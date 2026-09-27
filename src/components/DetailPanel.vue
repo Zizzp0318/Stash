@@ -80,10 +80,37 @@ async function toggleFav(): Promise<void> {
 const addingTag = ref(false)
 const newTag = ref('')
 
-async function addTag(): Promise<void> {
+/** 快捷区一行 4 列、最多两行；再多就不是「最近」而是标签列表了 */
+const RECENT_LIMIT = 8
+
+/** 最近添加的标签（新的在前），已挂在本素材上的不列出来（上方 chip 已经能看到） */
+const recentTags = computed(() => lib.recentTags(asset.value?.tags.map((t) => t.id) ?? [], RECENT_LIMIT))
+
+/** 快捷区为空时的说明：区分「库里还没标签」和「近期标签都已挂上」两种原因 */
+const recentHint = computed(() => (lib.tags.length ? '近期标签都已添加' : '输入名称新建第一个标签'))
+
+/**
+ * 把某个标签挂到当前素材上（只管挂，不碰输入框）。
+ * 已经挂过就直接返回，避免 setTags 原样重写一遍。
+ */
+async function attachTag(tagId: number): Promise<boolean> {
   const a = asset.value
+  if (!a) return false
+  if (a.tags.some((t) => t.id === tagId)) return true
+  const r = await window.stash.asset.setTags(a.id, [...a.tags.map((t) => t.id), tagId])
+  if (!r.ok) {
+    assets.notify('error', `添加标签失败：${r.error ?? '未知错误'}`)
+    return false
+  }
+  // 标签数量变了，侧栏计数与标签列表都要跟着刷新，再重拉当前素材
+  await lib.loadMeta()
+  await assets.select(a.id)
+  return true
+}
+
+async function addTag(): Promise<void> {
   const name = newTag.value.trim()
-  if (!a || !name) {
+  if (!asset.value || !name) {
     addingTag.value = false
     return
   }
@@ -95,22 +122,14 @@ async function addTag(): Promise<void> {
     return void assets.notify('error', `新建标签失败：${created.error ?? '未知错误'}`)
   }
   const tagId = existing ? existing.id : created?.data?.id
-  if (tagId) {
-    if (a.tags.some((t) => t.id === tagId)) {
-      // 已经挂过这个标签：什么都不用做，直接收起输入框（否则 setTags 会原地重写一遍）
-      addingTag.value = false
-      newTag.value = ''
-      return
-    }
-    const r = await window.stash.asset.setTags(a.id, [...a.tags.map((t) => t.id), tagId])
-    if (!r.ok) {
-      addingTag.value = false
-      return void assets.notify('error', `添加标签失败：${r.error ?? '未知错误'}`)
-    }
-    await lib.loadMeta()
-    await assets.select(a.id)
-  }
+  if (tagId) await attachTag(tagId)
   addingTag.value = false
+  newTag.value = ''
+}
+
+/** 点快捷区里的标签：挂上后**不关输入框**，方便连着加好几个 */
+async function pickRecent(tagId: number): Promise<void> {
+  await attachTag(tagId)
   newTag.value = ''
 }
 
@@ -172,6 +191,23 @@ async function removeTag(tagId: number): Promise<void> {
           </div>
           <div v-if="addingTag" class="inline-form">
             <input v-model="newTag" placeholder="输入标签名（回车确认）" autofocus @keyup.enter="addTag" @blur="addTag" @keyup.esc="addingTag = false; newTag = ''" />
+          </div>
+          <!-- 最近添加的标签：点一下直接挂到当前素材上，省得反复打字 -->
+          <div v-if="addingTag" class="recent-tags" data-recent-tags>
+            <span v-if="!recentTags.length" class="d-hint recent-empty">{{ recentHint }}</span>
+            <button
+              v-for="t in recentTags"
+              :key="t.id"
+              type="button"
+              class="recent-tag"
+              :data-recent-tag-id="t.id"
+              :style="{ '--tag-color': t.color }"
+              :title="`添加标签「${t.name}」`"
+              @mousedown.prevent
+              @click="pickRecent(t.id)"
+            >
+              <span class="recent-tag-name">{{ t.name }}</span>
+            </button>
           </div>
           <div class="rate-row">
             <div class="stars" @mouseleave="hoverStar = 0">

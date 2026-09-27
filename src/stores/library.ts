@@ -123,6 +123,24 @@ export const useLibraryStore = defineStore('library', () => {
     return n
   }
 
+  /**
+   * 最近添加的标签（新的在前），详情页「＋」下方的快捷区用它。
+   *
+   * 时间序直接用 `id` 倒序：`tags.id` 是库内自增主键，插入越晚 id 越大，
+   * 等价于创建时间倒序 —— 不必额外加 `created_at` 列（也不必给老库做迁移）。
+   * 若哪天要做「最近**使用**过的标签」，那就真得存时间了（现有表结构推不出来）。
+   *
+   * @param excludeIds 当前素材已经挂上的标签，不该出现在快捷区（上方 chip 已经展示了）
+   */
+  function recentTags(excludeIds: number[] = [], limit = 8): TagRow[] {
+    const skip = new Set(excludeIds)
+    // filter 已经产出新数组，后面的 sort 不会污染 store 里的原始顺序
+    return tags.value
+      .filter((t) => !skip.has(t.id))
+      .sort((a, b) => b.id - a.id)
+      .slice(0, limit)
+  }
+
   async function loadMeta(): Promise<void> {
     const [f, t, c] = await Promise.all([
       window.stash.folder.list(),
@@ -213,6 +231,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, recentTags, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

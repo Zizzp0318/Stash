@@ -494,6 +494,46 @@ mark {
   outline: none;
 }
 
+/* 「最近添加的标签」快捷区：输入框下方固定 4 列。
+   刻意**不放进 `.inline-form`**：那里左右各留了 8/4px 内边距，一格只剩 ~43px，
+   中文标签名会被省略成「标…」。放在 `.d-section` 下与上方标签 chip 左对齐，一格 ~46px。
+   标签身份用**淡色底**表达而不是色点：色点要吃掉 8px，放不下 3 个汉字。 */
+.recent-tags {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0 0 4px;
+}
+.recent-tag {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 22px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: var(--bg-raised); /* color-mix 不被支持时的退路 */
+  background: color-mix(in srgb, var(--tag-color, var(--bg-raised)) 22%, var(--bg-raised));
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.recent-tag:hover {
+  color: var(--text-1);
+  background: color-mix(in srgb, var(--tag-color, var(--bg-hover)) 34%, var(--bg-hover));
+  border-color: var(--accent-border);
+}
+/* 4 列时单格只有 ~48px，长标签名只能省略（完整名在 title 里） */
+.recent-tag .recent-tag-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 一条提示占满整行，别被挤进第一列 */
+.recent-tags .recent-empty { grid-column: 1 / -1; padding: 2px 0; }
+
 /* 侧栏文件夹「就地重命名」输入框：藏在行内，看起来像被编辑的文本而不是弹窗 */
 .side-rename {
   flex: 1;
