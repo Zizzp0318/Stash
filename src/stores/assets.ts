@@ -17,6 +17,9 @@ export const CARD_FIELDS: Array<{ key: CardField; label: string }> = [
 
 const FIELD_STORE_KEY = 'stash.cardFields'
 
+/** 右侧信息栏是否收起（布局偏好，全局一份，不按库隔离） */
+const DETAIL_COLLAPSED_KEY = 'stash.detailCollapsed'
+
 /**
  * 瀑布视图缩放：滑块值 = 目标列宽（px），实际卡片宽度按容器撑满。
  * 上限刻意压低，避免放大到只剩一两列的大图。
@@ -34,6 +37,15 @@ function readViewZoom(): number {
     /* 读取失败用默认值 */
   }
   return VIEW_ZOOM_DEFAULT
+}
+
+/** 右侧信息栏的收起状态（默认展开；只有明确存过 '1' 才收起） */
+function readDetailCollapsed(): boolean {
+  try {
+    return localStorage.getItem(DETAIL_COLLAPSED_KEY) === '1'
+  } catch {
+    return false
+  }
 }
 
 function readCardFields(): Record<CardField, boolean> {
@@ -131,6 +143,25 @@ export const useAssetStore = defineStore('assets', () => {
       /* 写入失败忽略 */
     }
   })
+
+  /**
+   * 右侧信息栏是否收起。
+   *
+   * 这是**一个显式的布局状态**，不是「当前有没有选中素材」的派生值 ——
+   * 所以收起之后点素材也不会把它拉回来（渲染只看这个标志）。
+   * 收起时整个面板不渲染：既省掉 detail 缩略图的预生成，也让中栏顺势占满宽度。
+   */
+  const detailCollapsed = ref(readDetailCollapsed())
+  watch(detailCollapsed, (v) => {
+    try {
+      localStorage.setItem(DETAIL_COLLAPSED_KEY, v ? '1' : '0')
+    } catch {
+      /* 写入失败忽略，仅本次会话生效 */
+    }
+  })
+  function toggleDetail(): void {
+    detailCollapsed.value = !detailCollapsed.value
+  }
 
   // 缩略图版本号：后台批量生成完成后 +1，URL 加 ?v= 触发 <img> 重新加载
   const thumbV = ref(0)
@@ -528,6 +559,7 @@ export const useAssetStore = defineStore('assets', () => {
     importing, importNotice, notify,
     thumbV, bumpThumbs, thumbUrl,
     cardFields, toggleCardField, viewZoom,
+    detailCollapsed, toggleDetail,
     activeFilterCount, clearFilters,
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,

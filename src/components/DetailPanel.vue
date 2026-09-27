@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { fmtSize, fmtDate, fmtDuration } from '../utils/format'
@@ -22,6 +22,8 @@ watch(
     editingNote.value = false
     noteDraft.value = ''
     noteCopied.value = false
+    // 色板的「已复制」高亮同理：换了素材就不该还亮着上一张的某个色块
+    copiedColor.value = null
     if (id && asset.value?.content_hash) {
       await window.stash.thumb.ensure(id, 'detail')
       detailReady.value++
@@ -56,6 +58,44 @@ const paletteColors = computed<string[]>(() => {
   } catch {
     return []
   }
+})
+
+// —— 色板：点一下复制该颜色的十六进制 ——
+const copiedColor = ref<string | null>(null)
+let colorTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 统一成大写 `#RRGGBB`。
+ * 色板数据本来就是 `#rrggbb`（见 `thumbs.computePalette`），这里只是兜住将来可能
+ * 换成简写 `#rgb` 或 `rgb()` 写法的情况 —— 复制出去的东西必须是能直接粘进代码/设计稿的。
+ */
+function hexOf(c: string): string {
+  const s = (c ?? '').trim()
+  if (/^#[0-9a-f]{6}$/i.test(s)) return s.toUpperCase()
+  if (/^#[0-9a-f]{3}$/i.test(s)) {
+    const [r, g, b] = s.slice(1).split('')
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase()
+  }
+  const m = /rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/i.exec(s)
+  if (m) {
+    return `#${[m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, '0')).join('')}`.toUpperCase()
+  }
+  return s
+}
+
+async function copyColor(c: string): Promise<void> {
+  const hex = hexOf(c)
+  const r = await window.stash.clipboard.writeText(hex)
+  if (!r.ok) return void assets.notify('error', `复制颜色失败：${r.error}`)
+  // 反馈落在被点的那个色块上（对勾），比只弹一条远处的提示更直观
+  copiedColor.value = c
+  if (colorTimer) clearTimeout(colorTimer)
+  colorTimer = setTimeout(() => (copiedColor.value = null), 1200)
+  assets.notify('info', `已复制颜色 ${hex}`)
+}
+
+onBeforeUnmount(() => {
+  if (colorTimer) clearTimeout(colorTimer)
 })
 
 const dimsText = computed(() => {
@@ -318,9 +358,25 @@ async function copyNote(): Promise<void> {
         </div>
 
         <div v-if="paletteColors.length" class="d-section">
-          <div class="d-label">色板</div>
+          <div class="d-label">
+            色板<span class="d-label-hint">点击色块复制十六进制</span>
+          </div>
           <div class="palette">
-            <div v-for="(c, i) in paletteColors" :key="i" :style="{ background: c }"></div>
+            <button
+              v-for="(c, i) in paletteColors"
+              :key="i"
+              type="button"
+              class="swatch"
+              :class="{ copied: copiedColor === c }"
+              :style="{ background: c }"
+              :title="`复制 ${hexOf(c)}`"
+              :data-color="hexOf(c)"
+              @click="copyColor(c)"
+            >
+              <svg v-if="copiedColor === c" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                <path d="M2.3 6.2l2.4 2.4 5-5.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
           </div>
         </div>
 

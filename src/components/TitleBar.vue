@@ -215,16 +215,38 @@ function close() {
     </div>
 
     <div class="win-controls">
-      <span title="收起侧栏">
-        <svg width="11" height="11" viewBox="0 0 12 12" fill="none">
-          <rect x="1" y="1.8" width="10" height="8.4" rx="1.6" stroke="currentColor" stroke-width="1.1" />
-          <path d="M4.2 1.8v8.4" stroke="currentColor" stroke-width="1.1" />
-          <path d="M8.4 4.8L7 6l1.4 1.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+      <!-- 四个按钮统一是 28×28 的方形按钮 + 16px 图标：
+           早先「最小化/最大化/关闭」写的是文字字符 ─ □ ✕，字形在行盒里不居中、
+           与左边的 SVG 图标基线也对不上，看着就是「几个图标不平行」。 -->
+      <button
+        class="wc-btn"
+        :title="assets.detailCollapsed ? '展开侧栏' : '收起侧栏'"
+        :data-collapsed="assets.detailCollapsed ? '1' : '0'"
+        data-wc="detail"
+        @click="assets.toggleDetail()"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1.7" y="2.5" width="12.6" height="11" rx="2" />
+          <path d="M10.6 2.5v11" />
+          <!-- 收起时箭头朝右（往边缘收），展开时朝左 -->
+          <path :d="assets.detailCollapsed ? 'M6.9 6.3L5.3 8l1.6 1.7' : 'M5.3 6.3L6.9 8l-1.6 1.7'" />
         </svg>
-      </span>
-      <span title="最小化" @click="minimize">─</span>
-      <span title="最大化" @click="toggleMaximize">□</span>
-      <span title="关闭" @click="close">✕</span>
+      </button>
+      <button class="wc-btn" title="最小化" data-wc="min" @click="minimize">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round">
+          <path d="M3.4 8h9.2" />
+        </svg>
+      </button>
+      <button class="wc-btn" title="最大化" data-wc="max" @click="toggleMaximize">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">
+          <rect x="3.4" y="3.4" width="9.2" height="9.2" rx="1.4" />
+        </svg>
+      </button>
+      <button class="wc-btn close" title="关闭" data-wc="close" @click="close">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round">
+          <path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6" />
+        </svg>
+      </button>
     </div>
   </header>
 </template>

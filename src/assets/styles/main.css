@@ -83,10 +83,29 @@ body {
 }
 .searchbox:hover { border-color: var(--border); }
 .searchbox .hint { font-size: 12px; }
-.win-controls { display: flex; gap: 16px; align-items: center; color: var(--text-3); padding-left: 6px; margin-left: auto; }
-.win-controls span { cursor: pointer; font-size: 14px; display: flex; align-items: center; }
-.win-controls svg { width: 15px; height: 15px; }
-.win-controls span:hover { color: var(--text-1); }
+.win-controls { display: flex; gap: 2px; align-items: center; color: var(--text-3); padding-left: 6px; margin-left: auto; }
+/*
+ * 四个按钮（收起侧栏 / 最小化 / 最大化 / 关闭）统一成等宽等高的方形按钮 + 居中图标：
+ * 按键的对齐由布局保证，不依赖字形。早先用文字字符 `─ □ ✕` 当图标时，
+ * 字形在行盒里不居中、字宽也与旁边的 SVG 不同，看上去就是「几个图标不平行」。
+ */
+.wc-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.wc-btn svg { width: 16px; height: 16px; display: block; }
+.wc-btn:hover { background: var(--bg-hover); color: var(--text-1); }
+/* 关闭按钮沿用 Windows 的红底白叉惯例，避免误点 */
+.wc-btn.close:hover { background: #C42B1C; color: #fff; }
 
 /* ============ 主体三栏 ============ */
 .body { display: flex; flex: 1; min-height: 0; }
@@ -336,8 +355,22 @@ mark {
   flex-shrink: 0;
   padding-bottom: 20px;
 }
-/* 高度由素材真实宽高比撑开（inline aspect-ratio），max-height 防止超长图把面板撑爆 */
+/*
+ * 高度由素材真实宽高比撑开（inline aspect-ratio），max-height 防止超长图把面板撑爆。
+ *
+ * 外面一圈 margin + 圆角边框 + 内圈 padding，让它像一张「被框住的卡片」：
+ * - margin 让预览区不再顶死面板左右边缘；
+ * - padding 让图片与边框之间也有间隙（用户报的「预览图和边框贴得太紧」就是这里）；
+ * - 圆角 + 细边框把图片整体包起来。
+ * padding / 边框刻意都很克制（4px + 极淡的 1px 线）：早先 6px + `--border-soft` 那圈深灰带
+ * 看起来像「一个很粗的框」，用户要求细一点。
+ * 图片本身仍是 `object-fit: contain`（不裁剪），两侧留白就是容器背景色，看着就是个画框。
+ */
 .detail-preview {
+  margin: 12px 12px 0;
+  padding: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 14px;
   background: var(--bg-raised);
   overflow: hidden;
   max-height: 60vh;
@@ -384,8 +417,28 @@ mark {
 .heart-btn svg { width: 15px; height: 15px; }
 .heart-btn:hover { color: var(--accent); }
 .palette { display: flex; height: 22px; border-radius: 6px; overflow: hidden; }
-.palette div { flex: 1; cursor: pointer; transition: flex 0.15s ease; }
-.palette div:hover { flex: 1.6; }
+/* 色块是按钮（可点、可 Tab 到），点一下把该颜色复制成十六进制 */
+.palette .swatch {
+  position: relative;
+  flex: 1;
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  transition: flex 0.15s ease;
+  color: #fff;
+}
+.palette .swatch:hover { flex: 1.6; }
+.palette .swatch.copied { flex: 1.8; }
+/* 对勾压在色块中央：白色描边加投影，深色浅色底上都看得清 */
+.palette .swatch svg {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 12px;
+  height: 12px;
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.6));
+}
+.d-label-hint { margin-left: 6px; font-size: 10px; opacity: 0.8; }
 .ai-note {
   background: var(--accent-soft);
   border: 1px solid rgba(232,176,75,0.28);
@@ -651,6 +704,13 @@ mark {
   object-fit: contain;
   display: block;
   background: var(--bg-hover, #2A2D31);
+  /*
+   * 与外框**同心**的圆角：内圆角 = 外圆角 − 内缩量 = 14 − (1 边框 + 4 padding) = 9。
+   * 直接照抄 14px 会让图片的弧比外框更「急」、四角看着不贴合；
+   * 同心的两条弧曲率一致，图片才像被外框规规矩矩包住的样子。
+   * 值要跟着 .detail-preview 的 border-radius / padding 一起改。
+   */
+  border-radius: 9px;
 }
 .detail-fallback {
   position: absolute; inset: 0;
@@ -1104,6 +1164,43 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .move-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .move-empty { padding: 18px 0; text-align: center; font-size: 12px; color: var(--text-3); }
 
+/* ============ 回到顶部浮标 ============ */
+/*
+ * 挂在 .gallery（position: relative）上，是 .grid-wrap 的**兄弟节点**而不是子节点 ——
+ * 放进滚动容器里它会跟着内容一起滚走，就不是「常驻右下角」了。
+ * 瀑布视图和列表视图共用同一个滚动容器，所以这一个按钮同时覆盖两种视图。
+ */
+.to-top {
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+  z-index: 40;
+  width: 38px; height: 38px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  /* 边框比常规表面略亮一档：这个钮会浮在任意素材上（亮的暗的都有），
+     只靠 --border-soft 的 0.07 白在浅色图上几乎看不见轮廓 */
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--bg-raised);
+  color: var(--text-2);
+  cursor: pointer;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.34);
+  transition: background 0.15s ease, color 0.15s ease, bottom 0.16s ease;
+}
+.to-top svg { width: 17px; height: 17px; }
+.to-top:hover { background: #43474C; color: var(--text-1); }
+.to-top:active { transform: translateY(1px); }
+/* 批量条是 left:50% 居中（bottom:18px、高 44px），窗口一窄就会和右下角的浮标撞上，
+   所以它在场时把浮标抬到它上方 */
+.to-top.with-batchbar { bottom: 74px; }
+/* 只做纵向位移。BatchBar 用的 .raise 里带 translate(-50%)（那是给它居中定位配的），
+   浮标靠 right 定位，照搬会在出现/消失时横向跳一下。 */
+.toTop-enter-active, .toTop-leave-active { transition: opacity 0.16s ease, transform 0.16s ease; }
+.toTop-enter-from, .toTop-leave-to { opacity: 0; transform: translateY(10px); }
+
+/* 浮标会盖住最后一行卡片的右下角，给它让出位置。
+   批量条的 84px 更大且写在后面 —— 两个类同时命中时按它生效，不叠加。 */
+.grid-wrap.has-totop { padding-bottom: 76px; }
 /* 悬浮条出现时给列表底部让出空间，避免最后一行被压住 */
 .grid-wrap.has-batchbar { padding-bottom: 84px; }
 /* 评分「混合」提示（选中项评分不一致时才出现） */

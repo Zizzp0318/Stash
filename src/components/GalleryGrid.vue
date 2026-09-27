@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, reactive, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { heart, folderIcon } from '@/data/mock'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../stores/assets'
@@ -249,9 +249,12 @@ onMounted(() => {
     containerW.value = el.clientWidth
     ro = new ResizeObserver((entries) => {
       containerW.value = entries[0].contentRect.width
+      // 窗口变化会连带重排滚动内容（可能把 scrollTop 夹小），顺带同步一次浮标
+      syncTopBtn()
     })
     ro.observe(el)
   }
+  syncTopBtn()
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
   // 拖文件进窗口：全局拦掉，否则 Chromium 会直接「导航到那个文件」，整个应用被替换成一张图
@@ -358,10 +361,46 @@ function onImgLoad(it: StashAssetRow, ev: Event): void {
   }
 }
 
+// ==================== 回到顶部浮标 ====================
+/**
+ * 滚过这个距离才显示浮标。
+ * 定 240px 而不是 1px：素材只有一两屏时按钮会一直杵在右下角挡视线，
+ * 而且它自己也占着最后一行卡片的位置，出现得太频繁反而碍事。
+ */
+const TOP_BTN_AFTER = 240
+const scrolledDown = ref(false)
+
+/**
+ * 浮标显隐**只看滚动位置**（不派生自 items 数量）。
+ *
+ * 读的是 `.grid-wrap` 的 scrollTop —— 瀑布视图与列表视图共用这一个滚动容器，
+ * 所以一个浮标天然覆盖两种视图，切视图不需要各写一套。
+ */
+function syncTopBtn(el?: HTMLElement | null): void {
+  const node = el ?? gridWrap.value
+  scrolledDown.value = !!node && node.scrollTop > TOP_BTN_AFTER
+}
+
 function onScroll(e: Event): void {
   const el = e.target as HTMLElement
+  syncTopBtn(el)
   if (el.scrollTop + el.clientHeight > el.scrollHeight - 800) assets.loadMore()
 }
+
+/**
+ * 一键回到顶部。
+ *
+ * 用 `behavior: 'smooth'` 而不是直接 `scrollTop = 0`：素材多的时候瞬移会让人分不清
+ * 自己到了哪一屏。滚动过程本身会持续发 scroll 事件，浮标会自己收起来（不需要手动置位）。
+ */
+function scrollToTop(): void {
+  const el = gridWrap.value
+  if (el) el.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+// 切视图 / 列表内容变化后，滚动位置会被浏览器重新夹一次（列表比瀑布短得多），
+// 所以必须重算，否则会出现「明明已经在顶部，按钮却还挂着」。
+watch([view, () => assets.items.length], () => nextTick(() => syncTopBtn()))
 
 // ==================== 多选：Ctrl 点选 / 拖拽框选 / 点击空白取消 ====================
 // 框选命中判定直接用 placed 里的几何数据（卡片坐标、尺寸都是算出来的），
@@ -960,7 +999,7 @@ function onWindowMouseDown(e: MouseEvent): void {
     <div
       ref="gridWrap"
       class="grid-wrap"
-      :class="{ 'has-batchbar': assets.selectedCount > 0 }"
+      :class="{ 'has-batchbar': assets.selectedCount > 0, 'has-totop': scrolledDown }"
       @scroll="onScroll"
       @mousedown="onGridPointerDown"
       @contextmenu.prevent
@@ -1056,6 +1095,28 @@ function onWindowMouseDown(e: MouseEvent): void {
         </div>
       </div>
     </div>
+
+    <!--
+      回到顶部浮标：素材多、浏览到下方时出现，一键回顶。
+      它是 `.grid-wrap` 的**兄弟节点**（不能放进去）—— 放进去就跟着内容一起滚走了。
+      瀑布视图和列表视图共用同一个滚动容器，所以这一个按钮同时覆盖两种视图。
+    -->
+    <Transition name="raise">
+      <button
+        v-if="scrolledDown"
+        class="to-top"
+        :class="{ 'with-batchbar': assets.selectedCount > 0 }"
+        type="button"
+        title="回到顶部"
+        aria-label="回到顶部"
+        data-to-top
+        @click="scrollToTop"
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 12.6V4M4.2 7.6L8 3.8l3.8 3.8" />
+        </svg>
+      </button>
+    </Transition>
 
     <!-- 底部悬浮条 -->
     <BatchBar @move="openMoveDialog" @remove="openDeleteDialog" />

@@ -69,7 +69,9 @@ onMounted(async () => {
     <div class="body">
       <SideBar />
       <GalleryGrid />
-      <DetailPanel />
+      <!-- 收纳状态由标题栏右上角的按钮控制（见 TitleBar 的 .wc-btn）。
+           收起后整个面板不渲染，点素材也不会把它带回来 —— 状态是显式的，不派生自「有没有选中」 -->
+      <DetailPanel v-if="!assets.detailCollapsed" />
     </div>
     <!-- 导入进度浮层 -->
     <div v-if="assets.importing" class="import-overlay">

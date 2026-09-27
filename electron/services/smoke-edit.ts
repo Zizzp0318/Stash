@@ -398,6 +398,10 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
 
     // ==================== U. UI 段 ====================
     step('U-UI')
+    // 前置状态隔离：右侧信息栏的收起状态存在 localStorage 里，跨冒烟共享同一份 userData ——
+    // 上一轮万一在「收起」之后崩掉，别的套件（m4 要读 .detail 里的星标）会莫名其妙全红。
+    // 开跑前先复位，收尾再复一次（见 finally）。
+    await js(`(() => { try { localStorage.removeItem('stash.detailCollapsed') } catch (e) {} return true })()`)
     await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
     await onceLoaded(win)
     await sleep(2800)
@@ -612,6 +616,250 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     }
     await capture('shot-edit-done.png')
 
+    // —— U6b 详情预览图：圆角边框包裹 + 与面板/边框都留出间隙 ——
+    // 纯 CSS 行为（有没有留白、圆角多大）只能靠几何与计算样式断言，内容断言看不出来
+    R.u6b_preview = (await js(`(() => {
+      const panel = document.querySelector('.detail')
+      const box = document.querySelector('.detail-preview')
+      const img = document.querySelector('.detail-img')
+      if (!panel || !box) return 'null'
+      // 先把面板滚回顶部再量：.detail 是滚动容器，前面 elPoint() 的 scrollIntoView
+      // 会把它滚下去，于是「预览区上边距」会随滚动变化，断言就不稳定了。
+      // 注意：这段脚本本身是模板字符串，注释里**不能出现反引号**，否则字符串会被提前截断
+      const scrolledBefore = panel.scrollTop
+      panel.scrollTop = 0
+      const pr = panel.getBoundingClientRect()
+      const br = box.getBoundingClientRect()
+      const ir = img ? img.getBoundingClientRect() : null
+      const cs = getComputedStyle(box)
+      const ics = img ? getComputedStyle(img) : null
+      return JSON.stringify({
+        scrolledBefore,
+        leftGap: Math.round(br.left - pr.left),
+        rightGap: Math.round(pr.right - br.right),
+        topGap: Math.round(br.top - pr.top),
+        radius: Math.round(parseFloat(cs.borderTopLeftRadius)),
+        borderW: Math.round(parseFloat(cs.borderTopWidth)),
+        padLeft: Math.round(parseFloat(cs.paddingLeft)),
+        imgRadius: ics ? Math.round(parseFloat(ics.borderTopLeftRadius)) : null,
+        imgInsetLeft: ir ? Math.round(ir.left - br.left) : null,
+        imgInsetTop: ir ? Math.round(ir.top - br.top) : null,
+        hasImg: !!img
+      })
+    })()`)) as string | null
+
+    // —— U6c 色板：点色块复制十六进制 ——
+    // 挑一张**确实有调色板**的素材（调色板是缩略图生成时回写的，不能假设任意一张都有）
+    const palId =
+      (
+        D().prepare('SELECT id FROM assets WHERE palette IS NOT NULL ORDER BY id LIMIT 1').get() as
+          | { id: number }
+          | undefined
+      )?.id ?? -1
+    R.u6c_paletteCount = (D().prepare('SELECT count(*) AS c FROM assets WHERE palette IS NOT NULL').get() as {
+      c: number
+    }).c
+
+    let u6cPal: Record<string, unknown> | null = null
+    if (palId > 0) {
+      await clickSel(`.masonry-card[data-id="${palId}"]`)
+      await sleep(1200)
+      clipboard.clear()
+      const swatch = await elPoint('.palette .swatch', 0)
+      const color = (await js(`document.querySelector('.palette .swatch')?.dataset.color ?? null`)) as string | null
+      const swatchCount = (await js(`document.querySelectorAll('.palette .swatch').length`)) as number
+      if (swatch) click(swatch.x, swatch.y)
+      await sleep(450)
+      u6cPal = {
+        color,
+        swatchCount,
+        clipboard: (await clipboard.readText()).trim(),
+        copiedClass: (await js(`document.querySelector('.palette .swatch')?.classList.contains('copied')`)) === true,
+        checkDrawn: (await js(`!!document.querySelector('.palette .swatch svg')`)) === true,
+        notice: await noticeText()
+      }
+    }
+    R.u6c_palette = u6cPal
+    await capture('shot-edit-palette.png')
+
+    // —— U7 右上角「收起侧栏」按钮：收起后点素材也不展开；四个按钮几何一致 ——
+    R.u7_buttons = (await js(`(() => {
+      const els = [...document.querySelectorAll('.win-controls .wc-btn')]
+      return JSON.stringify(els.map((b) => {
+        const r = b.getBoundingClientRect()
+        const svg = b.querySelector('svg')
+        const sr = svg ? svg.getBoundingClientRect() : null
+        return {
+          key: b.dataset.wc ?? null,
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          cy: Math.round((r.top + r.height / 2) * 10) / 10,
+          icon: sr ? Math.round(sr.width) : 0,
+          text: b.textContent.trim()
+        }
+      }))
+    })()`)) as string | null
+    R.u7_before = (await js(`!!document.querySelector('.detail')`)) === true
+
+    const detailBtn = await elPoint('.wc-btn[data-wc="detail"]')
+    if (detailBtn) click(detailBtn.x, detailBtn.y)
+    await sleep(450)
+    R.u7_collapsed = {
+      detailGone: (await js(`!!document.querySelector('.detail')`)) === false,
+      flag: (await js(`localStorage.getItem('stash.detailCollapsed')`)) as string | null,
+      title: (await js(`document.querySelector('.wc-btn[data-wc="detail"]')?.getAttribute('title') ?? null`)) as
+        | string
+        | null
+    }
+    await capture('shot-edit-detail-collapsed.png')
+
+    // 收起是「锁定」状态：点素材只换选中项，不该把信息栏拉回来
+    await clickSel('.masonry-card', 1)
+    await sleep(700)
+    R.u7_afterSelect = {
+      detailGone: (await js(`!!document.querySelector('.detail')`)) === false,
+      selected: (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
+    }
+
+    // 再点一次 → 恢复展开
+    const detailBtn2 = await elPoint('.wc-btn[data-wc="detail"]')
+    if (detailBtn2) click(detailBtn2.x, detailBtn2.y)
+    await sleep(700)
+    R.u7_expanded = {
+      detailBack: (await js(`!!document.querySelector('.detail')`)) === true,
+      flag: (await js(`localStorage.getItem('stash.detailCollapsed')`)) as string | null
+    }
+    await capture('shot-edit-detail-expanded.png')
+
+    // —— U8 回到顶部浮标：滚到下方才出现、点击回顶、两种视图都要有、且不压住批量条 ——
+    //
+    // 这一步的前提是**页面真的能滚**。当前素材量在 1280x820 下瀑布视图都够不到 240px 阈值
+    // （列表视图更短），所以先灌一批图把两种视图都撑长。
+    // 放在这里做是安全的：前面所有「按第几张卡片取素材」的断言都已经跑完了，加素材影响不到它们。
+    const bulkDir = join(dir, 'bulk')
+    mkdirSync(bulkDir, { recursive: true })
+    const bulkPaths: string[] = []
+    for (let i = 1; i <= 30; i++) {
+      const p = join(bulkDir, `批量 ${i}.png`)
+      await sharp({
+        create: { width: 200, height: 200 + i * 4, channels: 3, background: { r: (i * 8) % 256, g: 90, b: (i * 17) % 256 } }
+      })
+        .png()
+        .toFile(p)
+      bulkPaths.push(p)
+    }
+    // 30 张颜色/尺寸各不相同的图：内容哈希天然不同，不会被导入管线的查重挡掉
+    const bulkImp = await new Promise<ImportResult>((resolve) =>
+      importFiles({ paths: bulkPaths, folderId: null, mode: 'copy', onDone: resolve })
+    )
+    R.u8_bulk = { added: bulkImp.added, total: assetCount() }
+    await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
+    await onceLoaded(win)
+    await sleep(3000)
+
+    // 先选一张：批量条要出现，才能验证「浮标让开批量条」不是空断言
+    await clickSel('.masonry-card', 0)
+    await sleep(700)
+    R.u8_selected = (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
+
+    // 滚到最下方（瀑布视图）
+    await js(`(() => { const w = document.querySelector('.grid-wrap'); if (w) w.scrollTop = w.scrollHeight })()`)
+    await sleep(600)
+    R.u8_masonry = (await js(`(() => {
+      const b = document.querySelector('[data-to-top]')
+      const g = document.querySelector('.gallery')
+      const wrap = document.querySelector('.grid-wrap')
+      if (!g || !wrap) return 'null'
+      if (!b) return JSON.stringify({ hasBtn: false, scrollTop: Math.round(wrap.scrollTop) })
+      const br = b.getBoundingClientRect()
+      const gr = g.getBoundingClientRect()
+      const cs = getComputedStyle(b)
+      return JSON.stringify({
+        hasBtn: true,
+        isList: !!document.querySelector('.list'),
+        scrollTop: Math.round(wrap.scrollTop),
+        maxScroll: Math.round(wrap.scrollHeight - wrap.clientHeight),
+        rightInset: Math.round(gr.right - br.right),
+        bottomInset: Math.round(gr.bottom - br.bottom),
+        topInset: Math.round(br.top - gr.top),
+        gh: Math.round(gr.height),
+        w: Math.round(br.width),
+        h: Math.round(br.height),
+        radius: cs.borderTopLeftRadius,
+        label: b.getAttribute('aria-label'),
+        icon: !!b.querySelector('svg')
+      })
+    })()`)) as string | null
+
+    // 与底部悬浮批量条是否重叠：批量条是居中定位的，窄窗口下最容易撞上
+    R.u8_overlap = (await js(`(() => {
+      const b = document.querySelector('[data-to-top]')
+      const bar = document.querySelector('.batchbar')
+      if (!b) return JSON.stringify({ hasBtn: false, bar: !!bar })
+      const br = b.getBoundingClientRect()
+      if (!bar) return JSON.stringify({ hasBtn: true, bar: false })
+      const rr = bar.getBoundingClientRect()
+      return JSON.stringify({
+        hasBtn: true,
+        bar: true,
+        gap: Math.round(rr.top - br.bottom),
+        sameRow: br.bottom > rr.top && br.top < rr.bottom
+      })
+    })()`)) as string | null
+    await capture('shot-edit-totop.png')
+
+    // 点一下：平滑回顶，浮标自己收起来
+    await clickSel('[data-to-top]')
+    const backTop = await waitFor(
+      async () =>
+        ((await js(`(() => { const w = document.querySelector('.grid-wrap'); return w ? (w.scrollTop < 2 && !document.querySelector('[data-to-top]')) : false })()`)) as
+          | boolean
+          | null) === true,
+      5000,
+      150
+    )
+    R.u8_back = {
+      ok: backTop,
+      scrollTop: (await js(`Math.round(document.querySelector('.grid-wrap').scrollTop)`)) as number,
+      hasBtn: (await js(`!!document.querySelector('[data-to-top]')`)) === true
+    }
+
+    // 列表视图：同一个滚动容器，浮标必须同样可用
+    await clickJs('.viewtoggle button[title="列表视图"]')
+    await sleep(600)
+    await js(`(() => { const w = document.querySelector('.grid-wrap'); if (w) w.scrollTop = w.scrollHeight })()`)
+    await sleep(600)
+    R.u8_list = (await js(`(() => {
+      const b = document.querySelector('[data-to-top]')
+      const wrap = document.querySelector('.grid-wrap')
+      if (!wrap) return 'null'
+      return JSON.stringify({
+        hasBtn: !!b,
+        isList: !!document.querySelector('.list'),
+        rows: document.querySelectorAll('.list-row').length,
+        scrollTop: Math.round(wrap.scrollTop)
+      })
+    })()`)) as string | null
+    await capture('shot-edit-totop-list.png')
+
+    await clickSel('[data-to-top]')
+    const backTopList = await waitFor(
+      async () => ((await js(`Math.round(document.querySelector('.grid-wrap').scrollTop)`)) as number) < 2,
+      5000,
+      150
+    )
+    R.u8_back_list = {
+      ok: backTopList,
+      scrollTop: (await js(`Math.round(document.querySelector('.grid-wrap').scrollTop)`)) as number
+    }
+    // 复位：回到瀑布视图 + Esc 取消选中（点空白处会误点到卡片）
+    await clickJs('.viewtoggle button[title="瀑布视图"]')
+    await sleep(400)
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+    await sleep(400)
+    R.u8_cleared = (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
+
     // ==================== 断言 ====================
     const u1 = (() => {
       try {
@@ -662,6 +910,75 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     const u5s = R.u5_saved as Record<string, unknown>
     const u5c = R.u5_copy as Record<string, unknown>
     const u6 = R.u6_switch as Record<string, unknown>
+    /** U8 的三段几何/状态快照共用这一个解析器（注入脚本返回的是 JSON 字符串） */
+    const u8p = <T>(key: string): T | null => {
+      const s = R[key] as string | null
+      try {
+        return s && s !== 'null' ? (JSON.parse(s) as T) : null
+      } catch {
+        return null
+      }
+    }
+    const u8m = u8p<{
+      hasBtn: boolean
+      isList?: boolean
+      scrollTop: number
+      maxScroll?: number
+      rightInset?: number
+      bottomInset?: number
+      topInset?: number
+      gh?: number
+      w?: number
+      h?: number
+      radius?: string
+      label?: string | null
+      icon?: boolean
+    }>('u8_masonry')
+    const u8o = u8p<{ hasBtn: boolean; bar: boolean; gap?: number; sameRow?: boolean }>('u8_overlap')
+    const u8l = u8p<{ hasBtn: boolean; isList: boolean; rows: number; scrollTop: number }>('u8_list')
+    const u8b = R.u8_back as Record<string, unknown>
+    const u8bl = R.u8_back_list as Record<string, unknown>
+    const u8bulk = R.u8_bulk as Record<string, unknown>
+    const u6b = (() => {
+      const s = R.u6b_preview as string | null
+      try {
+        return s && s !== 'null'
+          ? (JSON.parse(s) as {
+              scrolledBefore: number
+              leftGap: number
+              rightGap: number
+              topGap: number
+              radius: number
+              borderW: number
+              padLeft: number
+              imgRadius: number | null
+              imgInsetLeft: number | null
+              imgInsetTop: number | null
+              hasImg: boolean
+            })
+          : null
+      } catch {
+        return null
+      }
+    })()
+    const u7b = (() => {
+      try {
+        return JSON.parse((R.u7_buttons as string) ?? '[]') as Array<{
+          key: string | null
+          w: number
+          h: number
+          cy: number
+          icon: number
+          text: string
+        }>
+      } catch {
+        return []
+      }
+    })()
+    const u7c = R.u7_collapsed as Record<string, unknown>
+    const u7s = R.u7_afterSelect as Record<string, unknown>
+    const u7e = R.u7_expanded as Record<string, unknown>
+    const u6c = R.u6c_palette as Record<string, unknown> | null
 
     const checks: Record<string, boolean> = {
       // U0 preload 桥接
@@ -848,6 +1165,85 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       noteSwitchClearsEditor: u6?.switched === true && u6?.inputGone === true,
       noteSwitchClearsCopied: u6?.copiedCleared === true,
 
+      // U6b 详情预览图：四周留白（不顶死面板）+ 图片与边框也有间隙 + 圆角边框包裹
+      // ⚠️ 别断言「左右留白相等」：`.detail` 内容溢出时会冒出 10px 的竖滚动条
+      //（`::-webkit-scrollbar { width: 10px }`），右侧留白就变成 12+10=22。
+      // 真正要守的是「四周都有 ≥ 8px 的呼吸空间」，跟两侧是否对称无关。
+      previewHasOuterGap:
+        u6b != null && u6b.leftGap >= 8 && u6b.rightGap >= 8 && u6b.topGap >= 8,
+      previewRounded: u6b != null && u6b.radius >= 10,
+      previewHasBorder: u6b != null && u6b.borderW >= 1,
+      previewHasInnerGap:
+        u6b?.hasImg === true &&
+        (u6b.imgInsetLeft ?? 0) >= u6b.padLeft &&
+        (u6b.imgInsetLeft ?? 0) >= 5 &&
+        (u6b.imgInsetTop ?? 0) >= 5,
+      // 框要「细」：线不粗于 1px，且那圈让出间隙的 padding 也要克制
+      previewBorderThin: u6b != null && u6b.borderW <= 1 && u6b.padLeft <= 4,
+      // 图片圆角与外框**同心**：内 = 外 − 内缩（1 边框 + 4 padding）
+      previewImgRounded:
+        u6b?.imgRadius != null &&
+        u6b.imgRadius >= 6 &&
+        Math.abs(u6b.imgRadius - (u6b.radius - u6b.borderW - u6b.padLeft)) <= 1,
+
+      // U6c 色板：点色块 → 复制十六进制（系统剪贴板为证）+ 对勾反馈
+      paletteSwatches: (R.u6c_paletteCount as number) > 0 && (u6c?.swatchCount as number) >= 1,
+      paletteColorIsHex: /^#[0-9A-F]{6}$/.test(String(u6c?.color ?? '')),
+      paletteCopiesHex: u6c?.clipboard === u6c?.color && /^#[0-9A-F]{6}$/.test(String(u6c?.clipboard ?? '')),
+      paletteShowsCheck: u6c?.copiedClass === true && u6c?.checkDrawn === true,
+      paletteNotifies: /已复制颜色 #/.test(String(u6c?.notice ?? '')),
+
+      // U7 右上角四个按钮：等宽等高 + 图标同尺寸同基线 + 纯图标无文字字形（旧版 ─ □ ✕ 就是靠这条盯住）
+      wcButtonsUniform:
+        u7b.length === 4 &&
+        u7b.every((b) => b.w === u7b[0].w && b.h === u7b[0].h) &&
+        Math.max(...u7b.map((b) => b.cy)) - Math.min(...u7b.map((b) => b.cy)) < 0.6,
+      wcButtonsIconOnly: u7b.length === 4 && u7b.every((b) => b.text === '' && b.icon === 16),
+      wcButtonsOrder: u7b.map((b) => b.key).join('|') === 'detail|min|max|close',
+      // 收起侧栏：面板消失 + localStorage 记住 + 按钮 title 翻转
+      detailCollapseWorks: R.u7_before === true && u7c?.detailGone === true,
+      detailCollapsePersists: u7c?.flag === '1' && u7c?.title === '展开侧栏',
+      // 收起是「锁定」状态：点素材只换选中项，不该把信息栏拉回来
+      detailStaysCollapsedOnSelect: u7s?.detailGone === true && (u7s?.selected as number) >= 1,
+      detailExpandWorks: u7e?.detailBack === true && u7e?.flag === '0',
+
+      // U8 回到顶部浮标：滚到下方才出现、点击回顶、两种视图都有、不与批量条重叠
+      // 前提守卫：页面得真的滚得起来，否则「滚到底浮标还在」这种断言是没有意义的
+      topBtnFixtureScrollable: (u8bulk?.added as number) >= 20 && (u8m?.maxScroll ?? 0) > 300,
+      topBtnAppearsOnScroll: u8m?.hasBtn === true && (u8m?.scrollTop ?? 0) > 240,
+      // 必须待在 .gallery 的右下角（也就是中栏内部，不会压到右侧信息栏）。
+      // topInset 两条盯的是「浮标真的在右下角」：一旦它变成参与布局的普通元素
+      //（position 没给、或者被塞进某个定位子树里），位置就会跟着内容流跑，
+      // 此时 DOM 里依然查得到（hasBtn 仍为 true），只有几何能抓到。
+      topBtnInsideRightBottom:
+        (u8m?.rightInset ?? 0) >= 8 &&
+        (u8m?.bottomInset ?? 0) >= 8 &&
+        (u8m?.topInset ?? 0) >= 8 &&
+        (u8m?.topInset ?? 0) > (u8m?.gh ?? 0) / 2,
+      // 圆角小圆钮 + 有图标 + 有可读标签（纯图标按钮必须给 aria-label，否则读屏只念「按钮」）
+      topBtnIsRoundIcon: (() => {
+        const w = u8m?.w ?? 0
+        const r = String(u8m?.radius ?? '')
+        // 计算样式给的是像素（19px）还是百分比（50%）都可能，两种写法都按「够不够圆」判
+        const round = r.endsWith('%') ? parseFloat(r) >= 50 : parseFloat(r) >= w / 2 - 1
+        return (
+          w === (u8m?.h ?? 0) &&
+          w >= 32 &&
+          w <= 44 &&
+          round &&
+          u8m?.icon === true &&
+          u8m?.label === '回到顶部'
+        )
+      })(),
+      // 批量条在场时不能盖住它（窄窗口下两者最容易撞上）
+      topBtnClearsBatchBar: u8o?.bar === true && (u8o?.gap ?? -1) >= 4 && u8o?.sameRow === false,
+      topBtnScrollsBack: u8b?.ok === true && u8b?.scrollTop === 0 && u8b?.hasBtn === false,
+      // 列表视图共用同一个滚动容器，浮标必须同样可用（用户明确要两种视图都有）
+      topBtnAvailableInList: u8l?.isList === true && u8l?.hasBtn === true && (u8l?.scrollTop ?? 0) > 240,
+      topBtnScrollsBackInList: u8bl?.ok === true && u8bl?.scrollTop === 0,
+      // 收尾：选中确实发生过（批量条才真的在场，重叠断言才有意义）、Esc 又能干净复位
+      topBtnTestSelectionReset: R.u8_selected === 1 && R.u8_cleared === 0,
+
       noJsErrors: jsErrors.length === 0
     }
 
@@ -864,6 +1260,14 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     R.checks = { noThrow: false }
     console.log('[SMOKE-EDIT] ' + JSON.stringify(R))
   } finally {
+    // 复位右侧信息栏的折叠标记（理由见 U 段开头），别把状态留给下一个冒烟套件
+    try {
+      await win.webContents.executeJavaScript(
+        `(() => { try { localStorage.removeItem('stash.detailCollapsed') } catch (e) {} return true })()`
+      )
+    } catch {
+      /* 窗口已关就无所谓了 */
+    }
     try {
       if (libPath) {
         closeCurrent()
