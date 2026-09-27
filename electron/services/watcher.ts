@@ -20,6 +20,7 @@ export function watchLibrary(libPath: string, db: DB): void {
     ignoreInitial: true,
     ignored: (p: string) => {
       const rel = relative(libPath, p)
+      // .stash 数据库文件 / .thumbs 缩略图缓存，均不参与索引同步
       return rel === '' || rel.startsWith('.stash') || rel.startsWith('.thumbs')
     },
     awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 100 }

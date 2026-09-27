@@ -24,6 +24,12 @@ contextBridge.exposeInMainWorld('stash', {
   },
   folder: {
     mkdir: (relPath: string) => ipcRenderer.invoke('folder:mkdir', relPath),
+    /** 在指定父文件夹下新建子文件夹（parentPath 为空 = 库根目录） */
+    mkdirChild: (parentPath: string, name: string) => ipcRenderer.invoke('folder:mkdir-child', { parentPath, name }),
+    /** 重命名：物理目录 + folders 子树 path + assets.rel_path 一并同步 */
+    rename: (id: number, name: string) => ipcRenderer.invoke('folder:rename', { id, name }),
+    /** 删除整个文件夹：物理删除，不可恢复（无回收站） */
+    remove: (id: number) => ipcRenderer.invoke('folder:delete', id),
     list: () => ipcRenderer.invoke('folder:list')
   },
   import: {
@@ -44,6 +50,9 @@ contextBridge.exposeInMainWorld('stash', {
     counts: () => ipcRenderer.invoke('asset:counts'),
     get: (id: number) => ipcRenderer.invoke('asset:get', id),
     update: (id: number, patch: unknown) => ipcRenderer.invoke('asset:update', { id, patch }),
+    bulkUpdate: (ids: number[], patch: unknown) => ipcRenderer.invoke('asset:bulk-update', { ids, patch }),
+    move: (ids: number[], folderId: number) => ipcRenderer.invoke('asset:move', { ids, folderId }),
+    remove: (ids: number[]) => ipcRenderer.invoke('asset:delete', { ids }),
     setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds })
   },
   tag: {

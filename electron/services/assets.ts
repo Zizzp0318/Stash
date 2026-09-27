@@ -1,4 +1,11 @@
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync } from 'fs'
+import { extname, join } from 'path'
 import { requireCurrent } from './library'
+
+/** 拼接库内相对路径（统一用 / 分隔） */
+function toRel(...segs: string[]): string {
+  return segs.filter(Boolean).join('/')
+}
 
 export interface AssetQuery {
   folderId?: number | null
@@ -66,6 +73,178 @@ export function updateAsset(id: number, patch: { rating?: number; isFav?: boolea
   if (patch.isFav != null) {
     db.prepare('UPDATE assets SET is_fav=? WHERE id=?').run(patch.isFav ? 1 : 0, id)
   }
+}
+
+/** 批量改评分 / 喜欢（单事务，避免 N 次 IPC 往返） */
+export function bulkUpdate(ids: number[], patch: { rating?: number; isFav?: boolean }): { updated: number } {
+  const { db } = requireCurrent()
+  if (!ids.length) return { updated: 0 }
+  const ph = ids.map(() => '?').join(',')
+  let updated = 0
+  db.exec('BEGIN')
+  try {
+    if (patch.rating != null) {
+      const r = Math.max(0, Math.min(5, Math.round(patch.rating)))
+      updated = Number(db.prepare(`UPDATE assets SET rating=? WHERE id IN (${ph})`).run(r, ...ids).changes)
+    }
+    if (patch.isFav != null) {
+      updated = Number(
+        db.prepare(`UPDATE assets SET is_fav=? WHERE id IN (${ph})`).run(patch.isFav ? 1 : 0, ...ids).changes
+      )
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  return { updated }
+}
+
+/** 目标目录内重名时追加 (n)，与导入逻辑保持一致的命名规则 */
+function uniqueName(dir: string, name: string): string {
+  if (!existsSync(join(dir, name))) return name
+  const e = extname(name)
+  const b = name.slice(0, name.length - e.length)
+  let i = 1
+  while (existsSync(join(dir, `${b} (${i})${e}`))) i++
+  return `${b} (${i})${e}`
+}
+
+/**
+ * 搬动单个文件。同库内基本都在同一卷，rename 即可；
+ * 遇到挂载点 / 卷不同 / 文件被占用时退化为复制 + 删除。
+ */
+function moveFile(src: string, dest: string): void {
+  try {
+    renameSync(src, dest)
+  } catch {
+    copyFileSync(src, dest)
+    unlinkSync(src)
+  }
+}
+
+function errMsg(e: unknown): string {
+  return String((e as Error).message ?? e)
+}
+
+export interface BulkFail {
+  id: number
+  name: string
+  error: string
+}
+
+/** 批量移动到库内目标文件夹：物理文件 + 索引同步（rel_path / folder_id / name 一起改） */
+export function moveAssets(ids: number[], folderId: number): { moved: number; failed: BulkFail[] } {
+  const { db, path: libPath } = requireCurrent()
+  const failed: BulkFail[] = []
+  if (!ids.length) return { moved: 0, failed }
+
+  const folder = db.prepare('SELECT id, path FROM folders WHERE id=?').get(folderId) as
+    | { id: number; path: string }
+    | undefined
+  if (!folder) throw new Error('ERR_FOLDER_NOT_FOUND')
+  const destDir = join(libPath, ...folder.path.split('/'))
+  mkdirSync(destDir, { recursive: true })
+
+  const ph = ids.map(() => '?').join(',')
+  const rows = db
+    .prepare(`SELECT id, name, rel_path FROM assets WHERE id IN (${ph})`)
+    .all(...ids) as Array<{ id: number; name: string; rel_path: string }>
+  const upd = db.prepare('UPDATE assets SET folder_id=?, rel_path=?, name=? WHERE id=?')
+
+  let moved = 0
+  db.exec('BEGIN')
+  try {
+    for (const row of rows) {
+      try {
+        const src = join(libPath, ...row.rel_path.split('/'))
+        const targetRel = toRel(folder.path, row.name)
+        if (row.rel_path === targetRel && existsSync(src)) {
+          // 已在目标文件夹，无需搬动
+          moved++
+          continue
+        }
+        if (!existsSync(src)) {
+          failed.push({ id: row.id, name: row.name, error: '源文件不存在' })
+          continue
+        }
+        const name = uniqueName(destDir, row.name)
+        const dest = join(destDir, name)
+        moveFile(src, dest)
+        upd.run(folder.id, toRel(folder.path, name), name, row.id)
+        moved++
+      } catch (e) {
+        failed.push({ id: row.id, name: row.name, error: String((e as Error).message ?? e) })
+      }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  return { moved, failed }
+}
+
+/**
+ * 批量删除素材：**直接真删除**，不经过任何回收站。
+ *
+ * 设计取舍：库里不设 `.trash`。理由（历史记录）——Windows 上 shell.trashItem
+ * 在本机表现为首次调用必然失败（"Operation was aborted"），且失败的同时文件已经
+ * 被真正删掉了，既不可靠也说不清文件到底去了哪。与其维护一个「半可靠」的中间态，
+ * 不如把语义做干净：删除 = 从磁盘抹掉，不可恢复。
+ * 因此 UI 侧必须保留二次确认（右键菜单与底部悬浮条共用同一个确认弹窗）。
+ *
+ * 索引行与缩略图缓存一并清理（同 hash 仍被其他素材引用时保留缓存）。
+ * 文件删失败则不动索引，避免出现「有记录没文件」的幽灵条目。
+ */
+export function deleteAssets(ids: number[]): { deleted: number; failed: BulkFail[] } {
+  const { db, path: libPath } = requireCurrent()
+  const failed: BulkFail[] = []
+  if (!ids.length) return { deleted: 0, failed }
+
+  const ph = ids.map(() => '?').join(',')
+  const rows = db
+    .prepare(`SELECT id, name, rel_path, content_hash FROM assets WHERE id IN (${ph})`)
+    .all(...ids) as Array<{ id: number; name: string; rel_path: string; content_hash: string | null }>
+  const del = db.prepare('DELETE FROM assets WHERE id=?')
+  const stillUsed = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?')
+
+  let deleted = 0
+  for (const row of rows) {
+    const file = join(libPath, ...row.rel_path.split('/'))
+
+    if (existsSync(file)) {
+      try {
+        unlinkSync(file)
+      } catch (e) {
+        // 文件没删掉就不动索引，避免出现「有记录没文件」的幽灵条目
+        failed.push({ id: row.id, name: row.name, error: `删除文件失败：${errMsg(e)}` })
+        continue
+      }
+    }
+
+    try {
+      del.run(row.id)
+    } catch (e) {
+      failed.push({ id: row.id, name: row.name, error: `索引删除失败：${errMsg(e)}` })
+      continue
+    }
+
+    // 缩略图缓存：hash 校验通过（同时防目录穿越）且无其他素材引用时才删
+    const hash = row.content_hash
+    if (hash && /^[0-9a-f]{20}$/.test(hash)) {
+      const used = (stillUsed.get(hash) as { c: number }).c
+      if (!used) {
+        try {
+          rmSync(join(libPath, '.thumbs', hash), { recursive: true, force: true })
+        } catch {
+          /* 缓存清理失败不影响删除结果 */
+        }
+      }
+    }
+    deleted++
+  }
+  return { deleted, failed }
 }
 
 export function setTags(assetId: number, tagIds: number[]): void {

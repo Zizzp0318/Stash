@@ -30,6 +30,12 @@ export interface StashLibraryApi {
 
 export interface StashFolderApi {
   mkdir: (relPath: string) => Promise<{ ok: boolean; data?: { id: number; path: string }; error?: string }>
+  /** 在指定父文件夹下新建子文件夹（parentPath 为空 = 库根目录） */
+  mkdirChild: (parentPath: string, name: string) => Promise<{ ok: boolean; data?: { id: number; path: string }; error?: string }>
+  /** 重命名文件夹：物理目录与索引（folders 子树 + assets.rel_path）一起同步 */
+  rename: (id: number, name: string) => Promise<{ ok: boolean; data?: { id: number; path: string; folders: number; assets: number }; error?: string }>
+  /** 删除整个文件夹：直接从磁盘删除，不可恢复（无回收站） */
+  remove: (id: number) => Promise<{ ok: boolean; data?: { folders: number; assets: number; thumbsRemoved: number }; error?: string }>
   list: () => Promise<{ ok: boolean; data?: Array<{ id: number; parent_id: number | null; path: string; name: string }>; error?: string }>
 }
 
@@ -71,6 +77,12 @@ export interface StashAssetDetail extends StashAssetRow {
   tags: Array<{ id: number; name: string; color: string }>
 }
 
+export interface StashBulkFail {
+  id: number
+  name: string
+  error: string
+}
+
 export interface StashAssetApi {
   list: (q?: {
     folderId?: number | null
@@ -87,6 +99,16 @@ export interface StashAssetApi {
   counts: () => Promise<{ ok: boolean; data?: { total: number; byFolder: Record<string, number>; byTag: Record<string, number> }; error?: string }>
   get: (id: number) => Promise<{ ok: boolean; data?: StashAssetDetail; error?: string }>
   update: (id: number, patch: { rating?: number; isFav?: boolean }) => Promise<{ ok: boolean; data?: null; error?: string }>
+  /** 批量评分 / 喜欢 */
+  bulkUpdate: (ids: number[], patch: { rating?: number; isFav?: boolean }) => Promise<{ ok: boolean; data?: { updated: number }; error?: string }>
+  /** 批量移动到库内文件夹（物理文件 + 索引同步） */
+  move: (ids: number[], folderId: number) => Promise<{ ok: boolean; data?: { moved: number; failed: StashBulkFail[] }; error?: string }>
+  /** 批量删除：直接从磁盘删除，不可恢复（无回收站） */
+  remove: (ids: number[]) => Promise<{
+    ok: boolean
+    data?: { deleted: number; failed: StashBulkFail[] }
+    error?: string
+  }>
   setTags: (id: number, tagIds: number[]) => Promise<{ ok: boolean; data?: null; error?: string }>
 }
 

@@ -1,6 +1,6 @@
 // 素材列表/筛选/选中/详情 + 导入进度状态
 import { defineStore } from 'pinia'
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useLibraryStore } from './library'
 import type { StashAssetRow, StashAssetDetail } from '../env'
 
@@ -66,10 +66,50 @@ export const useAssetStore = defineStore('assets', () => {
   const selectedId = ref<number | null>(null)
   const detail = ref<StashAssetDetail | null>(null)
 
+  // —— 多选集合（批量操作的作用域）——
+  // 用数组而非 Set：组件里 isSelected 是热路径（每帧每卡一次），数组 includes 在
+  // 单页 200 项量级下开销可忽略，且替换式赋值能保证触发更新，不依赖 Set 的响应式代理
+  const selectedIds = ref<number[]>([])
+  const selectedCount = computed(() => selectedIds.value.length)
+  /** 选中项是否全部已喜欢（决定右键/悬浮条显示「设为喜欢」还是「取消喜欢」） */
+  const selectedAllFav = computed(() => {
+    if (!selectedIds.value.length) return false
+    const set = selectedIds.value
+    const list = items.value.filter((i) => set.includes(i.id))
+    return list.length > 0 && list.every((i) => i.is_fav === 1)
+  })
+  /** 选中项的公共评分：全部一致时返回该值，不一致返回 0（UI 另用 mixed 提示，避免被误读成「无评分」） */
+  const selectedRating = computed(() => {
+    const set = selectedIds.value
+    const list = items.value.filter((i) => set.includes(i.id))
+    if (!list.length) return 0
+    const first = list[0].rating
+    return list.every((i) => i.rating === first) ? first : 0
+  })
+  /** 选中项评分是否存在分歧 */
+  const selectedRatingMixed = computed(() => {
+    const set = selectedIds.value
+    const list = items.value.filter((i) => set.includes(i.id))
+    if (list.length < 2) return false
+    return list.some((i) => i.rating !== list[0].rating)
+  })
+
+  function isSelected(id: number): boolean {
+    return selectedIds.value.includes(id)
+  }
+
   // 导入浮层状态
   const importing = ref<{ done: number; total: number } | null>(null)
   // 导入结果提示（错误 / 摘要）
   const importNotice = ref<{ kind: 'error' | 'info'; text: string } | null>(null)
+
+  /** 统一的轻提示出口（批量操作等非导入场景也走这里，自动消失） */
+  let noticeTimer: ReturnType<typeof setTimeout> | null = null
+  function notify(kind: 'error' | 'info', text: string): void {
+    importNotice.value = { kind, text }
+    if (noticeTimer) clearTimeout(noticeTimer)
+    noticeTimer = setTimeout(() => (importNotice.value = null), kind === 'error' ? 10000 : 5000)
+  }
 
   // 卡片下方常驻显示哪些字段（偏好持久化到 localStorage）
   const cardFields = reactive(readCardFields())
@@ -122,6 +162,7 @@ export const useAssetStore = defineStore('assets', () => {
     items.value = []
     total.value = 0
     selectedId.value = null
+    selectedIds.value = []
     detail.value = null
   }
 
@@ -132,8 +173,11 @@ export const useAssetStore = defineStore('assets', () => {
     if (r.data) {
       items.value = r.data.items
       total.value = r.data.total
-      // 当前选中项可能已不在列表中
-      if (selectedId.value != null && !items.value.some((i) => i.id === selectedId.value)) {
+      // 选中项可能已不在列表中（被删/被移走/切换了筛选条件）
+      const visible = new Set(items.value.map((i) => i.id))
+      const kept = selectedIds.value.filter((id) => visible.has(id))
+      if (kept.length !== selectedIds.value.length) selectedIds.value = kept
+      if (selectedId.value != null && !visible.has(selectedId.value)) {
         selectedId.value = null
         detail.value = null
       }
@@ -152,18 +196,194 @@ export const useAssetStore = defineStore('assets', () => {
     }
   }
 
-  async function select(id: number): Promise<void> {
+  /** 拉取详情并把它设为右侧面板展示的对象 */
+  async function loadDetail(id: number): Promise<void> {
     selectedId.value = id
     const r = await window.stash.asset.get(id)
     detail.value = r.data ?? null
   }
 
+  /** 普通左键点击：单选（清掉其他选中），右侧详情同步 */
+  async function select(id: number): Promise<void> {
+    selectedIds.value = [id]
+    await loadDetail(id)
+  }
+
+  /** Ctrl+左键点击：把该项加入 / 移出选中集合 */
+  async function toggleSelect(id: number): Promise<void> {
+    if (selectedIds.value.includes(id)) {
+      const rest = selectedIds.value.filter((x) => x !== id)
+      selectedIds.value = rest
+      if (selectedId.value === id) {
+        const next = rest[rest.length - 1]
+        if (next != null) await loadDetail(next)
+        else {
+          selectedId.value = null
+          detail.value = null
+        }
+      }
+    } else {
+      selectedIds.value = [...selectedIds.value, id]
+      await loadDetail(id)
+    }
+  }
+
+  /** 框选：additive=true（Ctrl 拖拽）在现有选中上追加，否则整体替换 */
+  async function selectMany(ids: number[], additive = false): Promise<void> {
+    const next = additive ? Array.from(new Set([...selectedIds.value, ...ids])) : ids.slice()
+    selectedIds.value = next
+    const last = next[next.length - 1]
+    if (last != null) await loadDetail(last)
+    else {
+      selectedId.value = null
+      detail.value = null
+    }
+  }
+
+  /** 取消选择（点击空白处触发） */
+  function clearSelection(): void {
+    selectedIds.value = []
+    selectedId.value = null
+    detail.value = null
+  }
+
+  // ==================== 拖拽素材到文件夹 ====================
+  // 状态放 store：拖拽要跨越两个组件 —— 画廊负责跟随鼠标的 ghost，
+  // 侧栏负责把落点文件夹高亮出来（两者都需要知道「正在拖什么、悬停在哪个文件夹」）。
+  const dragIds = ref<number[]>([])
+  /** 当前鼠标悬停的落点文件夹；不可能是有效落点时（源文件夹 / 空白）保持 null */
+  const dragOverFolderId = ref<number | null>(null)
+  /** 被拖素材的公共源文件夹（跨目录多选时为 null）——用来判定「拖回原地」这个无效落点 */
+  const dragOriginFolderId = ref<number | null>(null)
+
+  function beginDragMove(ids: number[], originFolderId: number | null): void {
+    dragIds.value = ids.slice()
+    dragOriginFolderId.value = originFolderId
+    dragOverFolderId.value = null
+  }
+
+  function setDragOver(folderId: number | null): void {
+    // 拖回素材原本所在的文件夹等于什么都没做，不作为有效落点（否则会白亮一下再消失）
+    dragOverFolderId.value = folderId != null && folderId === dragOriginFolderId.value ? null : folderId
+  }
+
+  function endDragMove(): void {
+    dragIds.value = []
+    dragOverFolderId.value = null
+    dragOriginFolderId.value = null
+  }
+
+  // —— 批量操作：作用于当前选中集合 ——
+
+  /** 批量评分：0 表示清除评分 */
+  async function bulkRate(rating: number): Promise<void> {
+    const ids = selectedIds.value.slice()
+    if (!ids.length) return
+    const r = await window.stash.asset.bulkUpdate(ids, { rating })
+    if (!r.ok) {
+      notify('error', `设置评分失败：${r.error}`)
+      return
+    }
+    const set = new Set(ids)
+    for (const it of items.value) if (set.has(it.id)) it.rating = rating
+    if (detail.value && set.has(detail.value.id)) detail.value.rating = rating
+    notify('info', rating > 0 ? `已为 ${ids.length} 项设置 ${rating} 星` : `已清除 ${ids.length} 项的评分`)
+  }
+
+  /** 批量喜欢 / 取消喜欢 */
+  async function bulkFav(isFav: boolean): Promise<void> {
+    const ids = selectedIds.value.slice()
+    if (!ids.length) return
+    const r = await window.stash.asset.bulkUpdate(ids, { isFav })
+    if (!r.ok) {
+      notify('error', `操作失败：${r.error}`)
+      return
+    }
+    const v = isFav ? 1 : 0
+    const set = new Set(ids)
+    for (const it of items.value) if (set.has(it.id)) it.is_fav = v
+    if (detail.value && set.has(detail.value.id)) detail.value.is_fav = v
+    notify('info', isFav ? `已喜欢 ${ids.length} 项` : `已取消喜欢 ${ids.length} 项`)
+  }
+
+  /**
+   * 批量移动到库内文件夹：文件真的搬走，列表与侧栏计数同步刷新。
+   * `explicitIds` 供拖拽移动使用 —— 那种场景下「要拖的东西」不一定等于当前选中集合。
+   */
+  async function bulkMove(folderId: number, explicitIds?: number[]): Promise<void> {
+    const ids = (explicitIds ?? selectedIds.value).slice()
+    if (!ids.length) return
+    const r = await window.stash.asset.move(ids, folderId)
+    if (!r.ok) {
+      notify('error', `移动失败：${r.error}`)
+      return
+    }
+    const moved = r.data?.moved ?? 0
+    const failed = r.data?.failed ?? []
+    clearSelection()
+    const lib = useLibraryStore()
+    const target = lib.folderById.get(folderId)?.name
+    await lib.loadMeta()
+    await refresh()
+    if (failed.length) notify('error', `${moved} 项已移动，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
+    else notify('info', target ? `已移动 ${moved} 项到「${target}」` : `已移动 ${moved} 项`)
+  }
+
+  /** 批量删除：直接真删除，不可恢复（无回收站；调用方必须先做二次确认） */
+  async function bulkDelete(): Promise<void> {
+    const ids = selectedIds.value.slice()
+    if (!ids.length) return
+    const r = await window.stash.asset.remove(ids)
+    if (!r.ok) {
+      notify('error', `删除失败：${r.error}`)
+      return
+    }
+    const deleted = r.data?.deleted ?? 0
+    const failed = r.data?.failed ?? []
+    clearSelection()
+    const lib = useLibraryStore()
+    await lib.loadMeta()
+    await refresh()
+    if (failed.length) notify('error', `${deleted} 项已删除，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
+    else notify('info', `已删除 ${deleted} 项（已从磁盘移除，不可恢复）`)
+  }
+
+  /**
+   * 详情页 / 卡片上的即时改评分与喜欢。
+   *
+   * ⚠️ 入参用 **DB 列名**（`is_fav`）而不是 IPC 那边的 camelCase `isFav`，
+   * 因为它会被直接 `Object.assign` 到本地行对象上；行对象字段名取自数据库。
+   * 曾经这里收 `isFav` 就原样 assign，结果本地对象被塞了个没人读的 `isFav` 字段，
+   * **数据库确实改了、但模板绑定的 `is_fav` 没变 → UI 不刷新**，
+   * 表现为「点详情页爱心没反应」（重开库才看得到其实早已生效）。
+   * 两个方向的映射都在这里显式做掉，调用方不用关心。
+   *
+   * 另注意：`rating` 两边同名，所以它一直是正常的。
+   */
   async function patchLocal(id: number, patch: Partial<Pick<StashAssetRow, 'rating' | 'is_fav'>>): Promise<void> {
-    await window.stash.asset.update(id, patch)
+    const r = await window.stash.asset.update(id, {
+      rating: patch.rating,
+      isFav: patch.is_fav == null ? undefined : patch.is_fav === 1
+    })
+    if (!r.ok) {
+      // 写库失败必须说出来，否则又是一次「点了没反应」
+      notify('error', `保存失败：${r.error}`)
+      return
+    }
     const it = items.value.find((i) => i.id === id)
     if (it) Object.assign(it, patch)
     if (detail.value?.id === id) Object.assign(detail.value, patch)
   }
 
-  return { query, items, total, loading, selectedId, detail, importing, importNotice, thumbV, bumpThumbs, thumbUrl, cardFields, toggleCardField, viewZoom, refresh, loadMore, select, patchLocal, reset }
+  return {
+    query, items, total, loading,
+    selectedId, detail,
+    selectedIds, selectedCount, selectedAllFav, selectedRating, selectedRatingMixed, isSelected,
+    importing, importNotice, notify,
+    thumbV, bumpThumbs, thumbUrl,
+    cardFields, toggleCardField, viewZoom,
+    refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
+    dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
+    patchLocal, bulkRate, bulkFav, bulkMove, bulkDelete, reset
+  }
 })

@@ -36,6 +36,69 @@ export const useLibraryStore = defineStore('library', () => {
     return m
   })
 
+  // ==================== 文件夹折叠 ====================
+  // 存 path 而不是 id：id 是库内自增，同一个文件夹在不同库里 id 不同，
+  // 而且这两点在重启后都可能变（重建索引）。path 在库里唯一且稳定（重命名后失效，属预期）。
+  const collapsed = ref<string[]>([])
+
+  /** 折叠状态按库隔离，否则「测试1」里折叠的『素材』会连带「测试2」的同名文件夹一起折起来 */
+  function collapsedKey(): string {
+    return info.value ? `stash.collapsed:${info.value.path}` : 'stash.collapsed'
+  }
+
+  /** 切换库后重新装载折叠状态（在 info 赋值之后调用） */
+  function loadCollapsed(): void {
+    try {
+      const raw = localStorage.getItem(collapsedKey())
+      const parsed: unknown = raw ? JSON.parse(raw) : []
+      collapsed.value = Array.isArray(parsed) ? (parsed.filter((x) => typeof x === 'string') as string[]) : []
+    } catch {
+      collapsed.value = []
+    }
+  }
+
+  function saveCollapsed(): void {
+    try {
+      localStorage.setItem(collapsedKey(), JSON.stringify(collapsed.value))
+    } catch {
+      /* 写入失败忽略，仅本次会话生效 */
+    }
+  }
+
+  function isCollapsed(path: string): boolean {
+    return collapsed.value.includes(path)
+  }
+
+  function toggleCollapse(path: string): void {
+    collapsed.value = isCollapsed(path)
+      ? collapsed.value.filter((p) => p !== path)
+      : [...collapsed.value, path]
+    saveCollapsed()
+  }
+
+  /** 展开 path 的所有祖先层级（拖拽移动完成、新建子级后确保目标可见） */
+  function expandTo(path: string): void {
+    const parts = path.split('/')
+    const ancestors: string[] = []
+    for (let i = 1; i < parts.length; i++) ancestors.push(parts.slice(0, i).join('/'))
+    if (!ancestors.length) return
+    const next = collapsed.value.filter((p) => !ancestors.includes(p))
+    if (next.length !== collapsed.value.length) {
+      collapsed.value = next
+      saveCollapsed()
+    }
+  }
+
+  /** 丢弃已不存在的折叠项（文件夹被删或改名后）。loadMeta 之后调用 */
+  function pruneCollapsed(): void {
+    const paths = new Set(folders.value.map((f) => f.path))
+    const next = collapsed.value.filter((p) => paths.has(p))
+    if (next.length !== collapsed.value.length) {
+      collapsed.value = next
+      saveCollapsed()
+    }
+  }
+
   /** 文件夹子树素材数：自身 + 所有路径前缀子目录之和 */
   function subtreeCount(f: FolderRow): number {
     let n = counts.value.byFolder[String(f.id)] ?? 0
@@ -55,6 +118,9 @@ export const useLibraryStore = defineStore('library', () => {
     folders.value = f.data ?? []
     tags.value = t.data ?? []
     if (c.data) counts.value = c.data
+    // 折叠状态按当前库重装（切库后不能沿用上一个库的），再清掉本库中已不存在的路径
+    loadCollapsed()
+    pruneCollapsed()
   }
 
   async function loadRecent(): Promise<void> {
@@ -108,6 +174,7 @@ export const useLibraryStore = defineStore('library', () => {
     folders.value = []
     tags.value = []
     counts.value = { total: 0, byFolder: {}, byTag: {} }
+    collapsed.value = []
     await loadRecent()
   }
 
@@ -132,5 +199,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, subtreeCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta }
+  return { info, folders, tags, counts, recent, folderById, subtreeCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+    collapsed, isCollapsed, toggleCollapse, expandTo }
 })

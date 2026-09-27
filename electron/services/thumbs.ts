@@ -179,11 +179,24 @@ export async function computePalette(abs: string): Promise<string | null> {
 }
 
 // —— 队列 ——
-interface Job { asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }; size: ThumbSize }
+/**
+ * 每一批（一次 ensureBatch 调用）单独记进度。
+ * 早先是 totalInJob / doneCount / pendingDone 三个模块级变量，两批重叠时（例如
+ * 开库的 thumb:backfill 与导入后的 backfill 撞在一起）会互相踩：
+ * 先结束的那批把计数清零，后一批永远凑不满 total → 它的 onDone 永远不触发、
+ * thumb:done 也提前广播（渲染层提前刷新，部分缩略图要等下次事件才出现）。
+ */
+interface Batch { total: number; done: number; cb: (() => void) | null }
+const batches = new Map<number, Batch>()
+let batchSeq = 0
+
+interface Job {
+  asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }
+  size: ThumbSize
+  batch: number
+}
 const queue: Job[] = []
 let running = 0
-let doneCount = 0
-let totalInJob = 0
 
 function broadcast(channel: string, data: unknown): void {
   BrowserWindow.getAllWindows()[0]?.webContents.send(channel, data)
@@ -210,43 +223,39 @@ function pump(): void {
       .catch(() => { /* ignore */ })
       .finally(() => {
         running--
-        doneCount++
-        if (totalInJob > 0 && (doneCount % 10 === 0 || doneCount === totalInJob)) {
-          const payload = { done: doneCount, total: totalInJob }
-          broadcast('thumb:progress', payload)
-        }
-        if (doneCount >= totalInJob && totalInJob > 0) {
-          broadcast('thumb:done', { done: doneCount, total: totalInJob })
-          totalInJob = 0
-          doneCount = 0
-          const cb = pendingDone
-          pendingDone = null
-          cb?.()
+        const b = batches.get(job.batch)
+        if (b) {
+          b.done++
+          if (b.done % 10 === 0 || b.done === b.total) {
+            broadcast('thumb:progress', { done: b.done, total: b.total })
+          }
+          if (b.done >= b.total) {
+            broadcast('thumb:done', { done: b.done, total: b.total })
+            batches.delete(job.batch)
+            b.cb?.()
+          }
         }
         pump()
       })
   }
 }
 
-/** 批量生成（入队，立即返回）。onDone 在全部完成时回调（冒烟测试用） */
+/** 批量生成（入队，立即返回）。onDone 在**这一批**全部完成时回调（冒烟测试用） */
 export function ensureBatch(
   assets: Array<{ id: number; type: string; ext: string; content_hash: string | null; rel_path: string }>,
   size: ThumbSize,
   onDone?: () => void
 ): void {
   const fresh = assets.filter((a) => a.content_hash && !existsSync(thumbFile(a.content_hash, size)))
-  totalInJob = fresh.length
-  doneCount = 0
   if (fresh.length === 0) {
     onDone?.()
     return
   }
-  pendingDone = onDone
-  queue.push(...fresh.map((asset) => ({ asset, size })))
+  const id = ++batchSeq
+  batches.set(id, { total: fresh.length, done: 0, cb: onDone ?? null })
+  queue.push(...fresh.map((asset) => ({ asset, size, batch: id })))
   pump()
 }
-
-let pendingDone: (() => void) | null = null
 
 /** 单个确保存在（IPC 用），返回 file:// 可用路径 */
 export async function ensureThumb(assetId: number, size: ThumbSize): Promise<{ url: string | null; generated: boolean }> {

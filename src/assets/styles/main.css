@@ -139,7 +139,7 @@ body {
 .tag-dot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; }
 
 /* ---- 中间画廊 ---- */
-.gallery { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.gallery { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
 .toolbar { padding: 10px 16px 0; flex-shrink: 0; }
 .toolbar-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
 .toolbar-head h1 { font-size: 15px; font-weight: 600; }
@@ -425,6 +425,30 @@ body {
 .side-item { cursor: pointer; }
 .side-item:hover { background: var(--bg-hover); }
 .side-item.active { background: var(--bg-active, rgba(255,255,255,0.08)); color: var(--text-1); }
+
+/* 文件夹折叠箭头（无子级时占位隐藏，保证各行图标纵向对齐） */
+.side-item .fold-toggle {
+  display: flex; align-items: center; justify-content: center;
+  width: 12px; height: 12px;
+  flex-shrink: 0;
+  margin-right: -4px;
+  color: var(--text-3);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: color 0.14s ease;
+}
+.side-item .fold-toggle svg { width: 8px; height: 8px; opacity: 1; transition: transform 0.14s ease; transform: rotate(90deg); }
+.side-item .fold-toggle:hover { color: var(--text-1); }
+/* 收起时箭头朝右（点开的方向），展开时朝下 —— 与资源管理器一致 */
+.side-item .fold-toggle.folded svg { transform: rotate(0deg); }
+.side-item .fold-toggle.leaf { visibility: hidden; }
+
+/* 拖拽素材悬停在文件夹上：给出明确的落点反馈 */
+.side-item.drop-on {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  color: var(--text-1);
+}
 .inline-form { padding: 2px 4px 6px 8px; }
 .inline-form input {
   width: 100%;
@@ -438,6 +462,30 @@ body {
   font-size: 11px;
   font-family: var(--font);
   outline: none;
+}
+
+/* 侧栏文件夹「就地重命名」输入框：藏在行内，看起来像被编辑的文本而不是弹窗 */
+.side-rename {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  padding: 0 5px;
+  margin: -2px 0;
+  border: 1px solid #5A8AC9;
+  border-radius: 5px;
+  background: var(--bg-input, #1D1F22);
+  color: var(--text-1);
+  font-size: 12px;
+  font-family: var(--font);
+  outline: none;
+}
+
+/* 文件夹右键菜单比素材菜单窄一点（条目文案短） */
+.folder-ctx { width: 184px; }
+.folder-ctx .ctx-head {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 工具栏右侧操作区 */
@@ -716,4 +764,209 @@ body {
 .lc-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .w-btn.danger { background: #8A4638; border-color: #8A4638; color: #fff; }
 .w-btn.danger:hover:not(:disabled) { background: #9A5648; }
+.w-btn.danger-strong { border-color: #6B4640; color: #D98F7F; }
+.w-btn.danger-strong:hover:not(:disabled) { background: #52322C; color: #F2C4B4; }
+.w-btn:disabled { opacity: 0.45; cursor: default; }
 .inline-hint { margin-top: 4px; font-size: 10px; color: var(--text-3); padding-left: 2px; }
+
+/* ============ 多选：拖拽框选 ============ */
+/* 选框坐标与卡片同在 .masonry 坐标系下，故挂在 .masonry 内部绝对定位 */
+.marquee {
+  position: absolute;
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 6;
+}
+/* ============ 拖动素材到文件夹 ============ */
+/* 拖动期间全局禁用文本选择并给出抓手光标，否则拖动经过文字会拉出选区 */
+body.drag-moving,
+body.drag-moving * { user-select: none; }
+body.drag-moving { cursor: grabbing; }
+/* 拖动时鼠标底下那张卡片不该再有「悬停放大」的反馈，那是点击态的语言 */
+body.drag-moving .card:hover { box-shadow: none; }
+body.drag-moving .card:hover .thumb-img { transform: none; }
+/* 正在被拖走的卡片整体压暗，一眼看出「这几张正在搬」 */
+.card.dragging,
+.list-row.dragging { opacity: 0.4; }
+
+.drag-ghost {
+  position: fixed;
+  z-index: 95;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 4px;
+  border-radius: 9px;
+  background: rgba(46, 49, 52, 0.97);
+  border: 1px solid var(--accent);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  /* 让光标落在浮层右下角，不遮住鼠标所指的文件夹行 */
+  transform: translate(12px, 10px);
+}
+.drag-ghost img {
+  width: 32px; height: 32px;
+  object-fit: cover;
+  border-radius: 6px;
+  display: block;
+}
+.drag-ghost .dg-count {
+  font-size: 12px;
+  color: var(--text-1);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============ 底部悬浮批量操作条 ============ */
+.batchbar {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 12px;
+  border-radius: 12px;
+  background: rgba(46, 49, 52, 0.96);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  z-index: 40;
+  white-space: nowrap;
+}
+.bb-count { font-size: 12px; color: var(--text-2); }
+.bb-count b { color: var(--accent); font-size: 13px; }
+.bb-div { width: 1px; height: 20px; background: var(--border-soft); }
+.bb-mini { font-size: 11px; color: var(--text-3); margin-right: 1px; }
+.bb-rate { display: flex; align-items: center; gap: 6px; }
+.bb-star {
+  width: 15px; height: 15px;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.12s ease, transform 0.12s ease;
+}
+.bb-star.on { color: var(--accent); }
+.bb-star:hover { transform: scale(1.18); }
+.bb-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  height: 28px; padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px; font-family: var(--font);
+  cursor: pointer;
+}
+.bb-btn svg { width: 13px; height: 13px; }
+.bb-btn:hover { background: var(--bg-hover); color: var(--text-1); }
+.bb-btn.on { color: #D98F7F; background: rgba(217, 143, 127, 0.12); }
+.bb-btn.danger:hover { background: #52322C; color: #F2C4B4; }
+.bb-btn.ghost { color: var(--text-3); font-size: 11px; }
+.bb-btn.ghost:hover { color: var(--text-1); }
+
+/* 悬浮条出入场 */
+.raise-enter-active, .raise-leave-active { transition: opacity 0.16s ease, transform 0.16s ease; }
+.raise-enter-from, .raise-leave-to { opacity: 0; transform: translate(-50%, 12px); }
+
+/* ============ 素材右键菜单 ============ */
+.ctx-menu {
+  position: fixed;
+  width: 212px;
+  padding: 6px;
+  border-radius: 10px;
+  background: var(--bg-raised, #2E3134);
+  border: 1px solid var(--border);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
+  z-index: 110;
+}
+.ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }
+.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
+.ctx-label { font-size: 11.5px; color: var(--text-2); }
+.ctx-stars { display: flex; gap: 3px; }
+.ctx-star {
+  width: 15px; height: 15px;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: color 0.12s ease, transform 0.12s ease;
+}
+.ctx-star.on { color: var(--accent); }
+.ctx-star:hover { transform: scale(1.18); }
+.ctx-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0; border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px; font-family: var(--font);
+  text-align: left;
+  cursor: pointer;
+}
+.ctx-item svg { width: 13px; height: 13px; flex-shrink: 0; }
+.ctx-item:hover { background: var(--bg-hover); color: var(--text-1); }
+.ctx-item.danger { color: #D98F7F; }
+.ctx-item.danger:hover { background: #52322C; color: #F2C4B4; }
+.ctx-sep { height: 1px; background: var(--border-soft); margin: 5px 2px; }
+.ctx-confirm { padding: 4px 4px 2px; display: flex; flex-direction: column; gap: 6px; }
+.ctx-confirm-text { font-size: 12px; color: var(--text-1); padding: 0 4px; }
+.ctx-confirm-sub { font-size: 10.5px; color: var(--text-3); padding: 0 4px 4px; }
+.ctx-confirm-btn {
+  height: 30px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-1);
+  font-size: 12px; font-family: var(--font);
+  cursor: pointer;
+}
+.ctx-confirm-btn:hover { background: var(--bg-hover); }
+.ctx-confirm-btn.danger { background: #8A4638; border-color: #8A4638; color: #fff; }
+.ctx-confirm-btn.danger:hover { background: #9A5648; }
+.ctx-confirm-btn.danger-strong { background: transparent; border-color: #6B4640; color: #D98F7F; }
+.ctx-confirm-btn.danger-strong:hover { background: #52322C; color: #F2C4B4; }
+
+/* ============ 通用弹窗（移动 / 删除确认） ============ */
+.modal-mask {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 130;
+}
+.modal {
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  padding: 18px 20px 16px;
+  border-radius: 12px;
+  background: var(--bg-panel, #2C2E31);
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+}
+.modal-title { font-size: 13.5px; font-weight: 600; color: var(--text-1); }
+.modal-body { margin: 12px 0 4px; max-height: 46vh; overflow-y: auto; }
+.modal-text { font-size: 12px; color: var(--text-2); line-height: 1.65; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+
+.move-row {
+  display: flex; align-items: center; gap: 7px;
+  height: 32px; padding: 0 9px;
+  border-radius: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.move-row:hover { background: var(--bg-hover); color: var(--text-1); }
+.move-row.on { background: var(--accent-soft); color: var(--accent); }
+.move-indent { flex-shrink: 0; }
+.move-icon { display: flex; flex-shrink: 0; opacity: 0.75; }
+.move-icon svg { width: 14px; height: 14px; }
+.move-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.move-empty { padding: 18px 0; text-align: center; font-size: 12px; color: var(--text-3); }
+
+/* 悬浮条出现时给列表底部让出空间，避免最后一行被压住 */
+.grid-wrap.has-batchbar { padding-bottom: 84px; }
+/* 评分「混合」提示（选中项评分不一致时才出现） */
+.bb-mixed, .ctx-mixed { font-size: 10px; color: var(--text-3); margin-left: 2px; }

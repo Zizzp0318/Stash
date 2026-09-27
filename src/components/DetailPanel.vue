@@ -63,6 +63,8 @@ const dimsText = computed(() => {
 })
 
 // —— 评分 / 喜欢 ——
+// 悬停预览到第 n 星，点第 n 星即为设为 n 星；再点当前星级则清零
+const hoverStar = ref(0)
 async function setRating(n: number): Promise<void> {
   if (!asset.value) return
   const next = asset.value.rating === n ? 0 : n
@@ -70,7 +72,8 @@ async function setRating(n: number): Promise<void> {
 }
 async function toggleFav(): Promise<void> {
   if (!asset.value) return
-  await assets.patchLocal(asset.value.id, { isFav: asset.value.is_fav ? false : true })
+  // 传 DB 列名 is_fav（0/1），patchLocal 会把它翻成 IPC 的 isFav 并就地更新本地行
+  await assets.patchLocal(asset.value.id, { is_fav: asset.value.is_fav ? 0 : 1 })
 }
 
 // —— 标签：点击已有标签移除；输入新建或复用后挂上 ——
@@ -138,21 +141,23 @@ async function removeTag(tagId: number): Promise<void> {
             <input v-model="newTag" placeholder="输入标签名（回车确认）" autofocus @keyup.enter="addTag" @blur="addTag" @keyup.esc="addingTag = false; newTag = ''" />
           </div>
           <div class="rate-row">
-            <div class="stars">
+            <div class="stars" @mouseleave="hoverStar = 0">
               <svg
                 v-for="n in 5"
                 :key="n"
                 class="star"
-                :class="{ on: n <= asset.rating }"
+                :class="{ on: n <= (hoverStar || asset.rating) }"
                 viewBox="0 0 12 12"
-                :fill="n <= asset.rating ? 'currentColor' : 'none'"
-                :stroke="n <= asset.rating ? 'none' : 'currentColor'"
+                :fill="n <= (hoverStar || asset.rating) ? 'currentColor' : 'none'"
+                :stroke="n <= (hoverStar || asset.rating) ? 'none' : 'currentColor'"
+                :title="asset.rating === n ? '点击清除评分' : `设为 ${n} 星`"
+                @mouseenter="hoverStar = n"
                 @click="setRating(n)"
               >
                 <path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z" stroke-width="1" stroke-linejoin="round" />
               </svg>
             </div>
-            <button class="heart-btn" :class="{ on: asset.is_fav }" title="喜欢" @click="toggleFav">
+            <button class="heart-btn" :class="{ on: asset.is_fav }" :title="asset.is_fav ? '取消喜欢' : '喜欢'" @click="toggleFav">
               <svg viewBox="0 0 13 13" :fill="asset.is_fav ? 'currentColor' : 'none'"><path d="M6.5 10.8S1.8 8.2 1.8 4.9c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2.1 1.2.4-.6 1.1-1.2 2.1-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.3-4.7 5.9-4.7 5.9z" stroke="currentColor" stroke-width="1.1" /></svg>
             </button>
           </div>

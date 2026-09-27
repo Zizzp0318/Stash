@@ -8,6 +8,8 @@ import { unwatchLibrary, watchLibrary } from './services/watcher'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
+import { runSmokeM4 } from './services/smoke4'
+import { runSmokeFolder } from './services/smoke-folder'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -173,6 +175,9 @@ function bootstrap(): void {
 
     // 文件夹
     ipcMain.handle('folder:mkdir', (_e, relPath) => wrap(() => librarySvc.mkdirRel(relPath)))
+    ipcMain.handle('folder:mkdir-child', (_e, { parentPath, name }) => wrap(() => librarySvc.mkdirChild(parentPath, name)))
+    ipcMain.handle('folder:rename', (_e, { id, name }) => wrap(() => librarySvc.renameFolder(id, name)))
+    ipcMain.handle('folder:delete', (_e, id) => wrap(() => librarySvc.deleteFolder(id)))
     ipcMain.handle('folder:list', () => wrap(() => librarySvc.listFolders()))
 
     // 导入
@@ -209,6 +214,9 @@ function bootstrap(): void {
     ipcMain.handle('asset:counts', () => wrap(() => assetsSvc.counts()))
     ipcMain.handle('asset:get', (_e, id) => wrap(() => assetsSvc.getAsset(id)))
     ipcMain.handle('asset:update', (_e, { id, patch }) => wrap(() => assetsSvc.updateAsset(id, patch)))
+    ipcMain.handle('asset:bulk-update', (_e, { ids, patch }) => wrap(() => assetsSvc.bulkUpdate(ids, patch)))
+    ipcMain.handle('asset:move', (_e, { ids, folderId }) => wrap(() => assetsSvc.moveAssets(ids, folderId)))
+    ipcMain.handle('asset:delete', (_e, { ids }) => wrap(() => assetsSvc.deleteAssets(ids)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))
@@ -260,6 +268,20 @@ function bootstrap(): void {
 
     win = createWindow()
     registerIpc()
+
+    // M4 冒烟：建临时库 → 导入 → 驱动渲染层跑完多选与批量操作 → 核对磁盘/数据库
+    if (process.argv.includes('--smoke-m4')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeM4(win)
+      })
+    }
+
+    // 文件夹管理冒烟：多级新建 / 重命名（子树 rel_path 同步）/ 物理删除，含 UI 右键菜单
+    if (process.argv.includes('--smoke-folder')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeFolder(win)
+      })
+    }
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) win = createWindow()
