@@ -9,10 +9,13 @@
 // 于是补了自动清理（`pruneUnlinkedTags`）：标签一个素材都不挂就失去意义，各条会减少
 // 标签关联的路径收尾都要清掉它。H7 覆盖「摘标签」入口，H8 覆盖「删素材」入口。
 //
-// H9 覆盖「点 ＋ 后输入框下方的最近添加标签（4 列）」。两条经验写在这里，别重复踩：
-//   - 快捷区按钮必须 `@mousedown.prevent`：输入框有 `@blur="addTag"`，不拦 mousedown 的话
-//     点击会先 blur → `addingTag=false` → v-if 把表单整个摘掉 → click 落在已卸载的节点上，静默失败；
-//   - 「4 列」是栅格行为，只能靠格子左上角坐标去重计数来断言（内容断言 3 列/5 列都能过）。
+// H9 覆盖「点 ＋ 后输入框下方的**悬浮**下拉（最近添加的 4 个标签，行尾带计数）」。三条经验写在这里，别重复踩：
+//   - 下拉行必须 `@mousedown.prevent`：输入框有 `@blur="addTag"`，不拦 mousedown 的话
+//     点击会先 blur → `addingTag=false` → v-if 把整个表单摘掉 → click 落在已卸载的节点上，静默失败；
+//   - 下拉必须**脱离文档流**：用户明确要「悬浮，不是在页面上拓展」。断言不能只看
+//     `getComputedStyle().position` —— 把下拉临时 `display:none` 再量下方评分区的 top，
+//     两者相等才算真的没占位（改回 static/relative 立刻变红）；
+//   - 「4 行」是布局行为，只能靠行 top 坐标去重计数来断言（内容断言 3 行/5 行都能过）。
 //
 // 断言全部同时核对**数据库**与**DOM**：本项目出过「DB 写成功、UI 不刷新」的假绿
 // （store 把 camelCase 字段 assign 到 snake_case 行对象上），只查 DB 会漏。
@@ -144,23 +147,25 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     (await js(`document.querySelector('.detail .tag-chips .d-hint')?.textContent.trim() ?? null`)) as string | null
 
   /**
-   * 「最近添加的标签」快捷区快照。
-   * 除了内容（ids/names），还要采**几何**：用户要求的是「4 列」，
-   * 而 `repeat(4, ...)` 写成 3 列 / 5 列在内容断言下完全看不出来，只能靠左下角坐标去重计数。
+   * 「＋」下方标签下拉的快照。
+   * 除了内容（ids/names/counts），还要采**几何**：
+   *   - 「悬浮」= 不占文档流，靠 menuTop/inputBottom 与 display:none 前后比对（见断言段）；
+   *   - 「4 行」只能靠行的 top 坐标去重数出来（内容断言 3 行/5 行都能过）。
+   * 行尾计数取自 `.tag-menu-count`，断言时与 DB 的 asset_tags 逐一对账。
    */
   interface RecentSnap {
     present: boolean
     ids: number[]
     names: string[]
-    cols: number
+    counts: number[]
     rows: number
-    widths: number[]
-    gridW: number
+    menuW: number
     inputW: number
-    gridLeft: number
-    chipsLeft: number
-    cellBg: string | null
-    chipBg: string | null
+    menuLeft: number
+    inputLeft: number
+    menuTop: number
+    inputBottom: number
+    position: string | null
     hint: string | null
     inputShown: boolean
     ellipsized: string[]
@@ -168,43 +173,44 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
   const recentSnap = async (): Promise<RecentSnap> =>
     JSON.parse(
       ((await js(`(() => {
-        const g = document.querySelector('.detail .recent-tags')
+        const m = document.querySelector('.detail .tag-menu')
         const gi = document.querySelector('.detail .inline-form input')
-        const gc = document.querySelector('.detail .tag-chips')
-        const items = g ? [...g.querySelectorAll('.recent-tag')] : []
-        const boxes = items.map(e => {
+        const rows = m ? [...m.querySelectorAll('.tag-menu-item')] : []
+        const boxes = rows.map(e => {
           const r = e.getBoundingClientRect()
-          const n = e.querySelector('.recent-tag-name')
+          const n = e.querySelector('.tag-menu-name')
           return {
-            id: +e.dataset.recentTagId,
-            l: Math.round(r.left), t: Math.round(r.top), w: Math.round(r.width),
+            id: +e.dataset.tagOptionId,
+            t: Math.round(r.top),
             name: n ? n.textContent : '',
+            count: +(e.querySelector('.tag-menu-count')?.textContent ?? '0'),
             full: n ? n.scrollWidth <= n.clientWidth + 1 : true
           }
         })
+        const mr = m ? m.getBoundingClientRect() : null
+        const ir = gi ? gi.getBoundingClientRect() : null
         return JSON.stringify({
-          present: !!g,
+          present: !!m,
           ids: boxes.map(b => b.id),
           names: boxes.map(b => b.name),
-          cols: [...new Set(boxes.map(b => b.l))].length,
+          counts: boxes.map(b => b.count),
           rows: [...new Set(boxes.map(b => b.t))].length,
-          widths: [...new Set(boxes.map(b => b.w))],
-          gridW: g ? Math.round(g.getBoundingClientRect().width) : 0,
-          inputW: gi ? Math.round(gi.getBoundingClientRect().width) : 0,
-          gridLeft: g ? Math.round(g.getBoundingClientRect().left) : -1,
-          chipsLeft: gc ? Math.round(gc.getBoundingClientRect().left) : -2,
-          // 快捷区用「标签色淡底」代替色点：与上方 tag-chip 的底色（--bg-raised）一比就知道有没有生效
-          cellBg: items.length ? getComputedStyle(items[0]).backgroundColor : null,
-          chipBg: (() => { const c = document.querySelector('.detail .tag-chips .tag-chip[data-tag-id]'); return c ? getComputedStyle(c).backgroundColor : null })(),
-          hint: g ? (g.querySelector('.recent-empty')?.textContent.trim() ?? null) : null,
+          menuW: mr ? Math.round(mr.width) : 0,
+          inputW: ir ? Math.round(ir.width) : 0,
+          menuLeft: mr ? Math.round(mr.left) : -1,
+          inputLeft: ir ? Math.round(ir.left) : -2,
+          menuTop: mr ? Math.round(mr.top) : -1,
+          inputBottom: ir ? Math.round(ir.bottom) : -2,
+          position: m ? getComputedStyle(m).position : null,
+          hint: m ? (m.querySelector('.tag-menu-empty')?.textContent.trim() ?? null) : null,
           inputShown: !!gi,
           ellipsized: boxes.filter(b => !b.full).map(b => b.name)
         })
       })()`)) as string | null) ?? '{}'
     ) as RecentSnap
 
-  /** 点快捷区第 idx 个标签（真实鼠标；输入框会 blur，靠 @mousedown.prevent 兜住） */
-  const clickRecent = async (idx: number): Promise<boolean> => clickEl('.detail .recent-tags .recent-tag', idx)
+  /** 点下拉第 idx 行（真实鼠标；输入框会 blur，靠 @mousedown.prevent 兜住） */
+  const clickRecent = async (idx: number): Promise<boolean> => clickEl('.detail .tag-menu-item', idx)
 
   /**
    * 侧栏标签行。
@@ -540,14 +546,15 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
 
     await capture('shot-tag-done.png')
 
-    // ==================== H9. 「＋」下方的最近标签快捷区 ====================
+    // ==================== H9. 「＋」下方的最近标签悬浮下拉 ====================
     //
-    // 需求：点添加标签的 ＋ 后，输入框下方显示最近添加的标签（4 列），点一下直接挂上。
-    // 两个容易翻车的点各有断言盯着：
-    //   ① 输入框带 `@blur="addTag"`：点按钮会先 blur → 表单被 v-if 摘掉 → click 落空。
-    //      靠快捷区按钮上的 `@mousedown.prevent` 兜住（H9c/H9d 变红就是这里坏了）。
-    //   ② 「4 列」是 CSS 栅格行为，内容断言完全看不出来（3 列/5 列都过），
-    //      只能靠格子左上角坐标去重计数。
+    // 需求：点添加标签的 ＋ 后，**悬浮**显示最近添加的标签（4 行封顶、行尾带计数），点一下直接挂上。
+    // 三个容易翻车的点各有断言盯着：
+    //   ① 输入框带 `@blur="addTag"`：点行会先 blur → 表单被 v-if 摘掉 → click 落空。
+    //      靠行上的 `@mousedown.prevent` 兜住（H9f/H9g 变红就是这里坏了）。
+    //   ② 下拉必须脱离文档流（用户要的是「悬浮」不是「在页面上拓展」）：断言段用
+    //      「临时 display:none 前后下方评分区 top 是否一致」来判定，改回 static/relative 会变红。
+    //   ③ 「4 行」是布局行为，内容断言完全看不出来（3 行/5 行都过），只能靠行 top 坐标去重计数。
     step('H9-最近标签')
     // 此刻（H8 刚跑完）库里标签已被清空 —— 正好先验「一个标签都没有」那条提示
     const idRedCard = assetIdOf('红.png')
@@ -563,13 +570,17 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     await sleep(300)
 
     // 造 12 个标签（创建顺序 = id 顺序），把**最新的**「标签12」挂到红.png 上。
-    // 必须挂最新的那个：挂最老的（标签01）它本来就排在 8 格窗口之外，
-    // 「已挂标签要从快捷区排除」这条规则失效了也看不出来（注入验证踩过这个坑）。
+    // 必须挂最新的那个：挂最老的（标签01）它本来就排在 4 行窗口之外，
+    // 「已挂标签要从下拉里排除」这条规则失效了也看不出来（注入验证踩过这个坑）。
+    // 另外给蓝.png 挂上 标签11/10/09，让行尾计数出现 1/1/1/0 的梯度 ——
+    // 全 0 的话「计数是真查出来的还是写死的」就分不清了。
+    // （别用绿.png：它在 H8 里被当作「删素材」的靶子删掉了，再挂会撞外键。）
     const tagNames12 = Array.from({ length: 12 }, (_, i) => `标签${String(i + 1).padStart(2, '0')}`)
     const tagIds12: Record<string, number> = {}
     for (const n of tagNames12) tagIds12[n] = createTag({ name: n }).id
     const idNewest = tagIds12['标签12']
     setTags(idRedCard, [idNewest])
+    setTags(assetIdOf('蓝.png'), [tagIds12['标签11'], tagIds12['标签10'], tagIds12['标签09']])
     // 刚才是服务层直接改的库，渲染层还不知道 → 重新 bootstrap
     const reloadedH9 = onceLoaded(win)
     await rawJs(`location.reload()`)
@@ -581,29 +592,74 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       sidebar: await sideMap()
     }
 
-    /** 期望的快捷区内容：库里的标签按 id 倒序（= 添加时间倒序），去掉已挂上的，取前 n 个 */
+    /** 期望的下拉内容：库里的标签按 id 倒序（= 添加时间倒序），去掉已挂上的，取前 n 行 */
     const expectRecent = (n: number): number[] =>
       tagIdsDesc()
         .filter((id) => !attachedTagIds(idRedCard).includes(id))
         .slice(0, n)
+    /** 输入框搜 q 时的期望：名字含 q、未挂在本素材上、4 行封顶 */
+    const expectSearch = (q: string): number[] => {
+      const attached = attachedTagIds(idRedCard)
+      return tagIdsDesc()
+        .filter((id) => !attached.includes(id))
+        .filter((id) => (tagRows().find((t) => t.id === id)?.name ?? '').toLowerCase().includes(q))
+        .slice(0, 4)
+    }
+    /** 行尾那个数字该是多少：直接查 DB，别拿 DOM 互相印证 */
+    const dbTagCount = (id: number): number =>
+      (D().prepare('SELECT COUNT(*) AS c FROM asset_tags WHERE tag_id = ?').get(id) as { c: number }).c
 
     await clickEl(`.masonry-card[data-id="${idRedCard}"]`)
     await sleep(700)
     await clickEl('.detail .tag-chips .tag-add')
     await sleep(400)
-    // 先把鼠标挪开：参考用的 tag-chip 一旦被 hover 底色就变了，淡底断言会假绿
     moveAway()
     await sleep(150)
-    R.h9_grid = await recentSnap()
-    R.h9_gridExpect = expectRecent(8)
-    // 已挂在这个素材上的标签不该出现在快捷区（上方 chip 已经有了）
+    R.h9_menu = await recentSnap()
+    R.h9_menuExpect = expectRecent(4)
+    R.h9_menuCounts = (R.h9_menuExpect as number[]).map(dbTagCount)
+    // 已挂在这个素材上的标签不该出现在下拉里（上方 chip 已经有了）
     R.h9_excludesAttached = await js(
-      `!document.querySelector('.detail .recent-tags .recent-tag[data-recent-tag-id="${idNewest}"]')`
+      `!document.querySelector('.detail .tag-menu-item[data-tag-option-id="${idNewest}"]')`
     )
+    // 「悬浮」不是看 CSS 属性就完事：把下拉临时拿掉，下面评分区若原地不动才算真的没占位
+    R.h9_float = await js(`(() => {
+      const m = document.querySelector('.detail .tag-menu')
+      const rr = document.querySelector('.detail .rate-row')
+      if (!m || !rr) return null
+      const withMenu = Math.round(rr.getBoundingClientRect().top)
+      const old = m.style.display
+      m.style.display = 'none'
+      const withoutMenu = Math.round(rr.getBoundingClientRect().top)
+      m.style.display = old
+      return { withMenu, withoutMenu }
+    })()`)
     await capture('shot-tag-recent.png')
 
-    // H9c 点第一个格子（最新的那个）→ 挂上、输入框不被 blur 关掉、格子就地重排
-    const pick1 = (R.h9_grid as RecentSnap).ids[0]
+    // H9b 在输入框里搜「1」→ 下拉换成匹配项
+    //（名字含 1 的有 标签01/10/11/12，12 已挂在本素材上 → 剩 3 行，同样是最近的在前）
+    const searchFocused = await js(`(() => {
+      const i = document.querySelector('.detail .inline-form input')
+      if (!i) return false
+      i.focus()
+      return true
+    })()`)
+    win.webContents.insertText('1')
+    await sleep(400)
+    moveAway()
+    await sleep(150)
+    R.h9_searchTyped = searchFocused === true
+    R.h9_search = await recentSnap()
+    R.h9_searchExpect = expectSearch('1')
+    await capture('shot-tag-recent-search.png')
+    // 退格清空 → 回到「最近 4 行」
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' })
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' })
+    await sleep(400)
+    R.h9_afterClear = await recentSnap()
+
+    // H9f 点第一行（最新的那个）→ 挂上、输入框不被 blur 关掉、该行消失且列表就地补位
+    const pick1 = (R.h9_menu as RecentSnap).ids[0]
     R.h9_pick1Target = pick1
     R.h9_click1 = await clickRecent(0)
     await sleep(1100)
@@ -615,15 +671,15 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       attached: attachedTagIds(idRedCard),
       chips: await detailChips(),
       sidebar: await sideMap(),
-      expect: expectRecent(8),
+      expect: expectRecent(4),
       pickedName: tagRows().find((t) => t.id === pick1)?.name ?? null
     }
     await capture('shot-tag-recent-picked.png')
 
-    // H9d 再点最后一个格子 → 「第一下点得动」不代表「重排后还点得动」
-    const pick2 = snap1.ids[6]
+    // H9g 重排之后再点最后一次 → 「第一下点得动」不代表「重排后还点得动」
+    const pick2 = snap1.ids[3]
     R.h9_pick2Target = pick2
-    R.h9_click2 = await clickRecent(6)
+    R.h9_click2 = await clickRecent(3)
     await sleep(1100)
     moveAway()
     await sleep(150)
@@ -631,11 +687,11 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     R.h9_afterPick2 = {
       snap: snap2,
       attached: attachedTagIds(idRedCard),
-      expect: expectRecent(8),
+      expect: expectRecent(4),
       pickedName: tagRows().find((t) => t.id === pick2)?.name ?? null
     }
 
-    // H9e 12 个标签全挂到这张素材上 → 快捷区无标签可点，提示要换成「都已添加」
+    // H9h 12 个标签全挂到这张素材上 → 下拉没有可加的了，提示要换成「都已添加」
     setTags(idRedCard, Object.values(tagIds12))
     const reloadedH9e = onceLoaded(win)
     await rawJs(`location.reload()`)
@@ -685,9 +741,15 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     }
     const h9e0 = R.h9_emptyState as RecentSnap
     const h9s = R.h9_setup as { tagCount: number; attached: number[]; sidebar: Record<string, number> }
-    const h9g = R.h9_grid as RecentSnap
-    const h9gExp = R.h9_gridExpect as number[]
+    const h9m = R.h9_menu as RecentSnap
+    const h9mExp = R.h9_menuExpect as number[]
+    const h9mCnt = R.h9_menuCounts as number[]
     const h9ex = R.h9_excludesAttached as boolean
+    const h9flt = R.h9_float as { withMenu: number; withoutMenu: number } | null
+    const h9st = R.h9_searchTyped as boolean
+    const h9sr = R.h9_search as RecentSnap
+    const h9srExp = R.h9_searchExpect as number[]
+    const h9ac = R.h9_afterClear as RecentSnap
     const h9p1t = R.h9_pick1Target as number
     const h9p1 = R.h9_afterPick1 as {
       snap: RecentSnap; attached: number[]; chips: string[]; sidebar: Record<string, number>
@@ -784,39 +846,54 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       deleteAssetCardsRemain: h8a?.cards?.length === 2,
       deleteAssetNotifies: /已自动清除/.test(h8a?.notice ?? ''),
 
-      // ==================== H9 「＋」下方的最近标签快捷区 ====================
-      // ① 库里一个标签都没有：快捷区在，但没有格子，提示指向「新建」
+      // ==================== H9 「＋」下方的最近标签悬浮下拉 ====================
+      // ① 库里一个标签都没有：下拉在，但没有行，提示指向「新建」
       recentEmptyWhenNoTags: h9e0?.present === true && (h9e0?.ids?.length ?? -1) === 0 &&
         h9e0?.hint === '输入名称新建第一个标签' && h9e0?.inputShown === true,
-      // ② 12 个标签、已挂 1 个 → 可加 11 个，取最新 8 个：正好 4 列 2 行
+      // ② 12 个标签、红.png 已挂 1 个 → 可加 11 个，只显示最近 4 行
       recentSetupOk: h9s?.tagCount === 12 && (h9s?.attached?.length ?? -1) === 1 && h9s?.sidebar?.['标签12'] === 1,
-      recentGridIsFourColumns: h9g?.cols === 4 && h9g?.rows === 2 && (h9g?.ids?.length ?? -1) === 8,
-      recentGridCellsEqualWidth: (h9g?.widths?.length ?? 0) === 1 && (h9g?.widths?.[0] ?? 0) >= 45,
-      // 淡底生效（用标签色替代色点）：底色必须不同于上方 tag-chip 的 --bg-raised
-      recentGridCellsTinted: h9g?.cellBg != null && h9g?.chipBg != null && h9g.cellBg !== h9g.chipBg,
-      // 与上方标签 chip 左对齐、且用满整个详情栏（比输入框宽）—— 挪回 .inline-form 会一起变红。
-      // 196 而不是 206：详情栏有纵向滚动条，占掉约 10px
-      recentGridAlignsWithChips: Math.abs((h9g?.gridLeft ?? -1) - (h9g?.chipsLeft ?? -2)) <= 1 &&
-        (h9g?.gridW ?? 0) >= 190 && (h9g?.gridW ?? 0) > (h9g?.inputW ?? 0),
-      // ③ 顺序与筛选：DOM 顺序 == DB 里「按添加时间倒序、去掉已挂的、截前 8」
-      recentGridOrderMatchesDb: (h9g?.ids ?? []).join('|') === (h9gExp ?? []).join('|') && (h9gExp?.length ?? -1) === 8,
-      recentGridExcludesAttached: h9ex === true,
-      // ④ 点一个格子：挂上了、输入框没被 blur 关掉、该格消失且列表就地补位
+      recentMenuShowsFourRows: (h9m?.ids?.length ?? -1) === 4 && h9m?.rows === 4,
+      // 顺序 == DB 里「按添加时间倒序、去掉已挂的、截前 4 行」
+      recentMenuOrderMatchesDb: (h9m?.ids ?? []).join('|') === (h9mExp ?? []).join('|') &&
+        (h9mExp?.length ?? -1) === 4,
+      recentMenuExcludesAttached: h9ex === true,
+      // 行尾计数是查 DB 来的：1/1/1/0 的梯度，写死 0 或只数当前素材都会露馅
+      recentMenuCountsMatchDb: (h9m?.counts ?? []).join('|') === (h9mCnt ?? []).join('|') &&
+        (h9mCnt ?? []).join('|') === '1|1|1|0',
+      // ③ 悬浮：与输入框等宽、左对齐，紧贴输入框下沿
+      recentMenuAlignedWithInput: (h9m?.inputLeft ?? -2) >= 0 &&
+        Math.abs((h9m?.menuLeft ?? -1) - (h9m?.inputLeft ?? -2)) <= 1 &&
+        Math.abs((h9m?.menuW ?? 0) - (h9m?.inputW ?? 0)) <= 1,
+      recentMenuHugsInput: (h9m?.menuTop ?? -1) - (h9m?.inputBottom ?? -2) >= 0 &&
+        (h9m?.menuTop ?? -1) - (h9m?.inputBottom ?? -2) <= 8,
+      // 关键：**不占文档流**。把下拉 display:none 掉，下方评分区若分毫不动才算真悬浮；
+      // 改成 static/relative 会立刻变红（那就是用户嫌弃的「在页面上拓展」）。
+      recentMenuOutOfFlow: h9m?.position === 'absolute' && h9flt !== null &&
+        h9flt.withMenu === h9flt.withoutMenu,
+      // ④ 搜索：输入「1」→ 只剩名字含 1 的（同样排除已挂的、4 行封顶）
+      recentSearchTypedReal: h9st === true,
+      recentSearchFilters: (h9sr?.ids ?? []).join('|') === (h9srExp ?? []).join('|') &&
+        (h9srExp?.length ?? -1) === 3 && h9sr?.inputShown === true,
+      // 退格清空 → 回到「最近 4 行」
+      recentSearchClearsBack: (h9ac?.ids ?? []).join('|') === (h9mExp ?? []).join('|') &&
+        h9ac?.hint === null && h9ac?.rows === 4,
+      // ⑤ 点一行：挂上了、输入框没被 blur 关掉、该行消失且列表就地补位
       recentPickClickLanded: R.h9_click1 === true,
       recentPickAddsToDb: (h9p1?.attached?.length ?? -1) === 2 && h9p1?.attached?.includes(h9p1t) === true,
       recentPickAddsChip: h9p1?.chips?.includes(h9p1?.pickedName ?? '') === true,
-      recentPickUpdatesSidebar: h9p1?.sidebar?.[h9p1?.pickedName ?? ''] === 1,
-      // 关键：输入框还开着（blur 陷阱）；被点的格子从列表里消失，列表保持 8 个并补上新的一个
+      // 侧栏计数要跟着 +1（原来的值就是下拉里那行的数字）
+      recentPickUpdatesSidebar: h9p1?.sidebar?.[h9p1?.pickedName ?? ''] === (h9mCnt?.[0] ?? -99) + 1,
+      // 关键：输入框还开着（blur 陷阱）；被点的那行消失，列表保持 4 行并补上新的一个
       recentPickKeepsInputOpen: h9p1?.snap?.inputShown === true,
-      recentPickRefillsGrid: (h9p1?.snap?.ids ?? []).join('|') === (h9p1?.expect ?? []).join('|') &&
-        h9p1?.snap?.ids?.includes(h9p1t) === false && (h9p1?.snap?.cols ?? 0) === 4,
-      // ⑤ 重排之后再点一次：证明不是「只有第一次点得动」
+      recentPickRefillsMenu: (h9p1?.snap?.ids ?? []).join('|') === (h9p1?.expect ?? []).join('|') &&
+        h9p1?.snap?.ids?.includes(h9p1t) === false && h9p1?.snap?.rows === 4,
+      // ⑥ 重排之后再点一次：证明不是「只有第一次点得动」
       recentPick2ClickLanded: R.h9_click2 === true,
       recentPick2AddsToDb: (h9p2?.attached?.length ?? -1) === 3 && h9p2?.attached?.includes(h9p2t) === true,
       recentPick2KeepsInputOpen: h9p2?.snap?.inputShown === true &&
         (h9p2?.snap?.ids ?? []).join('|') === (h9p2?.expect ?? []).join('|') &&
         h9p2?.snap?.ids?.includes(h9p2t) === false,
-      // ⑥ 12 个标签全挂上后：没有可加的标签了，提示换成「都已添加」
+      // ⑦ 12 个标签全挂上后：没有可加的了，提示换成「都已添加」
       recentAllAttachedHint: h9all?.present === true && (h9all?.ids?.length ?? -1) === 0 &&
         h9all?.hint === '近期标签都已添加' && h9all?.inputShown === true,
 

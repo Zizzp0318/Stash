@@ -124,21 +124,29 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   /**
-   * 最近添加的标签（新的在前），详情页「＋」下方的快捷区用它。
+   * 最近添加的标签（新的在前），详情页「＋」下方的悬浮下拉用它。
    *
    * 时间序直接用 `id` 倒序：`tags.id` 是库内自增主键，插入越晚 id 越大，
    * 等价于创建时间倒序 —— 不必额外加 `created_at` 列（也不必给老库做迁移）。
    * 若哪天要做「最近**使用**过的标签」，那就真得存时间了（现有表结构推不出来）。
    *
-   * @param excludeIds 当前素材已经挂上的标签，不该出现在快捷区（上方 chip 已经展示了）
+   * @param excludeIds 当前素材已经挂上的标签，不该出现在下拉里（上方 chip 已经展示了）
+   * @param limit      下拉最多几行：详情栏是窄条，超过 4 行就盖住下面的评分区了
+   * @param query      输入框里已经打的字：非空时按名字做包含匹配（「搜索或创建」里搜的那一半）
    */
-  function recentTags(excludeIds: number[] = [], limit = 8): TagRow[] {
+  function recentTags(excludeIds: number[] = [], limit = 4, query = ''): TagRow[] {
     const skip = new Set(excludeIds)
+    const q = query.trim().toLowerCase()
     // filter 已经产出新数组，后面的 sort 不会污染 store 里的原始顺序
     return tags.value
-      .filter((t) => !skip.has(t.id))
+      .filter((t) => !skip.has(t.id) && (!q || t.name.toLowerCase().includes(q)))
       .sort((a, b) => b.id - a.id)
       .slice(0, limit)
+  }
+
+  /** 标签挂了多少个素材（详情页下拉行尾那个数字，与侧栏标签行同源） */
+  function tagCount(tagId: number): number {
+    return counts.value.byTag[String(tagId)] ?? 0
   }
 
   async function loadMeta(): Promise<void> {
@@ -231,6 +239,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, recentTags, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

@@ -479,12 +479,13 @@ mark {
   box-shadow: inset 0 0 0 1px var(--accent);
   color: var(--text-1);
 }
-.inline-form { padding: 2px 4px 6px 8px; }
+/* 标签输入框：自身相对定位，好让下拉浮层贴着它下沿浮起来 */
+.inline-form { position: relative; padding: 2px 4px 6px 8px; }
 .inline-form input {
   width: 100%;
   box-sizing: border-box;
   height: 24px;
-  padding: 0 8px;
+  padding: 0 8px 0 22px; /* 左侧留给那个小标签图标 */
   border-radius: 6px;
   border: 1px solid #5A8AC9;
   background: var(--bg-input, #1D1F22);
@@ -493,46 +494,61 @@ mark {
   font-family: var(--font);
   outline: none;
 }
-
-/* 「最近添加的标签」快捷区：输入框下方固定 4 列。
-   刻意**不放进 `.inline-form`**：那里左右各留了 8/4px 内边距，一格只剩 ~43px，
-   中文标签名会被省略成「标…」。放在 `.d-section` 下与上方标签 chip 左对齐，一格 ~46px。
-   标签身份用**淡色底**表达而不是色点：色点要吃掉 8px，放不下 3 个汉字。 */
-.recent-tags {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 4px;
-  margin: 0 0 4px;
+/* 输入框里的小标签图标：纯装饰，别抢走点击 */
+.tag-search-ico {
+  position: absolute;
+  left: 14px;   /* 8（.inline-form 左内边距）+ 6（距输入框左边缘）= 输入框内 6px 处 */
+  top: 8.5px;   /* 2（上内边距）+ (24 - 11) / 2，与输入框垂直居中 */
+  width: 11px;
+  height: 11px;
+  color: var(--text-3);
+  pointer-events: none;
 }
-.recent-tag {
+
+/* 「最近添加的标签」下拉。
+   必须 **absolute 脱离文档流** —— 用户要的是「悬浮」，不是在页面上把内容撑开：
+   详情栏是窄条，若这 4 行参与布局，下面的评分/色板会被整块推下去。
+   改回 static/relative 时冒烟的 `recentMenuOutOfFlow` 会变红。 */
+.tag-menu {
+  position: absolute;
+  z-index: 30;
+  left: 8px;    /* 与输入框左边缘对齐（= .inline-form 的 padding-left） */
+  right: 4px;   /* 与输入框右边缘对齐（= padding-right）→ 二者等宽 */
+  top: 28px;    /* 2（上内边距）+ 24（输入框高）+ 2（缝隙） */
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+}
+.tag-menu-item {
   display: flex;
   align-items: center;
-  min-width: 0;
-  height: 22px;
-  padding: 0 5px;
-  border: 1px solid transparent;
+  gap: 6px;
+  width: 100%;
+  height: 26px;
+  padding: 0 7px;
+  border: 0;
   border-radius: 5px;
-  background: var(--bg-raised); /* color-mix 不被支持时的退路 */
-  background: color-mix(in srgb, var(--tag-color, var(--bg-raised)) 22%, var(--bg-raised));
+  background: transparent;
   color: var(--text-2);
   font-family: var(--font);
-  font-size: 10.5px;
+  font-size: 11.5px;
+  text-align: left;
   cursor: pointer;
 }
-.recent-tag:hover {
-  color: var(--text-1);
-  background: color-mix(in srgb, var(--tag-color, var(--bg-hover)) 34%, var(--bg-hover));
-  border-color: var(--accent-border);
-}
-/* 4 列时单格只有 ~48px，长标签名只能省略（完整名在 title 里） */
-.recent-tag .recent-tag-name {
+.tag-menu-item:hover { background: var(--bg-hover); color: var(--text-1); }
+.tag-menu-item .tag-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.tag-menu-name {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* 一条提示占满整行，别被挤进第一列 */
-.recent-tags .recent-empty { grid-column: 1 / -1; padding: 2px 0; }
+/* 行尾计数：一眼看出这个标签已经挂了几张素材 */
+.tag-menu-count { flex-shrink: 0; color: var(--text-3); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.tag-menu-empty { display: block; padding: 6px 7px; color: var(--text-3); font-size: 11px; }
 
 /* 侧栏文件夹「就地重命名」输入框：藏在行内，看起来像被编辑的文本而不是弹窗 */
 .side-rename {

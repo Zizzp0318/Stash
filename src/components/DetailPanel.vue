@@ -76,18 +76,33 @@ async function toggleFav(): Promise<void> {
   await assets.patchLocal(asset.value.id, { is_fav: asset.value.is_fav ? 0 : 1 })
 }
 
-// —— 标签：点击已有标签移除；输入新建或复用后挂上 ——
+// —— 标签：点击已有标签移除；输入搜索或新建后挂上 ——
 const addingTag = ref(false)
 const newTag = ref('')
 
-/** 快捷区一行 4 列、最多两行；再多就不是「最近」而是标签列表了 */
-const RECENT_LIMIT = 8
+/** 悬浮下拉最多 4 行：详情栏是窄条，再多就把下面的评分区盖住了 */
+const RECENT_LIMIT = 4
 
-/** 最近添加的标签（新的在前），已挂在本素材上的不列出来（上方 chip 已经能看到） */
-const recentTags = computed(() => lib.recentTags(asset.value?.tags.map((t) => t.id) ?? [], RECENT_LIMIT))
+/** 已挂在本素材上的标签不进下拉（上方 chip 已经能看到） */
+const attachedTagIds = computed(() => asset.value?.tags.map((t) => t.id) ?? [])
 
-/** 快捷区为空时的说明：区分「库里还没标签」和「近期标签都已挂上」两种原因 */
-const recentHint = computed(() => (lib.tags.length ? '近期标签都已添加' : '输入名称新建第一个标签'))
+/**
+ * 下拉内容：没输入 = 最近添加的 4 个标签；输着字 = 名字含输入的（同样 4 行封顶）。
+ * 两种情况都排除当前素材已挂的标签。
+ */
+const tagOptions = computed(() => lib.recentTags(attachedTagIds.value, RECENT_LIMIT, newTag.value))
+
+/** 下拉一行都没有时的说明：区分「库里还没标签」「近期标签都已挂上」「输完回车会新建一个」 */
+const menuHint = computed(() => {
+  const q = newTag.value.trim()
+  if (q) return `回车创建「${q}」`
+  return lib.tags.length ? '近期标签都已添加' : '输入名称新建第一个标签'
+})
+
+function closeTagInput(): void {
+  addingTag.value = false
+  newTag.value = ''
+}
 
 /**
  * 把某个标签挂到当前素材上（只管挂，不碰输入框）。
@@ -127,7 +142,7 @@ async function addTag(): Promise<void> {
   newTag.value = ''
 }
 
-/** 点快捷区里的标签：挂上后**不关输入框**，方便连着加好几个 */
+/** 点下拉里的标签：挂上后**不关输入框**，方便连着加好几个 */
 async function pickRecent(tagId: number): Promise<void> {
   await attachTag(tagId)
   newTag.value = ''
@@ -190,24 +205,34 @@ async function removeTag(tagId: number): Promise<void> {
             <span class="tag-chip tag-add" data-add-tag @click="addingTag = true">＋</span>
           </div>
           <div v-if="addingTag" class="inline-form">
-            <input v-model="newTag" placeholder="输入标签名（回车确认）" autofocus @keyup.enter="addTag" @blur="addTag" @keyup.esc="addingTag = false; newTag = ''" />
-          </div>
-          <!-- 最近添加的标签：点一下直接挂到当前素材上，省得反复打字 -->
-          <div v-if="addingTag" class="recent-tags" data-recent-tags>
-            <span v-if="!recentTags.length" class="d-hint recent-empty">{{ recentHint }}</span>
-            <button
-              v-for="t in recentTags"
-              :key="t.id"
-              type="button"
-              class="recent-tag"
-              :data-recent-tag-id="t.id"
-              :style="{ '--tag-color': t.color }"
-              :title="`添加标签「${t.name}」`"
-              @mousedown.prevent
-              @click="pickRecent(t.id)"
-            >
-              <span class="recent-tag-name">{{ t.name }}</span>
-            </button>
+            <svg class="tag-search-ico" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" aria-hidden="true">
+              <path d="M1.7 2.4c0-.4.3-.7.7-.7h3.2c.2 0 .4.1.5.2l3.9 3.9c.3.3.3.7 0 1l-3 3c-.3.3-.7.3-1 0L2 5.9a.7.7 0 0 1-.2-.5V2.4z" />
+              <circle cx="4.1" cy="4.1" r=".85" fill="currentColor" stroke="none" />
+            </svg>
+            <input
+              v-model="newTag"
+              placeholder="搜索或创建标签…"
+              autofocus
+              @keyup.enter="addTag"
+              @blur="addTag"
+              @keyup.esc="closeTagInput"
+            />
+            <!-- 悬浮下拉：absolute 定位浮在输入框下方，不占文档流（下方评分区不会被推下去） -->
+            <div class="tag-menu" data-tag-menu>
+              <span v-if="!tagOptions.length" class="tag-menu-empty" data-tag-menu-empty>{{ menuHint }}</span>
+              <button
+                v-for="t in tagOptions"
+                :key="t.id"
+                type="button"
+                class="tag-menu-item"
+                :data-tag-option-id="t.id"
+                :title="`添加标签「${t.name}」`"
+                @mousedown.prevent
+                @click="pickRecent(t.id)"
+              >
+                <span class="tag-dot" :style="{ background: t.color }"></span><span class="tag-menu-name">{{ t.name }}</span><span class="tag-menu-count">{{ lib.tagCount(t.id) }}</span>
+              </button>
+            </div>
           </div>
           <div class="rate-row">
             <div class="stars" @mouseleave="hoverStar = 0">
