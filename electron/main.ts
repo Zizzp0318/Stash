@@ -11,6 +11,7 @@ import { runSmokeM3 } from './services/smoke3'
 import { runSmokeM4 } from './services/smoke4'
 import { runSmokeFolder } from './services/smoke-folder'
 import { runSmokeSearch } from './services/smoke-search'
+import { runSmokeTag } from './services/smoke-tag'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -221,6 +222,7 @@ function bootstrap(): void {
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))
+    ipcMain.handle('tag:delete', (_e, { id }) => wrap(() => assetsSvc.deleteTag(id)))
 
     // 系统对话框
     ipcMain.handle('dialog:pick-folder', async () => {
@@ -288,6 +290,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-search')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeSearch(win)
+      })
+    }
+
+    // 标签冒烟：详情页添加/摘掉标签 + 侧栏右键删除标签本体（含关联级联与筛选重置）
+    if (process.argv.includes('--smoke-tag')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeTag(win)
       })
     }
 

@@ -60,6 +60,13 @@ export function openDatabase(stashFile: string): DB {
   const { DatabaseSync } = require('node:sqlite')
   const db = new DatabaseSync(stashFile) as DB
   db.exec('PRAGMA journal_mode = WAL')
+  /**
+   * 这里的外键声明其实**不是必需**的：`node:sqlite` 的 `DatabaseSync` 默认
+   * `enableForeignKeyConstraints: true`（实测注释掉本行后 CASCADE 依然生效）。
+   * 但显式写出来更保险 —— 一旦换回 `better-sqlite3` 或改了构造参数，
+   * 外键会被静默关掉，删标签就会留下指向已删 tag_id 的孤儿关联
+   * （侧栏计数为 0、素材详情却还挂着空标签）。`--smoke-tag` 里有孤儿断言盯着这件事。
+   */
   db.exec('PRAGMA foreign_keys = ON')
   db.exec(SCHEMA)
   return db

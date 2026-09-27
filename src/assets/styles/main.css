@@ -367,6 +367,9 @@ mark {
   cursor: pointer;
 }
 .tag-chip:hover { color: var(--text-1); background: var(--bg-hover); border: 0; }
+/* 可移除的提示：× 常驻占位（只改透明度，避免 hover 时宽度跳动导致整行位移） */
+.tag-chip .tag-x { margin-left: 4px; opacity: 0; font-size: 12px; line-height: 1; transition: opacity 0.12s ease; }
+.tag-chip:hover .tag-x { opacity: 0.75; }
 .tag-chip.ai { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); }
 .rate-row { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
 .stars { display: flex; gap: 3px; color: var(--accent); }

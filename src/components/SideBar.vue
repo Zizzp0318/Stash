@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { folderIcon } from '@/data/mock'
-import { useLibraryStore, type FolderRow } from '../stores/library'
+import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { fmtCount } from '../utils/format'
 
@@ -311,17 +311,81 @@ function isUnder(targetId: number, root: FolderRow): boolean {
   return !!t && t.path.startsWith(root.path + '/')
 }
 
+// ==================== 标签右键菜单 / 删除标签 ====================
+/**
+ * 标签有两层「删除」，语义不同，别混：
+ *  - 详情页点标签 chip = 从**这个素材**上摘掉（`asset.setTags`，标签本体还在，其它素材照旧）
+ *  - 这里右键删除 = 删掉**标签本体**（`tag.remove`，所有素材一并解绑）
+ */
+const tagMenu = ref<{ x: number; y: number; tag: TagRow } | null>(null)
+
+function openTagMenu(e: MouseEvent, t: TagRow): void {
+  e.preventDefault()
+  e.stopPropagation()
+  const w = 168
+  const h = 92
+  tagMenu.value = {
+    tag: t,
+    x: Math.max(6, Math.min(e.clientX, window.innerWidth - w - 6)),
+    y: Math.max(6, Math.min(e.clientY, window.innerHeight - h - 6))
+  }
+}
+function closeTagMenu(): void {
+  tagMenu.value = null
+}
+
+const pendingTagDelete = ref<TagRow | null>(null)
+/** 删这个标签会影响多少个素材（用后端计数，不是当前列表长度） */
+const tagDeleteInfo = computed(() => {
+  const t = pendingTagDelete.value
+  return { assets: t ? (lib.counts.byTag[String(t.id)] ?? 0) : 0 }
+})
+
+function askDeleteTag(): void {
+  const t = tagMenu.value?.tag
+  closeTagMenu()
+  pendingTagDelete.value = t ?? null
+}
+
+async function confirmDeleteTag(): Promise<void> {
+  const t = pendingTagDelete.value
+  if (!t || busy.value) return
+  busy.value = true
+  try {
+    const r = await window.stash.tag.remove(t.id)
+    if (!r.ok) throw new Error(r.error ?? '删除失败')
+    pendingTagDelete.value = null
+    // 当前正按这个标签筛选 → 回到「所有素材」，否则会停在空列表上
+    if (assets.query.tagId === t.id) assets.query.tagId = null
+    await lib.loadMeta()
+    await assets.refresh()
+    // 详情面板里可能正挂着这个标签 —— 重新拉一次详情，否则 chip 会赖在界面上
+    // （用 loadDetail 而不是 select：后者会把用户的多选状态清成单个）
+    const openId = assets.selectedId
+    if (openId != null) await assets.loadDetail(openId)
+    assets.notify('info', `已删除标签「${t.name}」（从 ${r.data?.unlinked ?? 0} 个素材上移除）`)
+  } catch (e) {
+    fail(`删除标签失败：${String((e as Error).message ?? e)}`)
+  } finally {
+    busy.value = false
+  }
+}
+
 // ==================== 全局按键 / 点击 ====================
 function onKeyDown(e: KeyboardEvent): void {
   if (e.key !== 'Escape') return
+  if (tagMenu.value) return closeTagMenu()
   if (menu.value) return closeMenu()
+  if (pendingTagDelete.value) return void (pendingTagDelete.value = null)
   if (pendingDelete.value) return void (pendingDelete.value = null)
   cancelDraft()
 }
 
 /** 点击菜单以外的任何地方都关闭右键菜单 */
 function onWindowMouseDown(e: MouseEvent): void {
-  if (menu.value && !(e.target as HTMLElement).closest('.ctx-menu')) closeMenu()
+  const t = e.target as HTMLElement
+  if (menu.value && !t.closest('.ctx-menu')) closeMenu()
+  if (tagMenu.value && !t.closest('.ctx-menu')) closeTagMenu()
 }
 
 onMounted(() => {
@@ -440,7 +504,10 @@ onBeforeUnmount(() => {
           :key="t.id"
           class="side-item"
           :class="{ active: assets.query.tagId === t.id }"
+          :data-tag-id="t.id"
+          :title="`点击按「${t.name}」筛选，右键管理`"
           @click="pickTag(t.id)"
+          @contextmenu.prevent.stop="openTagMenu($event, t)"
         >
           <span class="tag-dot" :style="{ background: t.color }"></span>
           {{ t.name }} <span class="n">{{ fmtCount(lib.counts.byTag[String(t.id)] ?? 0) }}</span>
@@ -505,6 +572,43 @@ onBeforeUnmount(() => {
           <div class="modal-foot">
             <button class="w-btn" :disabled="busy" @click="pendingDelete = null">取消</button>
             <button class="w-btn danger-strong" :disabled="busy" @click="confirmDeleteFolder">删除</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 标签右键菜单 -->
+    <Teleport to="body">
+      <div
+        v-if="tagMenu"
+        class="ctx-menu tag-ctx"
+        :style="{ left: tagMenu.x + 'px', top: tagMenu.y + 'px' }"
+        @mousedown.stop
+      >
+        <div class="ctx-head">{{ tagMenu.tag.name }}</div>
+        <button class="ctx-item danger" @click="askDeleteTag">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M2.4 3.6h8.2M5.1 3.6V2.4h2.8v1.2M3.4 3.6l.5 7h5.2l.5-7" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          删除标签
+        </button>
+      </div>
+    </Teleport>
+
+    <!-- 删除标签确认（只解绑素材，不删文件） -->
+    <Teleport to="body">
+      <div v-if="pendingTagDelete" class="modal-mask" @click.self="pendingTagDelete = null">
+        <div class="modal">
+          <div class="modal-title">删除标签「{{ pendingTagDelete.name }}」？</div>
+          <div class="modal-body">
+            <p class="modal-text">
+              该标签会从 <b>{{ tagDeleteInfo.assets }}</b> 个素材上移除。
+              <b>素材文件本身不受影响</b>，只是不再带这个标签。
+            </p>
+          </div>
+          <div class="modal-foot">
+            <button class="w-btn" :disabled="busy" @click="pendingTagDelete = null">取消</button>
+            <button class="w-btn danger-strong" :disabled="busy" @click="confirmDeleteTag">删除</button>
           </div>
         </div>
       </div>

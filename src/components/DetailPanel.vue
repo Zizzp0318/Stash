@@ -88,9 +88,25 @@ async function addTag(): Promise<void> {
     return
   }
   const existing = lib.tags.find((t) => t.name === name)
-  const tagId = existing ? existing.id : (await window.stash.tag.create({ name })).data?.id
+  const created = existing ? null : await window.stash.tag.create({ name })
+  if (created && !created.ok) {
+    addingTag.value = false
+    newTag.value = ''
+    return void assets.notify('error', `新建标签失败：${created.error ?? '未知错误'}`)
+  }
+  const tagId = existing ? existing.id : created?.data?.id
   if (tagId) {
-    await window.stash.asset.setTags(a.id, [...a.tags.map((t) => t.id), tagId])
+    if (a.tags.some((t) => t.id === tagId)) {
+      // 已经挂过这个标签：什么都不用做，直接收起输入框（否则 setTags 会原地重写一遍）
+      addingTag.value = false
+      newTag.value = ''
+      return
+    }
+    const r = await window.stash.asset.setTags(a.id, [...a.tags.map((t) => t.id), tagId])
+    if (!r.ok) {
+      addingTag.value = false
+      return void assets.notify('error', `添加标签失败：${r.error ?? '未知错误'}`)
+    }
     await lib.loadMeta()
     await assets.select(a.id)
   }
@@ -98,10 +114,13 @@ async function addTag(): Promise<void> {
   newTag.value = ''
 }
 
+/** 从当前素材上摘掉某个标签（标签本体保留，其它素材照旧） */
 async function removeTag(tagId: number): Promise<void> {
   const a = asset.value
   if (!a) return
-  await window.stash.asset.setTags(a.id, a.tags.filter((t) => t.id !== tagId).map((t) => t.id))
+  const r = await window.stash.asset.setTags(a.id, a.tags.filter((t) => t.id !== tagId).map((t) => t.id))
+  // 必须检查返回：IPC 失败时上面那行是静默的，界面看着像「点了没反应」
+  if (!r.ok) return void assets.notify('error', `移除标签失败：${r.error ?? '未知错误'}`)
   await lib.loadMeta()
   await assets.select(a.id)
 }
@@ -131,11 +150,18 @@ async function removeTag(tagId: number): Promise<void> {
         <div class="d-section">
           <div class="d-label">标签</div>
           <div class="tag-chips">
-            <span v-for="t in asset.tags" :key="t.id" class="tag-chip" :title="`点击移除「${t.name}」`" @click="removeTag(t.id)">
-              <span class="tag-dot" :style="{ background: t.color }"></span>{{ t.name }}
+            <span
+              v-for="t in asset.tags"
+              :key="t.id"
+              class="tag-chip"
+              :data-tag-id="t.id"
+              :title="`点击移除「${t.name}」`"
+              @click="removeTag(t.id)"
+            >
+              <span class="tag-dot" :style="{ background: t.color }"></span>{{ t.name }}<span class="tag-x" aria-hidden="true">×</span>
             </span>
             <span v-if="!asset.tags.length" class="d-hint">暂无标签</span>
-            <span class="tag-chip" @click="addingTag = true">＋</span>
+            <span class="tag-chip tag-add" data-add-tag @click="addingTag = true">＋</span>
           </div>
           <div v-if="addingTag" class="inline-form">
             <input v-model="newTag" placeholder="输入标签名（回车确认）" autofocus @keyup.enter="addTag" @blur="addTag" @keyup.esc="addingTag = false; newTag = ''" />

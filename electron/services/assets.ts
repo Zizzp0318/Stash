@@ -289,6 +289,21 @@ export function createTag({ name, color }: { name: string; color?: string }): { 
   return { id: Number(r.lastInsertRowid) }
 }
 
+/**
+ * 彻底删除标签本身（不是「从某个素材上摘掉」——那个走 `setTags`）。
+ * `asset_tags` 的关联靠外键 `ON DELETE CASCADE` 自动清空，前提是 `db.ts` 里的
+ * `PRAGMA foreign_keys = ON` 生效：SQLite 的外键约束**默认是关的**，被关掉时
+ * 这里会留下一堆指向已删除 tag_id 的孤儿关联（表现为侧栏计数为 0 但素材详情里还挂着空标签）。
+ * 返回被解绑的素材数，供 UI 提示。
+ */
+export function deleteTag(id: number): { unlinked: number } {
+  const { db } = requireCurrent()
+  const unlinked = (db.prepare('SELECT count(*) AS c FROM asset_tags WHERE tag_id=?').get(id) as { c: number }).c
+  const r = db.prepare('DELETE FROM tags WHERE id=?').run(id)
+  if (r.changes === 0) throw new Error('ERR_TAG_NOT_FOUND')
+  return { unlinked }
+}
+
 /** 侧栏计数：总数 + 按文件夹直挂数 + 按标签数（子树聚合由渲染层按路径前缀计算） */
 export function counts(): { total: number; byFolder: Record<string, number>; byTag: Record<string, number> } {
   const { db } = requireCurrent()

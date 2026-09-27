@@ -115,6 +115,8 @@ export interface StashAssetApi {
 export interface StashTagApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ id: number; name: string; color: string }>; error?: string }>
   create: (args: { name: string; color?: string }) => Promise<{ ok: boolean; data?: { id: number }; error?: string }>
+  /** 彻底删除标签（不是从素材上摘掉），返回被解绑的素材数 */
+  remove: (id: number) => Promise<{ ok: boolean; data?: { unlinked: number }; error?: string }>
 }
 
 export interface StashDialogApi {

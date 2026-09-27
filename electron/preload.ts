@@ -57,7 +57,8 @@ contextBridge.exposeInMainWorld('stash', {
   },
   tag: {
     list: () => ipcRenderer.invoke('tag:list'),
-    create: (args: { name: string; color?: string }) => ipcRenderer.invoke('tag:create', args)
+    create: (args: { name: string; color?: string }) => ipcRenderer.invoke('tag:create', args),
+    remove: (id: number) => ipcRenderer.invoke('tag:delete', { id })
   },
   dialog: {
     pickFolder: () => ipcRenderer.invoke('dialog:pick-folder'),
