@@ -141,7 +141,8 @@ body {
 /* ---- 中间画廊 ---- */
 .gallery { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
 .toolbar { padding: 10px 16px 0; flex-shrink: 0; }
-.toolbar-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+/* position: relative 只为给 .notice-toast 当定位参照（它浮在这一行的中段上空） */
+.toolbar-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; position: relative; }
 .toolbar-head h1 { font-size: 15px; font-weight: 600; }
 .toolbar-head .total { font-size: 12px; color: var(--text-3); }
 .toolbar-head .viewtoggle { margin-left: auto; display: flex; gap: 4px; }
@@ -747,19 +748,28 @@ mark {
 .import-fill { height: 100%; background: #5A8AC9; border-radius: 3px; transition: width 0.15s; }
 .import-meta { margin-top: 8px; font-size: 11px; color: var(--text-3); text-align: right; }
 
-/* 导入结果提示条 */
+/* 轻提示条（导入结果 / 批量操作回执）
+   浮在「标题 … 导入」那一行的中段：`.toolbar-head` 左侧是标题与计数、右侧是导入与视图切换，
+   中间那段本来就是空的，提示条落在这里谁也不挡。
+   **必须 absolute**：一旦参与布局就会把下方的筛选芯片行顶下去（那正是「页面被撑开」的观感）；
+   从前它是 `position: fixed; bottom: 28px`，正好和底部悬浮的批量条叠在一起。 */
 .notice-toast {
-  position: fixed;
-  left: 50%; bottom: 28px;
-  transform: translateX(-50%);
-  max-width: 560px;
-  padding: 10px 18px;
-  border-radius: 10px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  /* 中段可用宽度 ≈ 行宽 − 左侧标题/计数 − 右侧按钮组（约 300px）。
+     夹在 160~520px 之间：窄窗口下宁可压住标题，也不许盖住「导入」按钮（盖住就点不动了）。 */
+  max-width: clamp(160px, calc(100% - 300px), 520px);
+  padding: 7px 15px;
+  border-radius: 9px;
   font-size: 12px;
+  line-height: 1.5;
+  text-align: center;
   font-family: var(--font);
   z-index: 120;
   cursor: pointer;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
 .notice-toast.info { background: #31404F; color: #C9D7E2; }
 .notice-toast.error { background: #52322C; color: #F2C4B4; border: 1px solid #7A4A3E; }

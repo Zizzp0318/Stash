@@ -1,5 +1,12 @@
 // M4 冒烟：多选（Ctrl 点选 / 拖拽框选 / 空白取消）+ 批量操作（评分 / 喜欢 / 移动 / 删除）
 // 全程在临时库里跑，用真实鼠标输入事件驱动渲染层，最后核对磁盘与数据库
+//
+// ⑬ 段额外盯**轻提示条的位置**：它必须浮在工具栏「标题 … 导入」那一行的中段。
+// 写这几条是因为踩过：提示条原本 `position: fixed; bottom: 28px`，与底部悬浮的批量条
+// 都在底部居中，一出现就叠在一起（用户截图里就是「已取消喜欢 1 项」压住批量条）。
+// 几何断言必须**同时**验证「不重叠」与「不占位」：
+//   - 只测不重叠 → 挪到任何别的空角落也能过；
+//   - 只测不占位 → 把 position 改成 fixed 吊回底部照样过。
 import { app, BrowserWindow } from 'electron'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
@@ -396,6 +403,55 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
         starDomFollowsDb: starOnAfter === (ratingAfter ?? -1) && starOnBefore === (ratingBefore ?? -1)
       }
 
+      // ⑬ 轻提示条的位置：必须浮在「标题 … 导入」那一行的中段，且不占文档流
+      //
+      // 用户报的现象：底部悬浮批量条出现时点「喜欢」，提示条正好压在批量条上（两者都在底部居中）。
+      // 这里刻意复现那个场景 —— 选中 1 项 + 点一下喜欢，让两件 UI 同时在场才好比几何。
+      // 三条证据缺一不可：
+      //   ① 与批量条矩形不相交、且整体在它上方：改回 fixed 吊底部会立刻变红；
+      //   ② 水平中心 ≈ 工具栏标题行中心：挪到别的列、或按窗口居中（画廊被左右两栏挤偏 20px）都会红；
+      //   ③ 把提示条临时 display:none 后，下方筛选芯片行的位置分毫不动 —— 这是「真悬浮」与
+      //      「参与布局」的分水岭（改成 static 它就成了一个 flex 项，会把芯片行顶下去）。
+      cs = await cards()
+      click(cs[0].cx, cs[0].cy)
+      await sleep(300)
+      moveAway()
+      await sleep(150)
+      // 第 1 个 .bb-btn 就是「喜欢 / 取消喜欢」（后面依次是 移动、删除、取消选择）
+      R.h13_favClicked = await clickEl('.batchbar .bb-btn', 0)
+      await sleep(700)
+      moveAway()
+      await sleep(200)
+      R.h13_geom = JSON.parse(
+        ((await js(`(() => {
+          const t = document.querySelector('.notice-toast')
+          const h = document.querySelector('.toolbar-head')
+          const b = document.querySelector('.batchbar')
+          const c = document.querySelector('.chips')
+          if (!t || !h || !b || !c) return JSON.stringify({ toast: !!t, head: !!h, batch: !!b, chips: !!c })
+          const rect = (e) => {
+            const x = e.getBoundingClientRect()
+            return { l: Math.round(x.left), t: Math.round(x.top), r: Math.round(x.right), b: Math.round(x.bottom), w: Math.round(x.width), h: Math.round(x.height) }
+          }
+          const tr = t.getBoundingClientRect()
+          const hr = h.getBoundingClientRect()
+          const chipsShown = Math.round(c.getBoundingClientRect().top)
+          // 临时藏掉再量一次参照行：真悬浮 → 一动不动
+          t.style.display = 'none'
+          const chipsHidden = Math.round(c.getBoundingClientRect().top)
+          t.style.display = ''
+          return JSON.stringify({
+            toast: rect(t), head: rect(h), batch: rect(b),
+            text: t.textContent.trim(),
+            position: getComputedStyle(t).position,
+            toastCenterX: Math.round(tr.left + tr.width / 2),
+            headCenterX: Math.round(hr.left + hr.width / 2),
+            chipsShown, chipsHidden
+          })
+        })()`)) as string | null) ?? '{}'
+      )
+      await capture('shot-notice.png')
+
       // ==================== 截图留证 ====================
       try {
         const wp = JSON.parse(
@@ -467,6 +523,17 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       heartDomToggled: boolean
     }
     const hd = R.hardDeleteCheck as { fileGone: boolean; rowGone: boolean; trashDirCreated: boolean } | undefined
+    const h13 = R.h13_geom as {
+      toast: { l: number; t: number; r: number; b: number; w: number; h: number }
+      head: { l: number; t: number; r: number; b: number; w: number; h: number }
+      batch: { l: number; t: number; r: number; b: number; w: number; h: number }
+      text: string
+      position: string
+      toastCenterX: number
+      headCenterX: number
+      chipsShown: number
+      chipsHidden: number
+    } | null
 
     R.checks = {
       singleClick: s1?.length === 1,
@@ -491,7 +558,30 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       // 详情页心心：DB 与 DOM 都必须翻转（只测 DB 会漏掉「没反应」这类 UI 层 bug）
       detailHeart: !!s12?.heartDbToggled && !!s12?.heartDomToggled,
       // 服务层直调同样不留孤儿行、不留回收站
-      serviceHardDelete: hd?.rowGone === true && hd?.fileGone === true && hd.trashDirCreated === false
+      serviceHardDelete: hd?.rowGone === true && hd?.fileGone === true && hd.trashDirCreated === false,
+
+      // ==================== ⑬ 轻提示条浮在工具栏标题行中段 ====================
+      // 先证明「这一刻提示条真的在场」，否则后面几条几何断言在元素缺失时全都恒真/恒假
+      noticeTextIsBulkFav: h13?.text != null && /^已(取消)?喜欢 1 项$/.test(h13.text),
+      // ① 与批量条矩形完全不相交，且整体在它上方（改回 fixed 吊底部 → 这两条一起红）
+      noticeAboveBatchbar: (h13?.toast?.b ?? 0) > 0 && (h13?.toast?.b ?? 0) < (h13?.batch?.t ?? -1),
+      noticeBatchbarNoOverlap:
+        !!h13?.toast && !!h13?.batch &&
+        !(
+          h13.toast.l < h13.batch.r &&
+          h13.batch.l < h13.toast.r &&
+          h13.toast.t < h13.batch.b &&
+          h13.batch.t < h13.toast.b
+        ),
+      // ② 落点在工具栏标题行内（上下各留 6px 容差：提示条比行本身高一点是正常的）
+      noticeSitsInToolbarRow:
+        h13?.position === 'absolute' &&
+        h13.toast.t >= h13.head.t - 6 &&
+        h13.toast.b <= h13.head.b + 6,
+      // ③ 水平中心与标题行中心对齐（按窗口居中会差 20px —— 画廊被左右两栏挤偏了）
+      noticeCenteredOnToolbarHead: Math.abs((h13?.toastCenterX ?? 0) - (h13?.headCenterX ?? -1)) <= 2,
+      // ④ 真悬浮：临时隐藏后下方筛选芯片行位置分毫不动
+      noticeNotInFlow: (h13?.chipsShown ?? 0) > 0 && h13?.chipsShown === h13?.chipsHidden
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

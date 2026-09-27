@@ -641,6 +641,22 @@ function onWindowMouseDown(e: MouseEvent): void {
             </button>
           </div>
         </div>
+
+        <!--
+          轻提示条（导入结果、批量操作回执）：浮在「标题 … 导入」这一行的中段。
+          从前它是 `position: fixed` 吊在窗口底部居中的，正好压在底部悬浮批量条上（用户截图里的重叠）。
+          这里绝对定位 + 不参与布局，所以既不挡批量条，也不会把下方的筛选芯片行推下去。
+        -->
+        <div
+          v-if="assets.importNotice"
+          class="notice-toast"
+          :class="assets.importNotice.kind"
+          title="点击关闭"
+          data-notice
+          @click="assets.importNotice = null"
+        >
+          {{ assets.importNotice.text }}
+        </div>
       </div>
       <div class="chips">
         <button

@@ -75,9 +75,7 @@ onMounted(async () => {
         <div class="import-meta">{{ assets.importing.done }} / {{ assets.importing.total }}</div>
       </div>
     </div>
-    <!-- 导入结果提示 -->
-    <div v-if="assets.importNotice" class="notice-toast" :class="assets.importNotice.kind" @click="assets.importNotice = null">
-      {{ assets.importNotice.text }}
-    </div>
+    <!-- 轻提示条（导入结果 / 批量操作回执）实际渲染在 GalleryGrid 的工具栏标题行里，
+         浮在「所有素材 … 导入」那一行的中段 —— 详见该组件里的 .notice-toast -->
   </div>
 </template>
