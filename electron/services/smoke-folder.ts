@@ -192,9 +192,11 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       diskGone: !onDisk('已重命名'),
       foldersLeft: folderPaths(),
       assetsLeft: assetRels(),
-      // 标签关联靠外键 CASCADE 自动清，但标签本身要留着
+      // 标签关联靠外键 CASCADE 自动清；标签本体若因此一个素材都不剩，会被自动清理
       orphanTagLinks: (D().prepare('SELECT count(*) AS c FROM asset_tags').get() as { c: number }).c,
       tagsLeft: (D().prepare('SELECT count(*) AS c FROM tags').get() as { c: number }).c,
+      // 自动清理掉的标签名 —— 唯一那个标签挂在被删的素材上，应当随素材一起消失
+      prunedTags: del.pruned.map((p) => p.name),
       thumbsBeforeDelete,
       thumbsLeft: thumbDirsOnDisk(),
       // 对照组必须毫发无伤
@@ -622,7 +624,8 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const f2r = R.f_renameMid as { folderPaths: string[]; assetRels: string[]; grandOk: boolean; oldMidGone: boolean }
     const g = R.g_delete as {
       diskGone: boolean; foldersLeft: string[]; assetsLeft: string[]; orphanTagLinks: number
-      tagsLeft: number; thumbsBeforeDelete: number; thumbsLeft: number; siblingIntact: boolean
+      tagsLeft: number; prunedTags: string[]
+      thumbsBeforeDelete: number; thumbsLeft: number; siblingIntact: boolean
     }
     const h1 = R.h1_result as { rowsAfter: string[]; onDiskAfter: boolean; dbPaths: string[] }
     const h2 = R.h2_result as { rowsAfter: string[]; oldGone: boolean; newOnDisk: boolean; dbPaths: string[] }
@@ -672,10 +675,16 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         f2r.folderPaths.join('|') === '对照|已重命名|已重命名/中层改名|已重命名/中层改名/三级' &&
         f2r.assetRels.every((r) => r.startsWith('已重命名/中层改名/')),
       // G 物理删除整棵 + 索引与缓存都清干净，且不碰对照组
+      //
+      // `tagsLeft` 是 0 而不是 1：唯一那个标签（「冒烟标签」）挂在被删的素材上，
+      // 素材一删它就归零 → 被 `pruneUnlinkedTags` 自动清掉。这是有意为之的行为
+      // （空标签会让侧栏显示一个计数 0 的假行），别再改回期望 1。
       deleteWholeTree: g?.diskGone === true && g.siblingIntact === true &&
         g.foldersLeft.join('|') === '对照' && g.assetsLeft.length === 0 &&
-        g.orphanTagLinks === 0 && g.tagsLeft === 1 &&
+        g.orphanTagLinks === 0 && g.tagsLeft === 0 &&
         g.thumbsBeforeDelete === 4 && g.thumbsLeft === 0,
+      // 且清掉的正是挂在被删素材上的那个标签
+      deleteFolderPrunesTag: (g?.prunedTags ?? []).join('|') === '冒烟标签',
       // H UI：菜单 / 新建子级 / 重命名 / 删除
       uiMenu: R.h1_menuItems !== null &&
         (R.h1_menuItems as string[]).join('|') === '新建子文件夹|重命名|删除文件夹',

@@ -2,7 +2,7 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref, watch } from 'vue'
 import { useLibraryStore } from './library'
-import type { StashAssetRow, StashAssetDetail } from '../env'
+import type { StashAssetRow, StashAssetDetail, StashPrunedTag } from '../env'
 
 const PAGE = 200
 
@@ -350,6 +350,35 @@ export const useAssetStore = defineStore('assets', () => {
     else notify('info', target ? `已移动 ${moved} 项到「${target}」` : `已移动 ${moved} 项`)
   }
 
+  /**
+   * 标签被自动删除时的说明文案，无则空串。
+   *
+   * ⚠️ 刻意**不在这里 notify**：通知是单槽位（后一条直接覆盖前一条），
+   * 若这里弹一次、调用方紧接着又弹自己的结果，前一条会被吃掉。
+   * 所以这里只产出文案片段，由调用方拼进自己的那一条提示里。
+   */
+  function prunedNote(pruned?: StashPrunedTag[]): string {
+    if (!pruned?.length) return ''
+    return `标签${pruned.map((p) => `「${p.name}」`).join('')}已无任何素材，已自动清除`
+  }
+
+  /**
+   * 清掉指向「已被自动删除的标签」的筛选，返回是否真的重置了。
+   *
+   * 服务层在各条会减少标签关联的路径（摘标签 / 删素材 / 删文件夹）收尾时会清空标签
+   * （见 `pruneUnlinkedTags`）。此时若 `query.tagId` 还指着它，列表就卡在一个
+   * 永远查不到东西的条件上 —— 表现为「删完标签，列表变成空的」。
+   * **必须在 refresh 之前调用**，否则刷新用的还是旧条件。
+   */
+  function dropPrunedTagFilter(pruned?: StashPrunedTag[]): boolean {
+    if (!pruned?.length) return false
+    if (pruned.some((p) => p.id === query.tagId)) {
+      query.tagId = null
+      return true
+    }
+    return false
+  }
+
   /** 批量删除：直接真删除，不可恢复（无回收站；调用方必须先做二次确认） */
   async function bulkDelete(): Promise<void> {
     const ids = selectedIds.value.slice()
@@ -363,10 +392,15 @@ export const useAssetStore = defineStore('assets', () => {
     const failed = r.data?.failed ?? []
     clearSelection()
     const lib = useLibraryStore()
+    // 删素材会让挂在它身上的标签归零。先清掉指向这些标签的筛选，再刷新
+    const pruned = r.data?.pruned
+    dropPrunedTagFilter(pruned)
     await lib.loadMeta()
     await refresh()
-    if (failed.length) notify('error', `${deleted} 项已删除，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
-    else notify('info', `已删除 ${deleted} 项（已从磁盘移除，不可恢复）`)
+    const note = prunedNote(pruned)
+    const tail = note ? `；${note}` : ''
+    if (failed.length) notify('error', `${deleted} 项已删除，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）${tail}`)
+    else notify('info', `已删除 ${deleted} 项（已从磁盘移除，不可恢复）${tail}`)
   }
 
   /**
@@ -406,6 +440,7 @@ export const useAssetStore = defineStore('assets', () => {
     activeFilterCount, clearFilters,
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
-    patchLocal, bulkRate, bulkFav, bulkMove, bulkDelete, reset
+    patchLocal, bulkRate, bulkFav, bulkMove, bulkDelete, reset,
+    prunedNote, dropPrunedTagFilter
   }
 })

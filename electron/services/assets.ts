@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync } from 'fs'
 import { extname, join } from 'path'
-import { requireCurrent } from './library'
+import { requireCurrent, pruneUnlinkedTags } from './library'
 
 /** 拼接库内相对路径（统一用 / 分隔） */
 function toRel(...segs: string[]): string {
@@ -213,11 +213,18 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; fa
  *
  * 索引行与缩略图缓存一并清理（同 hash 仍被其他素材引用时保留缓存）。
  * 文件删失败则不动索引，避免出现「有记录没文件」的幽灵条目。
+ *
+ * 素材行删掉后 asset_tags 靠外键 CASCADE 一起消失，挂在它们上的标签可能归零，
+ * 所以最后要 `pruneUnlinkedTags`（返回值里的 `pruned` 供 UI 提示）。
  */
-export function deleteAssets(ids: number[]): { deleted: number; failed: BulkFail[] } {
+export function deleteAssets(ids: number[]): {
+  deleted: number
+  failed: BulkFail[]
+  pruned: Array<{ id: number; name: string }>
+} {
   const { db, path: libPath } = requireCurrent()
   const failed: BulkFail[] = []
-  if (!ids.length) return { deleted: 0, failed }
+  if (!ids.length) return { deleted: 0, failed, pruned: [] }
 
   const ph = ids.map(() => '?').join(',')
   const rows = db
@@ -225,6 +232,14 @@ export function deleteAssets(ids: number[]): { deleted: number; failed: BulkFail
     .all(...ids) as Array<{ id: number; name: string; rel_path: string; content_hash: string | null }>
   const del = db.prepare('DELETE FROM assets WHERE id=?')
   const stillUsed = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?')
+
+  // 空标签清理的候选集：待删素材当前挂着的标签。**必须在 DELETE 之前取**，
+  // 删完 asset_tags 靠 CASCADE 一起消失，事后无从知道该检查哪些标签
+  const affectedTagIds = (
+    db.prepare(`SELECT DISTINCT tag_id FROM asset_tags WHERE asset_id IN (${ph})`).all(...ids) as Array<{
+      tag_id: number
+    }>
+  ).map((r) => r.tag_id)
 
   let deleted = 0
   for (const row of rows) {
@@ -261,11 +276,27 @@ export function deleteAssets(ids: number[]): { deleted: number; failed: BulkFail
     }
     deleted++
   }
-  return { deleted, failed }
+  return { deleted, failed, pruned: pruneUnlinkedTags(db, affectedTagIds) }
 }
 
-export function setTags(assetId: number, tagIds: number[]): void {
+/**
+ * 重写某素材的标签集合（「从这张素材上摘标签」也走这里）。
+ *
+ * 摘掉的标签若变成「全网零素材」，会在事务提交后被自动删除 ——
+ * 见 `pruneUnlinkedTags` 的注释（侧栏留着一个计数 0 的标签会被当成 bug）。
+ * 返回 `pruned` 供 UI 提示；调用方若正按被删标签筛选，需要自己把筛选清掉。
+ */
+export function setTags(assetId: number, tagIds: number[]): { pruned: Array<{ id: number; name: string }> } {
   const { db } = requireCurrent()
+  // 清理候选 = 这张素材原本挂着的标签里、本次没被保留的那些。
+  // 刻意**只检查这些**：新建但还没挂上任何素材的标签也是「空」的，
+  // 若无脑全表扫空标签，会把用户刚建好、紧接着就要挂上去的标签当场删掉
+  // （然后 INSERT 关联就会 `FOREIGN KEY constraint failed`）。
+  const before = (
+    db.prepare('SELECT tag_id FROM asset_tags WHERE asset_id=?').all(assetId) as Array<{ tag_id: number }>
+  ).map((r) => r.tag_id)
+  const unlinked = before.filter((id) => !tagIds.includes(id))
+
   db.exec('BEGIN')
   try {
     db.prepare('DELETE FROM asset_tags WHERE asset_id=?').run(assetId)
@@ -276,6 +307,8 @@ export function setTags(assetId: number, tagIds: number[]): void {
     db.exec('ROLLBACK')
     throw e
   }
+  // 放在 COMMIT 之后：清理读的是已提交状态，语义清楚，也不会让清理失败倒灌回关联写入
+  return { pruned: pruneUnlinkedTags(db, unlinked) }
 }
 
 export function listTags(): unknown[] {

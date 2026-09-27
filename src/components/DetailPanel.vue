@@ -114,15 +114,22 @@ async function addTag(): Promise<void> {
   newTag.value = ''
 }
 
-/** 从当前素材上摘掉某个标签（标签本体保留，其它素材照旧） */
+/** 从当前素材上摘掉某个标签（标签还有别的素材挂着就保留，挂了 0 个会被服务层自动删掉） */
 async function removeTag(tagId: number): Promise<void> {
   const a = asset.value
   if (!a) return
   const r = await window.stash.asset.setTags(a.id, a.tags.filter((t) => t.id !== tagId).map((t) => t.id))
   // 必须检查返回：IPC 失败时上面那行是静默的，界面看着像「点了没反应」
   if (!r.ok) return void assets.notify('error', `移除标签失败：${r.error ?? '未知错误'}`)
+  // 摘掉的标签若一个素材都不剩，会被服务层自动删除。先清掉指向它的筛选再刷新，
+  // 否则列表会停在一个永远查不到东西的条件上（看着像「标签删了，列表也空了」）
+  const pruned = r.data?.pruned
+  const filterReset = assets.dropPrunedTagFilter(pruned)
   await lib.loadMeta()
+  if (filterReset) await assets.refresh()
   await assets.select(a.id)
+  const note = assets.prunedNote(pruned)
+  if (note) assets.notify('info', `已从该素材上移除标签；${note}`)
 }
 </script>
 

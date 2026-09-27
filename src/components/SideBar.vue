@@ -294,9 +294,14 @@ async function confirmDeleteFolder(): Promise<void> {
     // 当前筛选正指向被删的子树 → 回到「所有素材」，否则会停在空列表上
     const sel = assets.query.folderId
     if (sel != null && isUnder(sel, f)) assets.query.folderId = null
+    // 连带删掉的素材可能让某些标签一个素材都不剩（服务层已自动清除它们），
+    // 指向这些标签的筛选也要一起清掉
+    const pruned = r.data?.pruned
+    assets.dropPrunedTagFilter(pruned)
     await lib.loadMeta()
     await assets.refresh()
-    assets.notify('info', `已删除文件夹「${f.name}」（${r.data?.assets ?? 0} 个素材已从磁盘移除）`)
+    const note = assets.prunedNote(pruned)
+    assets.notify('info', `已删除文件夹「${f.name}」（${r.data?.assets ?? 0} 个素材已从磁盘移除）${note ? `；${note}` : ''}`)
   } catch (e) {
     fail(`删除文件夹失败：${errText((e as Error).message)}`)
   } finally {

@@ -66,6 +66,9 @@ export function openLibrary(target: string): LibraryInfo {
   if (!existsSync(join(libPath, '.stash'))) throw new Error('ERR_NOT_A_LIBRARY')
   const db = openDatabase(join(libPath, '.stash'))
   setCurrent(db, libPath)
+  // 收掉老版本遗留的空标签（那时没有自动清理，库里可能躺着计数为 0 的标签）。
+  // 这里静默处理、不通知：用户没做任何操作，弹提示反而莫名其妙。
+  pruneAllEmptyTags(db)
   return { path: libPath, name: libName(db) }
 }
 
@@ -235,14 +238,73 @@ export function renameFolder(id: number, rawName: string): { id: number; path: s
 }
 
 /**
+ * 挑选并删除「一个素材都没挂」的标签，返回被删掉的标签（供 UI 提示）。
+ *
+ * 背景：标签的全部用途就是给素材分类，挂着 0 个素材的标签没有任何信息量 ——
+ * 留在侧栏只会显示一个孤零零的 `0`，看起来像 bug（用户就是这么报上来的）。
+ *
+ * ⚠️ 分两种调用场景，别混：
+ *  - **业务路径**（摘标签 / 删素材 / 删文件夹）用 `pruneUnlinkedTags(db, candidates)`，
+ *    只在自己刚摘掉关联的那些标签里找。**绝对不能在这里全表扫「空的标签」**：
+ *    `createTag` 与 `setTags` 之间有窗口期，新建的标签在挂上任何素材之前就是「空的」，
+ *    全表扫会当场把它误删，紧接着 `setTags` 插关联就会撞 `FOREIGN KEY constraint failed`
+ *    （这个坑是写冒烟时踩出来的：脚本先连建两个标签再逐个挂，第一个 `setTags` 就把
+ *    第二个还没挂上的标签清掉了）。
+ *  - **打开库时**用 `pruneAllEmptyTags(db)` 全量扫一次，收掉老版本遗留的脏数据 ——
+ *    这个时点不存在「用户正在创建标签」的状态，安全。
+ *
+ * 两者都用 `NOT EXISTS` 而不是 `NOT IN`：后者在子查询结果含 NULL 时恒为空集（经典陷阱）。
+ */
+function selectEmptyTags(db: DB, candidates: number[] | null): Array<{ id: number; name: string }> {
+  const listed = candidates && !candidates.length ? [] : candidates
+  const ph = listed?.map(() => '?').join(',')
+  const rows = (
+    listed
+      ? db
+          .prepare(
+            `SELECT t.id, t.name FROM tags t
+              WHERE t.id IN (${ph})
+                AND NOT EXISTS (SELECT 1 FROM asset_tags a WHERE a.tag_id = t.id)`
+          )
+          .all(...listed)
+      : db
+          .prepare(
+            'SELECT t.id, t.name FROM tags t WHERE NOT EXISTS (SELECT 1 FROM asset_tags a WHERE a.tag_id = t.id)'
+          )
+          .all()
+  ) as Array<{ id: number; name: string }>
+  if (!rows.length) return []
+  db.prepare(`DELETE FROM tags WHERE id IN (${rows.map(() => '?').join(',')})`).run(...rows.map((t) => t.id))
+  return rows
+}
+
+/** 只清理「刚被摘掉关联」的那些标签（业务路径用，理由见 `selectEmptyTags`） */
+export function pruneUnlinkedTags(db: DB, candidates: number[]): Array<{ id: number; name: string }> {
+  return selectEmptyTags(db, candidates)
+}
+
+/** 全量清理空标签（打开库时用，理由见 `selectEmptyTags`） */
+export function pruneAllEmptyTags(db: DB): Array<{ id: number; name: string }> {
+  return selectEmptyTags(db, null)
+}
+
+/**
  * 删除整个文件夹：**直接从磁盘删除**，不进回收站，不可恢复。
  *
  * 顺序与 deleteAssets 保持一致：先把物理目录整棵 rmSync 掉，成功后才清索引；
  * 物理删除失败（被占用/权限）就抛错且不动索引，避免留下「有记录没文件」的幽灵条目。
  * 索引清理含三部分：该子树的 assets 行（asset_tags 靠外键 CASCADE 自动清）、
  * folders 行、以及无其他素材引用的 .thumbs/<hash> 缓存。
+ *
+ * ⚠️ 因为连带删了素材，挂在那些素材上的标签可能归零，所以最后要清一次空标签。
+ * 候选集必须在 `DELETE FROM assets` **之前**取，删完关联就查不到了。
  */
-export function deleteFolder(id: number): { folders: number; assets: number; thumbsRemoved: number } {
+export function deleteFolder(id: number): {
+  folders: number
+  assets: number
+  thumbsRemoved: number
+  pruned: Array<{ id: number; name: string }>
+} {
   const { db, path: libPath } = requireCurrent()
   const row = db.prepare('SELECT id, path FROM folders WHERE id=?').get(id) as { id: number; path: string } | undefined
   if (!row) throw new Error('ERR_FOLDER_NOT_FOUND')
@@ -259,6 +321,17 @@ export function deleteFolder(id: number): { folders: number; assets: number; thu
   const assetRows = db
     .prepare(`SELECT id, content_hash FROM assets WHERE folder_id IN (${ph})`)
     .all(...subIds) as Array<{ id: number; content_hash: string | null }>
+
+  // 空标签清理的候选集：这些素材当前挂着的标签。**必须在 DELETE 之前取**，
+  // 删完 asset_tags 就一起没了，事后无从知道该检查哪些标签
+  const affectedTagIds = (
+    db
+      .prepare(
+        `SELECT DISTINCT tag_id FROM asset_tags
+          WHERE asset_id IN (SELECT id FROM assets WHERE folder_id IN (${ph}))`
+      )
+      .all(...subIds) as Array<{ tag_id: number }>
+  ).map((r) => r.tag_id)
 
   try {
     db.exec('BEGIN')
@@ -284,7 +357,9 @@ export function deleteFolder(id: number): { folders: number; assets: number; thu
       /* 缓存清理失败不影响删除结果 */
     }
   }
-  return { folders: sub.length, assets: assetRows.length, thumbsRemoved }
+  // 素材行删掉后，挂在它们身上的标签可能一个素材都不剩了
+  const pruned = pruneUnlinkedTags(db, affectedTagIds)
+  return { folders: sub.length, assets: assetRows.length, thumbsRemoved, pruned }
 }
 
 /** 为已存在的物理目录补齐 folders 表行（不建目录），返回最深层 id */

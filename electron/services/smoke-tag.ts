@@ -1,9 +1,13 @@
-// 标签冒烟：添加 / 从素材上摘掉 / 删除标签本体 / 关联级联清空 / 筛选重置
+// 标签冒烟：添加 / 从素材上摘掉 / 删除标签本体 / 关联级联清空 / 筛选重置 / **归零自删**
 //
 // 缘起：用户报「标签只能添加，不能删除」。根因是 `tags` 表只有 `createTag` 没有删除入口，
 // 侧栏标签行也没有任何管理操作。这里覆盖两层语义，别混：
 //   - 详情页点标签 chip = 从**这个素材**上摘掉（标签本体还在，其它素材照旧）→ `asset.setTags`
 //   - 侧栏标签行右键 → 删除标签 = 删掉**标签本体**（所有素材一并解绑）→ `tag.remove`
+//
+// 后来又报了第二条：「详情页把标签都摘掉后，侧栏那个标签还在，数字显示 0」。
+// 于是补了自动清理（`pruneUnlinkedTags`）：标签一个素材都不挂就失去意义，各条会减少
+// 标签关联的路径收尾都要清掉它。H7 覆盖「摘标签」入口，H8 覆盖「删素材」入口。
 //
 // 断言全部同时核对**数据库**与**DOM**：本项目出过「DB 写成功、UI 不刷新」的假绿
 // （store 把 camelCase 字段 assign 到 snake_case 行对象上），只查 DB 会漏。
@@ -366,6 +370,88 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       finalOrphans: orphans()
     }
 
+    // ==================== H7. 标签归零 → 自动删除（含筛选重置）====================
+    //
+    // 缘起：用户报「详情页把素材上的标签都摘掉后，侧栏那个标签还在，数字显示 0」。
+    // 标签的全部意义就是给素材分类，挂 0 个素材的标签没有任何信息量 —— 必须自删。
+    // 这段同时覆盖两个点：
+    //   ① 标签本体从 tags 表消失（侧栏行跟着消失）；
+    //   ② 若当时正按它筛选，筛选要一起重置 —— 否则列表会卡在一个永远查不到东西的
+    //      条件上，表现为「标签没了，列表也空了」。
+    step('H7-归零自删')
+    await clickEl(`.side-item[data-tag-id="${tScenery.id}"]`)
+    await sleep(800)
+    R.h7_filtered = { cards: await cardNames(), sidebar: await sideMap() }
+
+    const idRed = assetIdOf('红.png')
+    await clickEl(`.masonry-card[data-id="${idRed}"]`)
+    await sleep(700)
+    R.h7_detailBefore = { chips: await detailChips() }
+    // 摘掉「风景」—— 它是这个标签仅剩的一个关联
+    await clickEl(`.detail .tag-chips .tag-chip[data-tag-id="${tScenery.id}"]`)
+    await sleep(1000)
+    moveAway()
+    await sleep(200)
+    R.h7_after = {
+      tagGone: tagIdOf('风景') == null,
+      tags: tagRows().map((t) => t.name),
+      links: links(),
+      orphans: orphans(),
+      sidebar: await sideMap(),
+      // 用户报的是「显示 0」，所以直接断言：侧栏不该存在任何计数为 0 的标签行
+      zeroRows: (await sidebarTags()).filter((t) => t.count === 0).map((t) => t.name),
+      chips: await detailChips(),
+      hint: await detailHint(),
+      cards: await cardNames(),
+      notice: await noticeText()
+    }
+    await capture('shot-tag-autoprune.png')
+
+    // ==================== H8. 删素材导致标签归零 → 同样自动清理 ====================
+    //
+    // 与 H7 是同一条规则的另一条入口：删素材时 asset_tags 靠外键 CASCADE 一起消失，
+    // 挂在它上面的标签也会归零。只在 setTags 里处理会漏掉这一条。
+    step('H8-删素材归零')
+    const tIsland = createTag({ name: '孤岛' })
+    setTags(assetIdOf('绿.png'), [tIsland.id])
+    // 刚才是服务层直接改的库，渲染层还不知道 —— 重新 bootstrap。
+    // 先挂 did-finish-load 监听再触发 reload，否则可能与加载完成抢跑。
+    const reloaded = onceLoaded(win)
+    await rawJs(`location.reload()`)
+    await reloaded
+    await sleep(2600)
+    R.h8_beforeDelete = {
+      sidebar: await sideMap(),
+      tags: tagRows().map((t) => t.name),
+      links: links()
+    }
+
+    const idGreen = assetIdOf('绿.png')
+    await clickEl(`.masonry-card[data-id="${idGreen}"]`)
+    await sleep(700)
+    moveAway()
+    await sleep(150)
+    // 选中卡片后详情页才展开，chip 要在这一步之后取（reload 会清掉选中状态）
+    R.h8_detailBefore = { chips: await detailChips() }
+    await clickEl('.batchbar .bb-btn.danger')
+    await sleep(500)
+    R.h8_modal = await modalInfo()
+    await capture('shot-tag-delasset-confirm.png')
+    R.h8_confirmClicked = await clickModalBtn('删除')
+    await sleep(1400)
+    moveAway()
+    await sleep(200)
+    R.h8_after = {
+      tagGone: tagIdOf('孤岛') == null,
+      tags: tagRows().map((t) => t.name),
+      links: links(),
+      orphans: orphans(),
+      sidebar: await sideMap(),
+      zeroRows: (await sidebarTags()).filter((t) => t.count === 0).map((t) => t.name),
+      cards: await cardNames(),
+      notice: await noticeText()
+    }
+
     await capture('shot-tag-done.png')
 
     // ==================== 断言汇总 ====================
@@ -386,6 +472,22 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     }
     const f = R.f_negative as {
       missing: string; alreadyDeleted: string; finalTags: string[]; finalLinks: string[]; finalOrphans: number
+    }
+    const h7f = R.h7_filtered as { cards: string[]; sidebar: Record<string, number> }
+    const h7 = R.h7_after as {
+      tagGone: boolean; tags: string[]; links: string[]; orphans: number
+      sidebar: Record<string, number>; zeroRows: string[]
+      chips: string[]; hint: string | null; cards: string[]; notice: string | null
+    }
+    const h8b = R.h8_beforeDelete as {
+      sidebar: Record<string, number>; tags: string[]; links: string[]
+    }
+    const h8d = R.h8_detailBefore as { chips: string[] }
+    const h8m = R.h8_modal as { title: string | null; text: string | null } | null
+    const h8a = R.h8_after as {
+      tagGone: boolean; tags: string[]; links: string[]; orphans: number
+      sidebar: Record<string, number>; zeroRows: string[]
+      cards: string[]; notice: string | null
     }
 
     R.checks = {
@@ -444,8 +546,34 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       // F 负例：不存在 / 已删除的标签都要明确报错
       missingTagThrows: f?.missing === 'ERR_TAG_NOT_FOUND',
       deletedTagThrows: f?.alreadyDeleted === 'ERR_TAG_NOT_FOUND',
+      // 注意：这里是「H6 刚跑完」的快照，后面 H7/H8 还会继续删，别拿它当最终状态用
       finalStateClean: f?.finalTags?.join('|') === '风景' && sameSet(f?.finalLinks, ['红.png→风景']) &&
         f?.finalOrphans === 0,
+
+      // H7 摘掉最后一个关联 → 标签自动删除
+      // 先证明筛选真的生效过（列表只剩 1 项）：否则「最后回到 3 项」可能因为压根没筛选而假绿
+      prunedTagFilterWasApplied: h7f?.cards?.length === 1 && h7f.cards[0] === '红.png',
+      prunedTagRowIsGone: h7?.tagGone === true && (h7?.tags?.length ?? -1) === 0,
+      prunedTagLinksCleared: (h7?.links?.length ?? -1) === 0 && h7?.orphans === 0,
+      prunedTagRemovedFromSidebar: h7?.sidebar?.['风景'] === undefined &&
+        Object.keys(h7?.sidebar ?? {}).length === 0,
+      // 直击用户报的现象：侧栏不该存在任何计数为 0 的标签行
+      prunedTagNoZeroRows: (h7?.zeroRows?.length ?? -1) === 0,
+      prunedTagClearsDetailChips: h7?.chips?.length === 0 && h7?.hint === '暂无标签',
+      // 筛选被重置回「所有素材」，列表恢复完整
+      prunedTagResetsFilter: h7?.cards?.length === 3,
+      prunedTagNotifies: /已无任何素材，已自动清除/.test(h7?.notice ?? ''),
+
+      // H8 删素材导致标签归零 → 同一条规则的另一条入口
+      // 同样先证明前置状态成立（标签在、挂在这张素材上、侧栏计数 1）
+      deleteAssetSetupOk: h8b?.sidebar?.['孤岛'] === 1 && h8d?.chips?.join('|') === '孤岛' &&
+        (h8b?.links?.length ?? -1) === 1,
+      deleteAssetConfirmShowsImpact: (h8m?.title ?? '').includes('1 项素材'),
+      deleteAssetPrunesTag: h8a?.tagGone === true && (h8a?.tags?.length ?? -1) === 0,
+      deleteAssetClearsLinks: (h8a?.links?.length ?? -1) === 0 && h8a?.orphans === 0,
+      deleteAssetNoZeroRows: Object.keys(h8a?.sidebar ?? {}).length === 0 && (h8a?.zeroRows?.length ?? -1) === 0,
+      deleteAssetCardsRemain: h8a?.cards?.length === 2,
+      deleteAssetNotifies: /已自动清除/.test(h8a?.notice ?? ''),
 
       // 渲染层不应有 JS 报错
       noJsErrors: jsErrors.length === 0
