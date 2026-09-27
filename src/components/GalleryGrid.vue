@@ -24,25 +24,176 @@ const title = computed(() => {
   return '所有素材'
 })
 
-// —— 筛选芯片 ——
-const sortLabel = computed(
-  () => ({ imported_at: '导入时间', name: '名称', size: '大小', rating: '评分' })[assets.query.sort] ?? '排序'
-)
+/**
+ * 当前范围（文件夹/标签）内的素材总数，**不含**工具栏筛选 —— 用作「N / 共 M」的分母。
+ *
+ * 刻意与列表查询保持同一语义：后端 `folderId != null` 只匹配 `a.folder_id = ?`（直接子项，不递归），
+ * 所以这里用 `byFolder` 直接计数而不是 `subtreeCount`（后者含子文件夹子树）。
+ * 用 subtreeCount 会让分母比不带筛选时列表里实际能看到的还多，数字对不上。
+ * 侧栏文件夹的计数走同一条口径（`lib.directCount`），三处保持一致。
+ */
+const scopeTotal = computed(() => {
+  if (assets.query.folderId != null) return lib.counts.byFolder[String(assets.query.folderId)] ?? 0
+  if (assets.query.tagId != null) return lib.counts.byTag[String(assets.query.tagId)] ?? 0
+  return lib.counts.total
+})
 
-async function cycleRating(): Promise<void> {
-  assets.query.rating = (assets.query.rating + 1) % 6
-  await assets.refresh()
-}
+/** 有没有生效的工具栏筛选（决定空态文案与计数写法） */
+const filtering = computed(() => assets.activeFilterCount > 0)
+
+// —— 筛选芯片 ——
 async function toggleFav(): Promise<void> {
   assets.query.fav = !assets.query.fav
   await assets.refresh()
 }
-async function cycleSort(): Promise<void> {
-  const order = ['imported_at', 'name', 'size', 'rating']
-  const next = order[(order.indexOf(assets.query.sort) + 1) % order.length]
-  assets.query.sort = next
-  assets.query.order = next === 'name' ? 'asc' : 'desc'
+
+/** 排序方向：名称按「A→Z」直觉用升序，其余维度默认降序更符合「最新/最大优先」 */
+async function toggleOrder(): Promise<void> {
+  assets.query.order = assets.query.order === 'asc' ? 'desc' : 'asc'
   await assets.refresh()
+}
+
+// ==================== 工具栏下拉菜单 ====================
+// 类型 / 评分 / 排序共用同一个弹层骨架，只有 `key` 与内容不同。
+// 三者都做成「点开选」而不是「点一下循环」：循环式芯片用户看不到有哪些可选项，
+// 想从「≥3 星」退回「不限」要点三下，也没法一步跳到目标值。
+type MenuKey = 'type' | 'rating' | 'sort'
+type SortKey = 'imported_at' | 'name' | 'size' | 'rating'
+const chipMenu = ref<{ key: MenuKey; x: number; y: number } | null>(null)
+
+const TYPE_OPTS: Array<{ value: string | null; label: string }> = [
+  { value: null, label: '全部类型' },
+  { value: 'image', label: '图片' },
+  { value: 'video', label: '视频' },
+  { value: 'audio', label: '音频' },
+  { value: 'text', label: '文本' }
+]
+
+/** 评分只支持「≥N 星」语义（0 = 不限），与后端 `rating >= ?` 一一对应，没有「恰好 N 星」 */
+const RATING_OPTS: Array<{ value: number; label: string }> = [
+  { value: 0, label: '不限评分' },
+  { value: 1, label: '1 星及以上' },
+  { value: 2, label: '2 星及以上' },
+  { value: 3, label: '3 星及以上' },
+  { value: 4, label: '4 星及以上' },
+  { value: 5, label: '5 星' }
+]
+
+const SORT_OPTS: Array<{ value: SortKey; label: string }> = [
+  { value: 'imported_at', label: '导入时间' },
+  { value: 'name', label: '名称' },
+  { value: 'size', label: '大小' },
+  { value: 'rating', label: '评分' }
+]
+
+const typeLabel = computed(() => TYPE_OPTS.find((o) => o.value === assets.query.type)?.label ?? '全部类型')
+const sortLabel = computed(() => SORT_OPTS.find((o) => o.value === assets.query.sort)?.label ?? '排序')
+
+/**
+ * 芯片只显示图标，状态信息全部搬到 title：
+ * 图标形状编码「哪一类」（类型/排序维度），颜色与填充编码「是否生效」，
+ * 具体档位（≥N 星、哪种类型、哪个排序维度）由悬停提示与菜单内高亮承担。
+ */
+const ratingTitle = computed(() =>
+  assets.query.rating > 0 ? `评分筛选：≥${assets.query.rating} 星（点击更换）` : '评分筛选：不限（点击更换）'
+)
+const favTitle = computed(() =>
+  assets.query.fav ? '喜欢筛选：已开启（点击关闭）' : '喜欢筛选：未开启（点击只看喜欢）'
+)
+const typeTitle = computed(() => `类型筛选：${typeLabel.value}（点击更换）`)
+const sortTitle = computed(
+  () => `排序方式：${sortLabel.value} · ${assets.query.order === 'asc' ? '升序' : '降序'}（点击更换）`
+)
+
+/** 各菜单的估算宽度，仅用于把弹层挡在窗口右缘之内 */
+const MENU_W: Record<MenuKey, number> = { type: 124, rating: 172, sort: 136 }
+
+/**
+ * 打开某个芯片的菜单。
+ * 对着同一个芯片再点一次则收起 —— 否则会「先关后开」，看起来像没反应。
+ */
+function openChipMenu(key: MenuKey, e: MouseEvent): void {
+  if (chipMenu.value?.key === key) {
+    chipMenu.value = null
+    return
+  }
+  const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+  chipMenu.value = {
+    key,
+    x: Math.max(8, Math.min(r.left, window.innerWidth - MENU_W[key] - 8)),
+    y: r.bottom + 4
+  }
+}
+
+async function setType(v: string | null): Promise<void> {
+  chipMenu.value = null
+  assets.query.type = v
+  await assets.refresh()
+}
+
+async function setRating(v: number): Promise<void> {
+  chipMenu.value = null
+  assets.query.rating = v
+  await assets.refresh()
+}
+
+/**
+ * 选排序维度。点「当前维度」本身 = 翻转升降序（菜单项右侧已有 ↑/↓ 提示），
+ * 这样在菜单里也能改方向，不用再去够旁边那个小箭头。
+ */
+async function setSort(v: SortKey): Promise<void> {
+  const same = assets.query.sort === v
+  chipMenu.value = null
+  if (same) {
+    assets.query.order = assets.query.order === 'asc' ? 'desc' : 'asc'
+  } else {
+    assets.query.sort = v
+    assets.query.order = v === 'name' ? 'asc' : 'desc'
+  }
+  await assets.refresh()
+}
+
+/** 清空全部工具栏筛选（关键词会通过 store 反向同步把顶栏搜索框也清掉） */
+async function clearAllFilters(): Promise<void> {
+  assets.clearFilters()
+  await assets.refresh()
+}
+
+// —— 搜索高亮 ——
+
+/** HTML 转义：文件名可以含 `&`、`<`、引号等任意合法字符，绝不能直接拼进 v-html */
+const HTML_ESC: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;'
+}
+function escHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => HTML_ESC[c] as string)
+}
+
+/**
+ * 把文件名里命中搜索词的部分包成 `<mark>`。
+ *
+ * 顺序很讲究：**先对文件名与关键词都做 HTML 转义，再匹配**。
+ * - 先转义：否则 `a<b.txt` 会被当成标签、甚至注入脚本
+ * - 两边都转义：`&` → `&amp;` 在两者里一致，匹配位置才不会错位
+ * - 关键词再做一次正则转义：用户搜 `a(1)` 时 `(` 是正则元字符，不转义会直接抛 RegExp 错误
+ * - 加 `i` 标志：SQLite 的 LIKE 对 ASCII 大小写不敏感，前端高亮要跟它对齐，
+ *   否则搜 `IMG` 能搜到但不高亮
+ */
+function hlName(name: string): string {
+  const kw = assets.query.keyword.trim()
+  const safe = escHtml(name)
+  if (!kw) return safe
+  const needle = escHtml(kw).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  try {
+    return safe.replace(new RegExp(needle, 'gi'), (m) => `<mark>${m}</mark>`)
+  } catch {
+    // 兜底：正则构造失败就退化成不高亮，至少不白屏
+    return safe
+  }
 }
 
 // —— 导入 ——
@@ -447,15 +598,20 @@ async function confirmDelete(): Promise<void> {
 // ==================== 全局按键 / 点击 ====================
 function onKeyDown(e: KeyboardEvent): void {
   if (e.key !== 'Escape') return
+  if (chipMenu.value) return void (chipMenu.value = null)
   if (menu.value) return closeMenu()
   if (moveOpen.value) return void (moveOpen.value = false)
   if (deleteOpen.value) return void (deleteOpen.value = false)
   assets.clearSelection()
 }
 
-/** 点击菜单以外的任何地方都关闭右键菜单 */
+/** 点击菜单以外的任何地方都关闭右键菜单 / 芯片下拉 */
 function onWindowMouseDown(e: MouseEvent): void {
-  if (menu.value && !(e.target as HTMLElement).closest('.ctx-menu')) closeMenu()
+  const t = e.target as HTMLElement
+  // 排除触发芯片本身：它有自己「再点一次收起」的 toggle 逻辑，
+  // 若在 mousedown 就关掉，紧接着的 click 又会把它打开，看着像点了没反应。
+  if (chipMenu.value && !t.closest('.chip-menu') && !t.closest('.chip-menu-trigger')) chipMenu.value = null
+  if (menu.value && !t.closest('.ctx-menu')) closeMenu()
 }
 </script>
 
@@ -464,7 +620,10 @@ function onWindowMouseDown(e: MouseEvent): void {
     <div class="toolbar">
       <div class="toolbar-head">
         <h1>{{ title }}</h1>
-        <span class="total">{{ fmtCount(assets.total) }} 个文件</span>
+        <span class="total">
+          <template v-if="filtering">{{ fmtCount(assets.total) }} / {{ fmtCount(scopeTotal) }} 个匹配</template>
+          <template v-else>{{ fmtCount(assets.total) }} 个文件</template>
+        </span>
         <div class="toolbar-actions">
           <button class="import-btn" title="导入文件到当前文件夹" @click="importFiles">
             <svg viewBox="0 0 12 12" fill="none"><path d="M6 1.8v6M3.4 5.4L6 8l2.6-2.6M2 10.4h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -481,17 +640,109 @@ function onWindowMouseDown(e: MouseEvent): void {
         </div>
       </div>
       <div class="chips">
-        <button class="chip" :class="{ on: assets.query.rating > 0 }" @click="cycleRating">
-          <svg viewBox="0 0 12 12" fill="none"><path d="M6 1.4l1.4 2.9 3.2.5-2.3 2.2.5 3.2L6 8.7l-2.8 1.5.5-3.2L1.4 4.8l3.2-.5L6 1.4z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" /></svg>
-          评分{{ assets.query.rating > 0 ? ` ≥${assets.query.rating}` : '' }}
+        <button
+          class="chip chip-ico chip-menu-trigger"
+          data-chip="rating"
+          :class="{ on: assets.query.rating > 0 || chipMenu?.key === 'rating' }"
+          :title="ratingTitle"
+          @click="openChipMenu('rating', $event)"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">
+            <path
+              d="M8 1.7l1.93 3.91 4.32.63-3.13 3.05.74 4.3L8 11.56l-3.86 2.03.74-4.3L1.75 6.24l4.32-.63L8 1.7z"
+              :fill="assets.query.rating > 0 ? 'currentColor' : 'none'"
+            />
+          </svg>
         </button>
-        <button class="chip" :class="{ on: assets.query.fav }" @click="toggleFav">
-          <svg viewBox="0 0 12 12" fill="none"><path d="M6 10.2S1.4 7.5 1.4 4.3c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2 1.2.3-.6 1-1.2 2-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.2-4.6 5.9-4.6 5.9z" stroke="currentColor" stroke-width="1.1" /></svg>
-          喜欢
+        <button class="chip chip-ico" data-chip="fav" :class="{ on: assets.query.fav }" :title="favTitle" @click="toggleFav">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round">
+            <path
+              d="M8 13.3S2.2 9.8 2.2 5.9c0-1.9 1.5-3.4 3.3-3.4 1.2 0 2.1.7 2.5 1.5.4-.8 1.3-1.5 2.5-1.5 1.8 0 3.3 1.5 3.3 3.4 0 3.9-5.8 7.4-5.8 7.4z"
+              :fill="assets.query.fav ? 'currentColor' : 'none'"
+            />
+          </svg>
         </button>
-        <button class="chip" @click="cycleSort">
-          <svg viewBox="0 0 12 12" fill="none"><path d="M2 2.8h8M3.8 6h4.4M5.4 9.2h1.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
-          {{ sortLabel }}
+        <button
+          class="chip chip-ico chip-menu-trigger"
+          data-chip="type"
+          :class="{ on: assets.query.type != null || chipMenu?.key === 'type' }"
+          :title="typeTitle"
+          @click="openChipMenu('type', $event)"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+            <g v-if="assets.query.type === 'image'" data-icon="image">
+              <rect x="2.3" y="3" width="11.4" height="10" rx="1.9" />
+              <circle cx="5.9" cy="6.4" r="1.1" fill="currentColor" stroke="none" />
+              <path d="M4.3 11.8l2.3-2.8 1.9 2.2 1.5-1.6 2 2.2" />
+            </g>
+            <g v-else-if="assets.query.type === 'video'" data-icon="video">
+              <rect x="2.3" y="3" width="11.4" height="10" rx="1.9" />
+              <path d="M6.7 6.2l3.5 2.1-3.5 2.1z" fill="currentColor" stroke="none" />
+            </g>
+            <g v-else-if="assets.query.type === 'audio'" data-icon="audio">
+              <path d="M2.7 6.9v2.2M5.3 4.5v7M8 2.7v10.6M10.7 5.1v5.8M13.3 6.9v2.2" />
+            </g>
+            <g v-else-if="assets.query.type === 'text'" data-icon="text">
+              <path d="M4 2.7h5.1l3.2 3.2v7.4H4z" />
+              <path d="M9.1 2.7v3.2h3.2M6.1 8.7h4M6.1 11h2.7" />
+            </g>
+            <g v-else data-icon="all" fill="currentColor" stroke="none">
+              <rect x="2.3" y="2.3" width="4.9" height="4.9" rx="1.4" />
+              <rect x="8.8" y="2.3" width="4.9" height="4.9" rx="1.4" />
+              <rect x="2.3" y="8.8" width="4.9" height="4.9" rx="1.4" />
+              <rect x="8.8" y="8.8" width="4.9" height="4.9" rx="1.4" />
+            </g>
+          </svg>
+        </button>
+        <button
+          class="chip chip-ico chip-menu-trigger"
+          data-chip="sort"
+          :class="{ on: chipMenu?.key === 'sort' }"
+          :title="sortTitle"
+          @click="openChipMenu('sort', $event)"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+            <g v-if="assets.query.sort === 'imported_at'" data-icon="imported_at">
+              <circle cx="8" cy="8" r="5.9" />
+              <path d="M8 4.7V8l2.4 1.5" />
+            </g>
+            <g v-else-if="assets.query.sort === 'name'" data-icon="name">
+              <path d="M3.2 11.9L6.2 4.3l3 7.6M4.4 9.6h3.6" />
+            </g>
+            <g v-else-if="assets.query.sort === 'size'" data-icon="size" fill="currentColor" stroke="none">
+              <rect x="2.3" y="9.4" width="3.4" height="4.3" rx="1" />
+              <rect x="6.3" y="6.6" width="3.4" height="7.1" rx="1" />
+              <rect x="10.3" y="3.4" width="3.4" height="10.3" rx="1" />
+            </g>
+            <g v-else data-icon="rating">
+              <path d="M8 2.6l1.6 3.25 3.59.52-2.6 2.53.62 3.57L8 10.75l-3.21 1.72.62-3.57-2.6-2.53 3.59-.52L8 2.6z" />
+            </g>
+          </svg>
+        </button>
+        <button
+          class="chip chip-order"
+          :title="assets.query.order === 'asc' ? '升序（点击切换）' : '降序（点击切换）'"
+          :data-order="assets.query.order"
+          @click="toggleOrder"
+        >
+          <svg viewBox="0 0 16 16" fill="none">
+            <path
+              :d="assets.query.order === 'asc' ? 'M8 13V3M4 7l4-4 4 4' : 'M8 3v10M4 9l4 4 4-4'"
+              stroke="currentColor"
+              stroke-width="1.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+        <button
+          v-if="assets.activeFilterCount > 0"
+          class="chip chip-clear"
+          :data-count="assets.activeFilterCount"
+          title="清除全部筛选条件"
+          @click="clearAllFilters"
+        >
+          清除筛选 {{ assets.activeFilterCount }}
         </button>
 
         <div class="field-toggles">
@@ -554,7 +805,7 @@ function onWindowMouseDown(e: MouseEvent): void {
             <span v-if="p.it.type === 'video' && p.it.duration_ms" class="video-len">{{ fmtDuration(p.it.duration_ms) }}</span>
           </div>
           <div v-if="assets.cardFields.name || metaText(p.it)" class="card-info">
-            <div v-if="assets.cardFields.name" class="ci-name" :title="p.it.name">{{ p.it.name }}</div>
+            <div v-if="assets.cardFields.name" class="ci-name" :title="p.it.name" v-html="hlName(p.it.name)"></div>
             <div v-if="metaText(p.it)" class="ci-meta">{{ metaText(p.it) }}</div>
           </div>
         </div>
@@ -584,7 +835,7 @@ function onWindowMouseDown(e: MouseEvent): void {
           @contextmenu="onCardContext($event, it)"
         >
           <span class="list-icon">{{ TYPE_ICON[it.type] }}</span>
-          <span class="list-name" :title="it.name">{{ it.name }}</span>
+          <span class="list-name" :title="it.name" v-html="hlName(it.name)"></span>
           <span v-if="assets.cardFields.dims" class="list-dim">{{ dimsOnly(it) || '—' }}</span>
           <span v-if="assets.cardFields.size" class="list-size">{{ fmtSize(it.size) }}</span>
           <span v-if="assets.cardFields.time" class="list-date">{{ fmtDate(it.imported_at) }}</span>
@@ -592,8 +843,15 @@ function onWindowMouseDown(e: MouseEvent): void {
       </div>
 
       <div v-if="!assets.items.length && !assets.loading" class="empty">
-        <p>暂无素材</p>
-        <p class="empty-sub">点击上方「导入」添加文件</p>
+        <template v-if="filtering">
+          <p>没有匹配的素材</p>
+          <p class="empty-sub">已应用 {{ assets.activeFilterCount }} 个筛选条件，试试放宽或清除</p>
+          <button class="w-btn small" @click="clearAllFilters">清除筛选</button>
+        </template>
+        <template v-else>
+          <p>暂无素材</p>
+          <p class="empty-sub">点击上方「导入」添加文件</p>
+        </template>
       </div>
       <div v-if="assets.loading" class="loading-tip">加载中…</div>
     </div>
@@ -610,6 +868,76 @@ function onWindowMouseDown(e: MouseEvent): void {
       >
         <img v-if="ghostThumb" :src="ghostThumb" draggable="false" alt="" />
         <span class="dg-count">{{ assets.dragIds.length }} 项</span>
+      </div>
+    </Teleport>
+
+    <!-- 工具栏芯片下拉（类型 / 评分 / 排序共用一个骨架） -->
+    <Teleport to="body">
+      <div
+        v-if="chipMenu"
+        class="chip-menu"
+        :data-menu="chipMenu.key"
+        :style="{ left: chipMenu.x + 'px', top: chipMenu.y + 'px' }"
+        @contextmenu.prevent
+      >
+        <template v-if="chipMenu.key === 'type'">
+          <button
+            v-for="o in TYPE_OPTS"
+            :key="o.label"
+            class="chip-menu-item"
+            :class="{ on: assets.query.type === o.value }"
+            :data-type="o.value ?? 'all'"
+            @click="setType(o.value)"
+          >
+            {{ o.label }}
+          </button>
+        </template>
+
+        <template v-else-if="chipMenu.key === 'rating'">
+          <button
+            v-for="o in RATING_OPTS"
+            :key="o.value"
+            class="chip-menu-item"
+            :class="{ on: assets.query.rating === o.value }"
+            :data-rating="o.value"
+            :title="o.label"
+            @click="setRating(o.value)"
+          >
+            <span v-if="o.value === 0" class="cmi-text">不限</span>
+            <template v-else>
+              <span class="cmi-stars">
+                <svg
+                  v-for="n in 5"
+                  :key="n"
+                  class="cmi-star"
+                  :class="{ off: n > o.value }"
+                  viewBox="0 0 12 12"
+                  :fill="n <= o.value ? 'currentColor' : 'none'"
+                  :stroke="n <= o.value ? 'none' : 'currentColor'"
+                  stroke-width="1"
+                  stroke-linejoin="round"
+                >
+                  <path d="M6 1.4l1.4 2.9 3.2.5-2.3 2.2.5 3.2L6 8.7l-2.8 1.5.5-3.2L1.4 4.8l3.2-.5L6 1.4z" />
+                </svg>
+              </span>
+              <span class="cmi-text">及以上</span>
+            </template>
+          </button>
+        </template>
+
+        <template v-else>
+          <button
+            v-for="o in SORT_OPTS"
+            :key="o.value"
+            class="chip-menu-item"
+            :class="{ on: assets.query.sort === o.value }"
+            :data-sort="o.value"
+            @click="setSort(o.value)"
+          >
+            <span class="cmi-text">{{ o.label }}</span>
+            <span v-if="assets.query.sort === o.value" class="cmi-dir">{{ assets.query.order === 'asc' ? '↑' : '↓' }}</span>
+          </button>
+        </template>
       </div>
     </Teleport>
 

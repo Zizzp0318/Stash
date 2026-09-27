@@ -10,6 +10,7 @@ import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
 import { runSmokeM4 } from './services/smoke4'
 import { runSmokeFolder } from './services/smoke-folder'
+import { runSmokeSearch } from './services/smoke-search'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -280,6 +281,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-folder')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeFolder(win)
+      })
+    }
+
+    // 搜索与筛选冒烟：关键词 / 标签 / 评分 / 喜欢 / 类型 / 排序 / 分页 / 组合，含 UI 驱动
+    if (process.argv.includes('--smoke-search')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeSearch(win)
       })
     }
 

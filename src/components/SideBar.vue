@@ -9,8 +9,7 @@ const lib = useLibraryStore()
 const assets = useAssetStore()
 
 // —— 文件夹树（按路径深度缩进）——
-/** 有子级的文件夹 path 集合（决定是否显示折叠箭头） */
-const parentPaths = computed(() => {
+/** 有子级的文件夹 path 集合（决定是否显示折叠箭头） */const parentPaths = computed(() => {
   const s = new Set<string>()
   for (const f of lib.folders) {
     const i = f.path.lastIndexOf('/')
@@ -25,6 +24,10 @@ function hiddenByCollapse(path: string): boolean {
   return false
 }
 
+/**
+ * count 用 `directCount`（直属素材），口径与点进去的列表一致：后端 folderId 筛选不递归，
+ * 用子树数会让「对照 7」点进去只看到 0 张。删除确认框仍走 subtreeCount（那里删的是整棵树）。
+ */
 const folderRows = computed(() =>
   lib.folders
     .slice()
@@ -33,7 +36,7 @@ const folderRows = computed(() =>
     .map((f) => ({
       ...f,
       indent: f.path.split('/').length - 1,
-      count: lib.subtreeCount(f),
+      count: lib.directCount(f),
       hasChildren: parentPaths.value.has(f.path),
       folded: lib.isCollapsed(f.path)
     }))
@@ -395,7 +398,7 @@ onBeforeUnmount(() => {
               @keydown.esc="cancelDraft"
               @blur="commitDraft"
             />
-            <template v-else>{{ f.name }} <span class="n">{{ fmtCount(f.count) }}</span></template>
+            <template v-else>{{ f.name }} <span class="n" title="仅本文件夹内的素材，不含子文件夹">{{ fmtCount(f.count) }}</span></template>
           </div>
           <div
             v-if="creatingIn === f.id"

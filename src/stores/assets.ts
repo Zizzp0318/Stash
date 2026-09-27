@@ -196,6 +196,27 @@ export const useAssetStore = defineStore('assets', () => {
     }
   }
 
+  // —— 筛选状态 ——
+  /**
+   * 工具栏上生效的筛选条件数（关键词 / 类型 / 评分 / 喜欢）。
+   *
+   * 刻意**不统计** folderId 与 tagId：那是侧栏的「导航定位」，
+   * 用户点「设计稿」文件夹是想看那里面的东西，不是给结果加了道筛子；
+   * 把它们算进去会让「清除筛选」变成「跳回全部素材」，误伤导航意图。
+   */
+  const activeFilterCount = computed(
+    () =>
+      (query.keyword ? 1 : 0) + (query.type ? 1 : 0) + (query.rating > 0 ? 1 : 0) + (query.fav ? 1 : 0)
+  )
+
+  /** 清空工具栏筛选（保留文件夹/标签定位与排序偏好），需调用方自行 refresh */
+  function clearFilters(): void {
+    query.keyword = ''
+    query.type = null
+    query.rating = 0
+    query.fav = false
+  }
+
   /** 拉取详情并把它设为右侧面板展示的对象 */
   async function loadDetail(id: number): Promise<void> {
     selectedId.value = id
@@ -382,6 +403,7 @@ export const useAssetStore = defineStore('assets', () => {
     importing, importNotice, notify,
     thumbV, bumpThumbs, thumbUrl,
     cardFields, toggleCardField, viewZoom,
+    activeFilterCount, clearFilters,
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
     patchLocal, bulkRate, bulkFav, bulkMove, bulkDelete, reset

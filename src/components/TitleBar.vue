@@ -12,10 +12,34 @@ let timer: ReturnType<typeof setTimeout> | null = null
 watch(keyword, (v) => {
   if (timer) clearTimeout(timer)
   timer = setTimeout(async () => {
-    assets.query.keyword = v.trim()
+    const kw = v.trim()
+    // 值没变就不重复请求（反向同步回写、或只敲了空格时都会走到这里）
+    if (kw === assets.query.keyword) return
+    assets.query.keyword = kw
     await assets.refresh()
   }, 300)
 })
+
+/**
+ * 反向同步：store 里的关键词被外部改动（工具栏「清除筛选」、切换库）时把输入框跟着清掉。
+ *
+ * 搜索词的唯一真相在 `assets.query.keyword`，输入框只是它的一个视图；
+ * 少了这一条，用户点「清除筛选」后列表是全部素材、但搜索框里还留着上次的词，
+ * 看起来像「筛选没清干净」。
+ *
+ * 比较用 `keyword.value.trim()` 而不是 `keyword.value`：输入 "abc " 时 store 存的是
+ * trim 后的 "abc"，若拿原值比较会判定为「不一致」→ 回写成 "abc"，
+ * 用户正在打字时空格被当场吃掉。
+ */
+watch(
+  () => assets.query.keyword,
+  (v) => {
+    if (v !== keyword.value.trim()) {
+      if (timer) clearTimeout(timer)
+      keyword.value = v
+    }
+  }
+)
 
 // —— 库切换菜单 ——
 const menuOpen = ref(false)

@@ -23,6 +23,18 @@ export interface AssetQuery {
 
 const SORTABLE = new Set(['imported_at', 'name', 'size', 'rating'])
 
+/**
+ * 转义 LIKE 的通配符。
+ *
+ * 不转义的话，用户搜 `100%` 会变成「以 100 开头」、搜 `a_b` 会匹配到 `axb`
+ * —— 搜索框看起来「不精确」，但很难联想到是通配符问题。
+ * `\` 自身必须一起转义，否则用户输入的 `\` 会让后面的字符意外获得转义语义。
+ * 配套 SQL 必须写 `ESCAPE '\'`，否则反斜杠会被当作普通字符。
+ */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`)
+}
+
 export function listAssets(q: AssetQuery): { total: number; items: unknown[] } {
   const { db } = requireCurrent()
 
@@ -36,8 +48,13 @@ export function listAssets(q: AssetQuery): { total: number; items: unknown[] } {
   if (q.fav) where.push('a.is_fav = 1')
   if (q.missing != null) { where.push('a.missing = ?'); params.push(q.missing ? 1 : 0) }
   if (q.keyword) {
-    where.push('(a.name LIKE ? OR a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id WHERE t.name LIKE ?))')
-    params.push(`%${q.keyword}%`, `%${q.keyword}%`)
+    // 文件名或标签名命中即可；两侧 LIKE 都走 escapeLike + ESCAPE '\'
+    where.push(
+      "(a.name LIKE ? ESCAPE '\\' OR a.id IN (" +
+        "SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id WHERE t.name LIKE ? ESCAPE '\\'))"
+    )
+    const kw = `%${escapeLike(q.keyword)}%`
+    params.push(kw, kw)
   }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
 

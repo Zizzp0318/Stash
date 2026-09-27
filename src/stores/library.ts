@@ -99,7 +99,21 @@ export const useLibraryStore = defineStore('library', () => {
     }
   }
 
-  /** 文件夹子树素材数：自身 + 所有路径前缀子目录之和 */
+  /**
+   * 文件夹直接子项素材数（不含子文件夹里的），**侧栏列表用它**。
+   *
+   * 必须与列表语义一致：后端 `folderId != null` 只匹配 `a.folder_id = ?`（不递归），
+   * 点进去看到几张卡片，侧栏就应显示几。用子树数会让数字比列表里实际能看到的还大。
+   */
+  function directCount(f: FolderRow): number {
+    return counts.value.byFolder[String(f.id)] ?? 0
+  }
+
+  /**
+   * 文件夹子树素材数：自身 + 所有路径前缀子目录之和。
+   * 只用于「删除文件夹」的确认弹窗 —— 那里删的是整棵子树，必须报真实会被删掉的总数，
+   * 与列表/侧栏的显示口径刻意不同。
+   */
   function subtreeCount(f: FolderRow): number {
     let n = counts.value.byFolder[String(f.id)] ?? 0
     const prefix = f.path + '/'
@@ -199,6 +213,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, subtreeCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

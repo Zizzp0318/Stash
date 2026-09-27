@@ -560,6 +560,55 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
     await capture('shot-folder-done.png')
 
+    // ==================== K. 侧栏计数口径：只算直接子项 ====================
+    // 素材全在「对照」的子目录里，所以「对照」直属 0、子树 3 —— 两种口径必然不同，
+    // 能真正区分改没改（只断言「显示 == 直属」在两边都是 0 时是恒真的假绿）。
+    step('K')
+    await sleep(700)
+
+    /** 侧栏每个文件夹行显示的计数（fmtCount 用空格做千分位，去掉再转数字） */
+    const sidebarCounts = async (): Promise<Record<string, number>> =>
+      ((await js(`(() => {
+        const out = {}
+        for (const el of document.querySelectorAll('.side-item[data-folder-path]')) {
+          const raw = el.querySelector('.n')?.textContent ?? ''
+          out[el.dataset.folderPath] = Number(String(raw).replace(/\\s/g, '')) || 0
+        }
+        return out
+      })()`)) as Record<string, number> | null) ?? {}
+
+    const kFolders = folderRows()
+    const kIdToPath = new Map(kFolders.map((f) => [f.id, f.path]))
+    /** 后端直属计数：path → count（与后端 folderId 筛选同源；无素材的文件夹补 0） */
+    const directByPath = (): Record<string, number> => {
+      const rows = D()
+        .prepare('SELECT folder_id, count(*) AS c FROM assets WHERE folder_id IS NOT NULL GROUP BY folder_id')
+        .all() as Array<{ folder_id: number; c: number }>
+      // SQL 只会返回「有素材」的分组；侧栏却每个文件夹都有数字，
+      // 不补 0 的话对比时会拿 undefined 去比 0，断言假红
+      const out: Record<string, number> = {}
+      for (const f of kFolders) out[f.path] = 0
+      for (const r of rows) {
+        const p = kIdToPath.get(r.folder_id)
+        if (p) out[p] = r.c
+      }
+      return out
+    }
+    const kDirect = directByPath()
+    /** 子树总数（旧口径）：自身 + 所有前缀子目录 */
+    const subtreeOf = (p: string): number => {
+      let n = kDirect[p] ?? 0
+      for (const f of kFolders) if (f.path.startsWith(p + '/')) n += kDirect[f.path] ?? 0
+      return n
+    }
+
+    R.k_ui = await sidebarCounts()
+    R.k_backend = kDirect
+    R.k_mismatch = Object.entries(R.k_ui as Record<string, number>)
+      .filter(([p, n]) => (kDirect[p] ?? 0) !== n)
+      .map(([p, n]) => `${p}: 侧栏${n} != 直属${kDirect[p] ?? 0}`)
+    R.k_treeDiff = { direct: kDirect['对照'] ?? 0, subtree: subtreeOf('对照') }
+    step(`K direct=${JSON.stringify(R.k_backend)} ui=${JSON.stringify(R.k_ui)} mismatch=${JSON.stringify(R.k_mismatch)}`)
 
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
@@ -666,7 +715,15 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       ctrlDragStillBand: j3m.marquee === true && j3m.ghost !== true &&
         j3?.relUnchanged === true && j3?.stillOnDisk === true,
       // J4 拖动已多选中的一张 → 整批一起走
-      dragBatch: j4?.allInTarget === true && (j4?.movedCount ?? 0) >= 1
+      dragBatch: j4?.allInTarget === true && (j4?.movedCount ?? 0) >= 1,
+
+      // K 侧栏文件夹计数 = 后端直属计数（与列表同口径），逐行比对无一例外
+      sidebarCountIsDirect: (R.k_mismatch as string[]).length === 0 &&
+        (R.k_ui as Record<string, number>)['对照'] === ((R.k_backend as Record<string, number>)['对照'] ?? 0),
+      // 且必须与旧口径（含子树）不同 —— 否则「显示==直属」在全 0 时是恒真的假绿，测不出回归
+      sidebarCountNotSubtree: (R.k_treeDiff as { direct: number; subtree: number }).subtree >
+        (R.k_treeDiff as { direct: number; subtree: number }).direct &&
+        (R.k_ui as Record<string, number>)['对照'] === (R.k_treeDiff as { direct: number; subtree: number }).direct
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

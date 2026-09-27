@@ -171,6 +171,33 @@ body {
 .chip.on { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
 .chip svg { width: 12px; height: 12px; }
 
+/* 纯图标芯片：评分 / 喜欢 / 类型 / 排序。不给文字留宽度，方形按钮图标略大 */
+.chip-ico { padding: 0; width: 32px; height: 32px; justify-content: center; border-radius: 8px; }
+.chip-ico svg { width: 17px; height: 17px; }
+
+/* 排序方向按钮：只有图标，与芯片同尺寸 */
+.chip-order { padding: 0; width: 32px; height: 32px; justify-content: center; border-radius: 8px; }
+.chip-order svg { width: 15px; height: 15px; }
+
+/* 清除筛选：只在有筛选条件时出现，用弱化的告警色提示「有东西正在生效」 */
+.chip-clear {
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border-color: #6B5A3E;
+  color: #D9B87F;
+  background: rgba(217, 184, 127, 0.07);
+}
+.chip-clear:hover { background: rgba(217, 184, 127, 0.15); color: #EBCB97; }
+
+/* 搜索命中高亮 */
+mark {
+  background: rgba(232, 176, 75, 0.28);
+  color: var(--accent);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
 /* 卡片信息字段开关（工具栏最右侧） */
 .field-toggles { margin-left: auto; display: flex; align-items: center; gap: 5px; }
 .ft-label { font-size: 11px; color: var(--text-3); }
@@ -543,6 +570,8 @@ body {
   gap: 4px; padding: 80px 0; color: var(--text-2); font-size: 13px;
 }
 .empty-sub { color: var(--text-3); font-size: 11px; }
+/* 空态里的操作按钮（如「清除筛选」）：与上方文案拉开距离 */
+.empty .w-btn { margin-top: 10px; }
 .loading-tip { text-align: center; padding: 16px 0; color: var(--text-3); font-size: 11px; }
 
 /* 评分星与喜欢按钮可交互 */
@@ -873,6 +902,47 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .raise-enter-from, .raise-leave-to { opacity: 0; transform: translate(-50%, 12px); }
 
 /* ============ 素材右键菜单 ============ */
+/* ============ 类型筛选弹层 ============ */
+/* 工具栏芯片下拉（类型 / 评分 / 排序共用） */
+.chip-menu {
+  position: fixed;
+  min-width: 124px;
+  padding: 5px;
+  border-radius: 9px;
+  background: var(--bg-raised, #2E3134);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  z-index: 110;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.chip-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 27px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+.chip-menu-item:hover { background: var(--bg-hover); color: var(--text-1); }
+.chip-menu-item.on { color: var(--accent); background: var(--accent-soft); }
+/* 评分项：星星用 --accent（金），未点亮的用描边灰，跟详情页星级一致 */
+.chip-menu-item .cmi-stars { display: inline-flex; align-items: center; gap: 1px; }
+.chip-menu-item .cmi-star { width: 11px; height: 11px; color: var(--accent); flex-shrink: 0; }
+.chip-menu-item .cmi-star.off { color: var(--text-3); }
+.chip-menu-item .cmi-text { font-size: 12px; }
+/* 排序项：当前维度的升降序标记靠右 */
+.chip-menu-item .cmi-dir { margin-left: auto; font-size: 11px; opacity: 0.85; }
+
 .ctx-menu {
   position: fixed;
   width: 212px;
@@ -883,8 +953,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
   z-index: 110;
 }
-.ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }
-.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
+.ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
 .ctx-label { font-size: 11.5px; color: var(--text-2); }
 .ctx-stars { display: flex; gap: 3px; }
 .ctx-star {
