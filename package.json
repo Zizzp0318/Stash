@@ -6,7 +6,9 @@
   "main": "out/main/main.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "predev": "node scripts/clean-vite-tmp.mjs",
     "build": "electron-vite build",
+    "postbuild": "node scripts/clean-vite-tmp.mjs",
     "start": "electron-vite preview"
   },
   "dependencies": {

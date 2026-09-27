@@ -7,8 +7,11 @@ set ELECTRON_RUN_AS_NODE=
 
 rem Always rebuild: the old script built only when out\main\main.js was missing,
 rem so source edits were never picked up and the app kept running a stale bundle.
+rem 走 `npm run build` 而不是 `npx electron-vite build`：只有走 npm 生命周期，
+rem package.json 里的 postbuild 才会被触发（负责清掉 electron-vite 留在项目根的
+rem electron.vite.config.<时间戳>.mjs 临时副本）。别把它改回 npx。
 echo Building Stash...
-call npx electron-vite build
+call npm run build
 if errorlevel 1 (
   echo.
   echo Build failed. Launch aborted.
