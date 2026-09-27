@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { fmtSize, fmtDate, fmtDuration } from '../utils/format'
@@ -18,6 +18,10 @@ watch(
   () => asset.value?.id,
   async (id) => {
     natRatio.value = null
+    // 换素材时退出编辑态，否则会把上一张的草稿带到下一张上
+    editingNote.value = false
+    noteDraft.value = ''
+    noteCopied.value = false
     if (id && asset.value?.content_hash) {
       await window.stash.thumb.ensure(id, 'detail')
       detailReady.value++
@@ -165,6 +169,62 @@ async function removeTag(tagId: number): Promise<void> {
   const note = assets.prunedNote(pruned)
   if (note) assets.notify('info', `已从该素材上移除标签；${note}`)
 }
+
+// —— 提示词 / 备注 ——
+// 平时只读预览（双击才进编辑），避免误触改内容；右上角提供一键复制。
+const editingNote = ref(false)
+const noteDraft = ref('')
+const noteCopied = ref(false)
+const noteInput = ref<HTMLTextAreaElement | null>(null)
+
+function beginEditNote(): void {
+  if (!asset.value) return
+  noteDraft.value = asset.value.note ?? ''
+  editingNote.value = true
+  nextTick(() => noteInput.value?.focus())
+}
+
+/** 提交：内容没变就不发 IPC，避免无谓的写库 */
+async function commitNote(): Promise<void> {
+  if (!editingNote.value) return
+  const a = asset.value
+  editingNote.value = false
+  if (!a) return
+  if ((a.note ?? '') === noteDraft.value) return
+  await assets.saveNote(a.id, noteDraft.value)
+}
+
+function cancelNote(): void {
+  editingNote.value = false
+  noteDraft.value = ''
+}
+
+/** 复制提示词到系统剪贴板（剪贴板 API 不可用时退回 textarea + execCommand） */
+async function copyNote(): Promise<void> {
+  const text = asset.value?.note ?? ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try {
+      document.execCommand('copy')
+    } catch {
+      /* 彻底失败就只给个 toast，别静默 */
+      assets.notify('error', '复制失败，请手动选中文本复制')
+      ta.remove()
+      return
+    }
+    ta.remove()
+  }
+  noteCopied.value = true
+  window.setTimeout(() => (noteCopied.value = false), 1500)
+}
 </script>
 
 <template>
@@ -262,6 +322,49 @@ async function removeTag(tagId: number): Promise<void> {
           <div class="palette">
             <div v-for="(c, i) in paletteColors" :key="i" :style="{ background: c }"></div>
           </div>
+        </div>
+
+        <!-- 提示词 / 备注：平时只读，双击进入编辑；右上角一键复制 -->
+        <div class="d-section">
+          <div class="d-label d-label-row">
+            <span>提示词</span>
+            <button
+              class="note-copy"
+              :class="{ ok: noteCopied }"
+              :disabled="!asset.note"
+              :title="asset.note ? '复制提示词' : '暂无提示词'"
+              data-note-copy
+              @click="copyNote"
+            >
+              <svg v-if="!noteCopied" viewBox="0 0 13 13" fill="none">
+                <rect x="4.4" y="1.6" width="7" height="7.8" rx="1.3" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+                <path d="M8.6 11.4H3.3a1.3 1.3 0 0 1-1.3-1.3V4.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <svg v-else viewBox="0 0 13 13" fill="none">
+                <path d="M2.4 6.9l2.6 2.6 5.6-5.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          </div>
+          <textarea
+            v-if="editingNote"
+            ref="noteInput"
+            v-model="noteDraft"
+            class="note-input"
+            data-note-input
+            placeholder="写下提示词 / 备注…"
+            spellcheck="false"
+            @blur="commitNote"
+            @keydown.esc="cancelNote"
+            @keydown.ctrl.enter="commitNote"
+          ></textarea>
+          <div
+            v-else
+            class="note-view"
+            :class="{ empty: !asset.note }"
+            data-note-view
+            title="双击编辑提示词"
+            @dblclick="beginEditNote"
+          >{{ asset.note || '双击添加提示词 / 备注' }}</div>
         </div>
 
         <div class="d-section">

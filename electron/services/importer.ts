@@ -1,8 +1,9 @@
-import { copyFileSync, existsSync, readSync, closeSync, openSync, renameSync, statSync } from 'fs'
+import { copyFileSync, readSync, closeSync, openSync, renameSync, statSync } from 'fs'
 import { basename, extname, join } from 'path'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { requireCurrent, mkdirRel } from './library'
+import { uniqueName } from './naming'
 import type { DB } from './db'
 
 export type AssetType = 'image' | 'video' | 'audio' | 'text'
@@ -37,7 +38,17 @@ export interface ImportArgs {
   folderId?: number | null
   mode?: 'copy' | 'move'
   onProgress?: (p: { importId: number; done: number; total: number }) => void
-  onDone?: (r: { importId: number; added: number; skipped: number; failed: Array<{ path: string; error: string }> }) => void
+  onDone?: (r: ImportResult) => void
+}
+
+export interface ImportResult {
+  importId: number
+  added: number
+  /** 因内容重复（content_hash 命中）被跳过的数量 */
+  skipped: number
+  /** 因目标目录已有同名文件、被自动改成 `名字 (1).ext` 的数量 */
+  renamed: number
+  failed: Array<{ path: string; error: string }>
 }
 
 let importSeq = 0
@@ -71,7 +82,7 @@ export function importFiles(args: ImportArgs): { importId: number } {
     )
     const dupStmt = db.prepare('SELECT id FROM assets WHERE content_hash=?')
 
-    let done = 0, added = 0, skipped = 0
+    let done = 0, added = 0, skipped = 0, renamed = 0
     const failed: Array<{ path: string; error: string }> = []
     const BATCH = 500
     let inTx = false
@@ -87,19 +98,15 @@ export function importFiles(args: ImportArgs): { importId: number } {
         const hash = contentHash(src)
         if (dupStmt.get(hash)) { skipped++; continue }
 
-        let name = basename(src)
-        let dest = join(destDir, name)
-        if (existsSync(dest)) {
-          const e = extname(name)
-          const b = name.slice(0, name.length - e.length)
-          let i = 1
-          while (existsSync(join(destDir, `${b} (${i})${e}`))) i++
-          name = `${b} (${i})${e}`
-          dest = join(destDir, name)
-        }
+        // 目标目录已有同名文件 → 自动换一个不冲突的名字（`名字 (1).png`），
+        // 绝不覆盖也不跳过。规则与移动/复制/重命名共用 `uniqueName`。
+        const origName = basename(src)
+        const name = uniqueName(destDir, origName)
+        const dest = join(destDir, name)
 
         if (mode === 'move') renameSync(src, dest)
         else copyFileSync(src, dest)
+        if (name !== origName) renamed++
 
         if (!inTx) { db.exec('BEGIN'); inTx = true }
         insStmt.run(
@@ -120,11 +127,11 @@ export function importFiles(args: ImportArgs): { importId: number } {
     }
     if (inTx) { try { db.exec('COMMIT') } catch { /* ignore */ } }
 
-    const result = { importId, added, skipped, failed }
+    const result = { importId, added, skipped, renamed, failed }
     args.onDone?.(result)
     BrowserWindow.getAllWindows()[0]?.webContents.send('import:done', result)
   })().catch((e) => {
-    args.onDone?.({ importId, added: 0, skipped: 0, failed: [{ path: '*', error: String(e) }] })
+    args.onDone?.({ importId, added: 0, skipped: 0, renamed: 0, failed: [{ path: '*', error: String(e) }] })
   })
 
   return { importId }

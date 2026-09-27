@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, reactive, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { heart, folderIcon } from '@/data/mock'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../stores/assets'
@@ -254,6 +254,11 @@ onMounted(() => {
   }
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
+  // 拖文件进窗口：全局拦掉，否则 Chromium 会直接「导航到那个文件」，整个应用被替换成一张图
+  window.addEventListener('dragenter', onDragEnter)
+  window.addEventListener('dragover', onDragOver)
+  window.addEventListener('dragleave', onDragLeave)
+  window.addEventListener('drop', onDrop)
 })
 
 onBeforeUnmount(() => {
@@ -263,6 +268,10 @@ onBeforeUnmount(() => {
   document.body.classList.remove('drag-moving')
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousedown', onWindowMouseDown)
+  window.removeEventListener('dragenter', onDragEnter)
+  window.removeEventListener('dragover', onDragOver)
+  window.removeEventListener('dragleave', onDragLeave)
+  window.removeEventListener('drop', onDrop)
 })
 
 /** 列数：由滑块目标宽度决定，至少 1 列 */
@@ -540,7 +549,7 @@ function onCardContext(e: MouseEvent, it: StashAssetRow): void {
   if (!assets.isSelected(it.id)) void assets.select(it.id)
   // 菜单靠近窗口右/下边缘时向内收，避免被裁掉；高度按「展开删除确认」后的最大态预留
   const w = 212
-  const h = 336
+  const h = 448
   menu.value = {
     x: Math.max(6, Math.min(e.clientX, window.innerWidth - w - 6)),
     y: Math.max(6, Math.min(e.clientY, window.innerHeight - h - 6))
@@ -561,6 +570,101 @@ async function menuRate(n: number): Promise<void> {
 async function menuFav(): Promise<void> {
   await assets.bulkFav(!assets.selectedAllFav)
   closeMenu()
+}
+
+// ==================== 复制 / 粘贴源文件 ====================
+async function menuCopy(): Promise<void> {
+  const ids = assets.selectedIds.slice()
+  closeMenu()
+  await assets.copySelection(ids)
+}
+
+async function menuPaste(): Promise<void> {
+  const target = assets.query.folderId
+  closeMenu()
+  await assets.pasteInto(target)
+}
+
+// ==================== 重命名素材 ====================
+const renameOpen = ref(false)
+const renameTarget = ref<{ id: number; name: string } | null>(null)
+const renameValue = ref('')
+const renameInput = ref<HTMLInputElement | null>(null)
+
+/** 后端错误码 → 人话 */
+const ASSET_ERR: Record<string, string> = {
+  ERR_EMPTY_NAME: '文件名不能为空',
+  ERR_INVALID_NAME: '含非法字符（\\ / : * ? " < > |）或为系统保留名，也不能以点或空格结尾',
+  ERR_EXT_CHANGED: '不能修改文件扩展名',
+  // 重名不再报错（会自动加 ` (n)`），这条是兜底：万一哪天后端又改成拒绝，提示也得能读懂
+  ERR_ASSET_EXISTS: '该文件夹下已存在同名文件',
+  ERR_ASSET_MISSING: '磁盘上找不到该文件，请重新打开库以同步',
+  ERR_ASSET_NOT_FOUND: '素材不存在（可能已被外部删除）'
+}
+function assetErrText(code?: string): string {
+  return ASSET_ERR[code ?? ''] ?? String(code ?? '未知错误')
+}
+
+/** 扩展名在弹窗里单独显示（不可编辑），让「改不了后缀」这件事一眼可见 */
+const renameExt = computed(() => {
+  const n = renameTarget.value?.name ?? ''
+  const i = n.lastIndexOf('.')
+  return i > 0 ? n.slice(i) : ''
+})
+/** 输入框里只编辑主名，避免用户把后缀删掉后才被拒 */
+const renameBase = ref('')
+
+function openRenameDialog(): void {
+  const id = assets.selectedId ?? assets.selectedIds[0]
+  const it = assets.items.find((x) => x.id === id)
+  closeMenu()
+  // 重命名一次只针对一个文件，多选时不给入口
+  if (!it || assets.selectedCount > 1) return
+  renameTarget.value = { id: it.id, name: it.name }
+  renameBase.value = renameExt.value ? it.name.slice(0, it.name.length - renameExt.value.length) : it.name
+  renameOpen.value = true
+  nextTick(() => {
+    renameInput.value?.focus()
+    renameInput.value?.select()
+  })
+}
+
+async function confirmRename(): Promise<void> {
+  const t = renameTarget.value
+  if (!t) return
+  const base = renameBase.value.trim()
+  if (!base) {
+    assets.notify('error', '文件名不能为空')
+    return
+  }
+  const name = base + renameExt.value
+  if (name === t.name) {
+    renameOpen.value = false
+    return
+  }
+  const r = await window.stash.asset.rename(t.id, name)
+  if (!r.ok) {
+    assets.notify('error', `重命名失败：${assetErrText(r.error)}`)
+    return
+  }
+  const finalName = r.data?.name ?? name
+  const from = r.data?.renamedFrom
+  renameOpen.value = false
+  renameTarget.value = null
+  await assets.refresh()
+  // name / rel_path 都变了，详情栏要重拉（用 loadDetail，别动用户的多选状态）
+  await assets.loadDetail(t.id)
+  // 目标名被占用时后端会自动加 ` (n)`，必须把最终名字说出来，
+  // 否则用户看到卡片上的名字跟自己输入的不一样，会以为改错了。
+  assets.notify(
+    'info',
+    from ? `「${from}」已存在，已重命名为「${finalName}」` : `已重命名为「${finalName}」`
+  )
+}
+
+function closeRename(): void {
+  renameOpen.value = false
+  renameTarget.value = null
 }
 
 // ==================== 移动 / 删除弹窗（右键菜单与底部悬浮条共用） ====================
@@ -599,13 +703,81 @@ async function confirmDelete(): Promise<void> {
 }
 
 // ==================== 全局按键 / 点击 ====================
+/** 焦点在输入框里时不抢快捷键（否则 Ctrl+V 会被我们截胡，用户没法往输入框粘贴文字） */
+function isTextInput(el: EventTarget | null): boolean {
+  const t = el as HTMLElement | null
+  if (!t || !t.tagName) return false
+  return t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable
+}
+
 function onKeyDown(e: KeyboardEvent): void {
+  // Ctrl/⌘ + C / V：复制 / 粘贴素材源文件
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    if (isTextInput(e.target)) return
+    const k = e.key.toLowerCase()
+    if (k === 'c' && assets.selectedCount > 0) {
+      e.preventDefault()
+      void assets.copySelection()
+      return
+    }
+    if (k === 'v') {
+      e.preventDefault()
+      void assets.pasteInto(assets.query.folderId)
+      return
+    }
+    return
+  }
+
   if (e.key !== 'Escape') return
+  if (renameOpen.value) return closeRename()
   if (chipMenu.value) return void (chipMenu.value = null)
   if (menu.value) return closeMenu()
   if (moveOpen.value) return void (moveOpen.value = false)
   if (deleteOpen.value) return void (deleteOpen.value = false)
   assets.clearSelection()
+}
+
+// ==================== 拖文件进窗口 → 导入到当前文件夹 ====================
+// 监听挂在 window 上：一方面「拖到瀑布界面任意位置」都能命中，
+// 另一方面必须全局 preventDefault，否则 Chromium 会把窗口导航到被拖进来的文件。
+const dropActive = ref(false)
+let dropDepth = 0
+
+function hasFiles(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+}
+
+function onDragEnter(e: DragEvent): void {
+  if (!hasFiles(e)) return
+  e.preventDefault()
+  dropDepth++
+  dropActive.value = true
+}
+
+function onDragOver(e: DragEvent): void {
+  if (!hasFiles(e)) return
+  // 不 preventDefault 的话浏览器不会派发 drop
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+}
+
+function onDragLeave(e: DragEvent): void {
+  if (!hasFiles(e)) return
+  dropDepth = Math.max(0, dropDepth - 1)
+  if (dropDepth === 0) dropActive.value = false
+}
+
+async function onDrop(e: DragEvent): Promise<void> {
+  dropDepth = 0
+  dropActive.value = false
+  if (!hasFiles(e)) return
+  e.preventDefault()
+  const files = Array.from(e.dataTransfer?.files ?? [])
+  // Electron 32 起 File.path 已移除，路径只能从 webUtils 拿
+  const paths = files.map((f) => window.stash.pathForFile(f)).filter(Boolean)
+  if (!paths.length) return
+  await window.stash.import.files({ paths, folderId: assets.query.folderId, mode: 'copy' })
+  void lib.loadMeta()
 }
 
 /** 点击菜单以外的任何地方都关闭右键菜单 / 芯片下拉 */
@@ -873,6 +1045,16 @@ function onWindowMouseDown(e: MouseEvent): void {
         </template>
       </div>
       <div v-if="assets.loading" class="loading-tip">加载中…</div>
+
+      <!-- 拖文件进窗口时的导入提示（松手即导入到当前文件夹） -->
+      <div v-if="dropActive" class="drop-hint" data-drop-hint>
+        <div class="dh-inner">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 15V4M8 8l4-4 4 4M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <span>松开即可导入到此文件夹</span>
+        </div>
+      </div>
     </div>
 
     <!-- 底部悬浮条 -->
@@ -1000,6 +1182,34 @@ function onWindowMouseDown(e: MouseEvent): void {
           </svg>
           {{ assets.selectedAllFav ? '取消喜欢' : '设为喜欢' }}
         </button>
+
+        <div class="ctx-sep"></div>
+        <button class="ctx-item" data-ctx="copy" @click="menuCopy">
+          <svg viewBox="0 0 13 13" fill="none">
+            <rect x="4.4" y="1.6" width="7" height="7.8" rx="1.3" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+            <path d="M8.6 11.4H3.3a1.3 1.3 0 0 1-1.3-1.3V4.6" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          复制（Ctrl+C）
+        </button>
+        <button class="ctx-item" data-ctx="paste" @click="menuPaste">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M4.6 2.2h3.8v1.6H4.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+            <path d="M4.6 3H3.4a1.2 1.2 0 0 0-1.2 1.2v6.2a1.2 1.2 0 0 0 1.2 1.2h6.2a1.2 1.2 0 0 0 1.2-1.2V4.2A1.2 1.2 0 0 0 9.6 3H8.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          粘贴（Ctrl+V）
+        </button>
+        <button
+          v-if="assets.selectedCount === 1"
+          class="ctx-item"
+          data-ctx="rename"
+          @click="openRenameDialog"
+        >
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M8.4 1.9l2.7 2.7-6.6 6.6-3.2.5.5-3.2 6.6-6.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+          </svg>
+          重命名文件
+        </button>
+
         <button class="ctx-item" @click="openMoveDialog">
           <svg viewBox="0 0 13 13" fill="none">
             <path d="M1.6 4.2h9.8v6.2H1.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
@@ -1066,6 +1276,34 @@ function onWindowMouseDown(e: MouseEvent): void {
           <div class="modal-foot">
             <button class="w-btn" @click="deleteOpen = false">取消</button>
             <button class="w-btn danger-strong" @click="confirmDelete">删除</button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
+    <!-- 重命名文件弹窗：扩展名固定不可改，输入框只编辑主名 -->
+    <Teleport to="body">
+      <div v-if="renameOpen" class="modal-mask" @click.self="closeRename">
+        <div class="modal">
+          <div class="modal-title">重命名文件</div>
+          <div class="modal-body">
+            <div class="rename-line">
+              <input
+                ref="renameInput"
+                v-model="renameBase"
+                class="rename-input"
+                data-rename-input
+                spellcheck="false"
+                @keydown.enter="confirmRename"
+                @keydown.esc="closeRename"
+              />
+              <span v-if="renameExt" class="rename-ext" data-rename-ext>{{ renameExt }}</span>
+            </div>
+            <p class="modal-sub">扩展名不可修改。若该名称已存在，会自动加序号（如「{{ renameBase || '名字' }} (1){{ renameExt }}」）。</p>
+          </div>
+          <div class="modal-foot">
+            <button class="w-btn" @click="closeRename">取消</button>
+            <button class="w-btn primary" data-rename-ok @click="confirmRename">确定</button>
           </div>
         </div>
       </div>

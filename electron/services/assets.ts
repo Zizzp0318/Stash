@@ -1,6 +1,8 @@
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync } from 'fs'
-import { extname, join } from 'path'
-import { requireCurrent, pruneUnlinkedTags } from './library'
+import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 'fs'
+import { extname, isAbsolute, join, relative } from 'path'
+import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
+import { importFiles } from './importer'
+import { uniqueName } from './naming'
 import type { DB } from './db'
 
 /** 拼接库内相对路径（统一用 / 分隔） */
@@ -115,7 +117,7 @@ export function getAsset(id: number): unknown {
   return { ...asset, tags }
 }
 
-export function updateAsset(id: number, patch: { rating?: number; isFav?: boolean }): void {
+export function updateAsset(id: number, patch: { rating?: number; isFav?: boolean; note?: string }): void {
   const { db } = requireCurrent()
   if (patch.rating != null) {
     const r = Math.max(0, Math.min(5, Math.round(patch.rating)))
@@ -123,6 +125,11 @@ export function updateAsset(id: number, patch: { rating?: number; isFav?: boolea
   }
   if (patch.isFav != null) {
     db.prepare('UPDATE assets SET is_fav=? WHERE id=?').run(patch.isFav ? 1 : 0, id)
+  }
+  if (patch.note != null) {
+    // 提示词/备注：空串统一存 NULL，避免「有内容但全是空白」和「真的没有」两种状态混在一起
+    const v = patch.note.trim()
+    db.prepare('UPDATE assets SET note=? WHERE id=?').run(v ? patch.note : null, id)
   }
 }
 
@@ -151,15 +158,8 @@ export function bulkUpdate(ids: number[], patch: { rating?: number; isFav?: bool
   return { updated }
 }
 
-/** 目标目录内重名时追加 (n)，与导入逻辑保持一致的命名规则 */
-function uniqueName(dir: string, name: string): string {
-  if (!existsSync(join(dir, name))) return name
-  const e = extname(name)
-  const b = name.slice(0, name.length - e.length)
-  let i = 1
-  while (existsSync(join(dir, `${b} (${i})${e}`))) i++
-  return `${b} (${i})${e}`
-}
+/** 目标目录内重名时追加 (n)。实现见 `naming.ts`（四条路径共用，别在这里另写一份） */
+export { uniqueName } from './naming'
 
 /**
  * 搬动单个文件。同库内基本都在同一卷，rename 即可；
@@ -184,11 +184,104 @@ export interface BulkFail {
   error: string
 }
 
+const BAD_FILE_CHARS = /[\\/:*?"<>|]/
+/** Windows 保留设备名当文件名同样会翻车（`CON.png` 这类一并拦掉） */
+const RESERVED_FILE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i
+
+/**
+ * 校验素材文件名。比文件夹名宽松一点（允许中间的点），但四类必须拦：
+ * 空、`. / ..`、非法字符与保留设备名、以点或空格结尾（Windows 会静默裁掉）。
+ * 路径分隔符也在非法字符里，防止用重命名把文件「搬」到别的目录。
+ */
+function validateAssetName(raw: string): string {
+  const name = (raw ?? '').trim()
+  if (!name) throw new Error('ERR_EMPTY_NAME')
+  if (name === '.' || name === '..') throw new Error('ERR_INVALID_NAME')
+  if (BAD_FILE_CHARS.test(name)) throw new Error('ERR_INVALID_NAME')
+  if (RESERVED_FILE_NAMES.test(name)) throw new Error('ERR_INVALID_NAME')
+  if (/[. ]$/.test(name)) throw new Error('ERR_INVALID_NAME')
+  return name
+}
+
+/** `renameAsset` 的结果；`renamedFrom` 非空表示「想要的名字被占了，自动换了一个」 */
+export interface RenameResult {
+  id: number
+  name: string
+  rel_path: string
+  /** 被占用而放弃的原始目标名（供 UI 说明），没发生冲突时为 null */
+  renamedFrom: string | null
+}
+
+/**
+ * 重命名素材文件名：物理文件先改名，成功后再改索引（name / rel_path）；
+ * 索引写失败就把物理文件名改回去，避免磁盘与索引不一致（与 `library.renameFolder` 同一套顺序）。
+ *
+ * **扩展名不允许修改**：文件内容没变，改扩展名只会让 type / 缩略图管线 / 预览全部对不上，
+ * 所以在服务层直接拒绝（`ERR_EXT_CHANGED`），由 UI 提示用户。
+ *
+ * **目标名被占用了不报错，自动换一个不冲突的名字**（`uniqueName` 追加 ` (n)`）。
+ * 用户的诉求是「重名了就给素材改个名」，而不是「重名了就不许改」——
+ * 报错拒绝对用户来说等于白打一遍字。被换掉的原名通过 `renamedFrom` 回传，让 UI 能说明清楚。
+ * 与导入 / 移动 / 复制走同一个 `uniqueName`，所以命名规则（`名字 (1).png`）处处一致。
+ */
+export function renameAsset(id: number, rawName: string): RenameResult {
+  const { db, path: libPath } = requireCurrent()
+  const row = db.prepare('SELECT id, name, rel_path FROM assets WHERE id=?').get(id) as
+    | { id: number; name: string; rel_path: string }
+    | undefined
+  if (!row) throw new Error('ERR_ASSET_NOT_FOUND')
+
+  const wanted = validateAssetName(rawName)
+  // 名字完全没变 → 什么都不做（连一次多余的磁盘操作都不做）
+  if (wanted === row.name) return { id, name: row.name, rel_path: row.rel_path, renamedFrom: null }
+
+  const oldExt = extname(row.name).slice(1).toLowerCase()
+  const newExt = extname(wanted).slice(1).toLowerCase()
+  if (newExt !== oldExt) throw new Error('ERR_EXT_CHANGED')
+
+  const dirRel = row.rel_path.includes('/') ? row.rel_path.slice(0, row.rel_path.lastIndexOf('/')) : ''
+  const dirAbs = dirRel ? join(libPath, ...dirRel.split('/')) : libPath
+  const oldAbs = join(libPath, ...row.rel_path.split('/'))
+  if (!existsSync(oldAbs)) throw new Error('ERR_ASSET_MISSING')
+
+  // 目标名被占用 → 自动换名。仅大小写变化（a.png → A.png）在 Windows 上是同一个文件，
+  // existsSync(新名) 恒真，属于合法改名，必须放行。
+  let name = wanted
+  let renamedFrom: string | null = null
+  const wantedAbs = join(dirAbs, wanted)
+  if (wantedAbs.toLowerCase() !== oldAbs.toLowerCase()) {
+    // 除了磁盘，还要把索引算进来：`rel_path` 有 UNIQUE 约束，
+    // 「记录还在、文件已被外部删掉」的 missing 行在磁盘上完全看不出来（见 naming.ts）
+    const relTaken = (n: string): boolean =>
+      !!db.prepare('SELECT id FROM assets WHERE LOWER(rel_path)=LOWER(?) AND id<>?').get(toRel(dirRel, n), id)
+    const final = uniqueName(dirAbs, wanted, relTaken)
+    if (final !== wanted) {
+      name = final
+      renamedFrom = wanted
+    }
+  }
+
+  const newAbs = join(dirAbs, name)
+  renameSync(oldAbs, newAbs)
+  const newRel = toRel(dirRel, name)
+  try {
+    db.prepare('UPDATE assets SET name=?, rel_path=? WHERE id=?').run(name, newRel, id)
+  } catch (e) {
+    try {
+      renameSync(newAbs, oldAbs)
+    } catch {
+      /* 回滚物理也失败，只能把错误抛出去 */
+    }
+    throw e
+  }
+  return { id, name, rel_path: newRel, renamedFrom }
+}
+
 /** 批量移动到库内目标文件夹：物理文件 + 索引同步（rel_path / folder_id / name 一起改） */
-export function moveAssets(ids: number[], folderId: number): { moved: number; failed: BulkFail[] } {
+export function moveAssets(ids: number[], folderId: number): { moved: number; renamed: number; failed: BulkFail[] } {
   const { db, path: libPath } = requireCurrent()
   const failed: BulkFail[] = []
-  if (!ids.length) return { moved: 0, failed }
+  if (!ids.length) return { moved: 0, renamed: 0, failed }
 
   const folder = db.prepare('SELECT id, path FROM folders WHERE id=?').get(folderId) as
     | { id: number; path: string }
@@ -204,6 +297,7 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; fa
   const upd = db.prepare('UPDATE assets SET folder_id=?, rel_path=?, name=? WHERE id=?')
 
   let moved = 0
+  let renamed = 0
   db.exec('BEGIN')
   try {
     for (const row of rows) {
@@ -220,6 +314,7 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; fa
           continue
         }
         const name = uniqueName(destDir, row.name)
+        if (name !== row.name) renamed++
         const dest = join(destDir, name)
         moveFile(src, dest)
         upd.run(folder.id, toRel(folder.path, name), name, row.id)
@@ -233,7 +328,126 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; fa
     db.exec('ROLLBACK')
     throw e
   }
-  return { moved, failed }
+  return { moved, renamed, failed }
+}
+
+/** 库内复制时要一起带过去的列（内容属性 + 用户标注），别漏 —— 漏了 note 就会出现「副本没有备注」 */
+const COPY_COLS = [
+  'type', 'ext', 'size', 'width', 'height', 'duration_ms', 'content_hash',
+  'rating', 'is_fav', 'palette', 'exif', 'note'
+] as const
+
+/**
+ * 库内复制：在目标文件夹生成一份**独立副本**（文件真拷一份，索引行新建）。
+ *
+ * 与 `moveAssets` 的区别只在「源留不留」，所以重名处理、目标兜底、事务粒度都对齐：
+ * - 目标文件夹没指定时落到「未分类」（与导入的兜底一致，避免用户在没有文件夹的库里粘贴失败）；
+ * - 重名自动加 ` (n)`（复用 `uniqueName`）；
+ * - **评分 / 喜欢 / 备注 / 标签一并带过去** —— 副本是「同一个素材的另一个拷贝」，
+ *   只拷文件不拷标注会让人以为标注丢了。缩略图按 `content_hash` 命名，天然共享缓存。
+ */
+export function copyAssets(
+  ids: number[],
+  folderId?: number | null
+): { copied: number; renamed: number; failed: BulkFail[] } {
+  const { db, path: libPath } = requireCurrent()
+  const failed: BulkFail[] = []
+  if (!ids.length) return { copied: 0, renamed: 0, failed }
+
+  let target: { id: number; path: string }
+  if (folderId != null) {
+    const f = db.prepare('SELECT id, path FROM folders WHERE id=?').get(folderId) as
+      | { id: number; path: string }
+      | undefined
+    if (!f) throw new Error('ERR_FOLDER_NOT_FOUND')
+    target = f
+  } else {
+    target = mkdirRel('未分类')
+  }
+  const destDir = join(libPath, ...target.path.split('/'))
+  mkdirSync(destDir, { recursive: true })
+
+  const ph = ids.map(() => '?').join(',')
+  const rows = db
+    .prepare(`SELECT id, name, rel_path, ${COPY_COLS.join(', ')} FROM assets WHERE id IN (${ph})`)
+    .all(...ids) as Array<Record<string, unknown> & { id: number; name: string; rel_path: string }>
+
+  const ins = db.prepare(
+    `INSERT INTO assets(folder_id,name,rel_path,source_path,${COPY_COLS.join(',')},file_mtime,imported_at,missing)
+     VALUES(?,?,?,?,${COPY_COLS.map(() => '?').join(',')},?,?,0)`
+  )
+  const tagOf = db.prepare('SELECT tag_id FROM asset_tags WHERE asset_id=?')
+  const insTag = db.prepare('INSERT OR IGNORE INTO asset_tags(asset_id,tag_id) VALUES(?,?)')
+
+  let copied = 0
+  let renamed = 0
+  db.exec('BEGIN')
+  try {
+    for (const row of rows) {
+      try {
+        const src = join(libPath, ...row.rel_path.split('/'))
+        if (!existsSync(src)) {
+          failed.push({ id: row.id, name: row.name, error: '源文件不存在' })
+          continue
+        }
+        const name = uniqueName(destDir, row.name)
+        if (name !== row.name) renamed++
+        const dest = join(destDir, name)
+        copyFileSync(src, dest)
+        const r = ins.run(
+          target.id,
+          name,
+          toRel(target.path, name),
+          src,
+          ...COPY_COLS.map((c) => row[c] as never),
+          Math.floor(statSync(dest).mtimeMs),
+          Date.now()
+        )
+        const newId = Number(r.lastInsertRowid)
+        for (const t of tagOf.all(row.id) as Array<{ tag_id: number }>) insTag.run(newId, t.tag_id)
+        copied++
+      } catch (e) {
+        failed.push({ id: row.id, name: row.name, error: errMsg(e) })
+      }
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  return { copied, renamed, failed }
+}
+
+/**
+ * 粘贴一批路径到目标文件夹，**按来源分流**：
+ *  - 路径落在**库内**（且能在 `assets` 里对上号）→ `copyAssets` 生成保留标注的副本；
+ *  - 库**外**的路径 → 走 `importFiles` 导入管线（内容查重、进度事件全都复用）。
+ *
+ * 这个分流是「Ctrl+C 一张图 → 切到 Stash → Ctrl+V」体验的关键：
+ * 用户在库内复制粘贴，期望得到的是**带评分/标签/备注的副本**，
+ * 而不是一条「内容重复被跳过」的提示。
+ */
+export function pastePaths(
+  paths: string[],
+  folderId?: number | null
+): { copied: number; renamed: number; failed: BulkFail[]; importing: number } {
+  const { db, path: libPath } = requireCurrent()
+  const ids: number[] = []
+  const outside: string[] = []
+  const findRel = db.prepare('SELECT id FROM assets WHERE LOWER(rel_path)=LOWER(?)')
+
+  for (const p of paths) {
+    const rel = relative(libPath, p).replace(/\\/g, '/')
+    // 库外路径：relative 返回 `..\xxx`（同盘）或直接回绝对路径（跨盘），两种都要挡住
+    const inLib = !!rel && !rel.startsWith('..') && !isAbsolute(rel)
+    const row = inLib ? (findRel.get(rel) as { id: number } | undefined) : undefined
+    if (row) ids.push(row.id)
+    else outside.push(p)
+  }
+
+  const res = ids.length ? copyAssets(ids, folderId) : { copied: 0, renamed: 0, failed: [] as BulkFail[] }
+  if (outside.length) importFiles({ paths: outside, folderId, mode: 'copy' })
+  return { copied: res.copied, renamed: res.renamed, failed: res.failed, importing: outside.length }
 }
 
 /**
@@ -354,6 +568,23 @@ export function createTag({ name, color }: { name: string; color?: string }): { 
   const { db } = requireCurrent()
   const r = db.prepare('INSERT INTO tags(name,color) VALUES(?,?)').run(name, color ?? '#7FA8D9')
   return { id: Number(r.lastInsertRowid) }
+}
+
+/**
+ * 重命名标签本体（不是「从某个素材上摘掉」——那个走 `setTags`）。
+ * 纯改文本，素材关联不受影响（关联挂在 id 上，与名字无关）。
+ * `tags.name` 有 UNIQUE 约束，重名提前报 `ERR_TAG_EXISTS` 比让 SQLite 抛约束错好读。
+ */
+export function renameTag(id: number, rawName: string): { id: number; name: string } {
+  const { db } = requireCurrent()
+  const name = (rawName ?? '').trim()
+  if (!name) throw new Error('ERR_EMPTY_NAME')
+  const cur = db.prepare('SELECT id, name FROM tags WHERE id=?').get(id) as { id: number; name: string } | undefined
+  if (!cur) throw new Error('ERR_TAG_NOT_FOUND')
+  if (cur.name === name) return { id, name }
+  if (db.prepare('SELECT id FROM tags WHERE name=?').get(name)) throw new Error('ERR_TAG_EXISTS')
+  db.prepare('UPDATE tags SET name=? WHERE id=?').run(name, id)
+  return { id, name }
 }
 
 /**

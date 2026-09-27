@@ -794,7 +794,7 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
 
       // H5 侧栏右键删除标签本体
       tagMenuOpened: R.h5_ctxMode === 'real' || R.h5_ctxMode === 'dispatch',
-      tagMenuItems: (R.h5_menuItems as string[])?.join('|') === '删除标签',
+      tagMenuItems: (R.h5_menuItems as string[])?.join('|') === '重命名标签|删除标签',
       tagMenuHitCorrectRow: (R.h5_targetIndex as number) >= 0,
       confirmShowsImpact: h5m?.title?.includes('水') === true && /1 个素材/.test(h5m?.text ?? ''),
       confirmSaysFilesSafe: /不受影响/.test(h5m?.text ?? ''),

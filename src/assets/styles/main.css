@@ -1108,3 +1108,96 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .grid-wrap.has-batchbar { padding-bottom: 84px; }
 /* 评分「混合」提示（选中项评分不一致时才出现） */
 .bb-mixed, .ctx-mixed { font-size: 10px; color: var(--text-3); margin-left: 2px; }
+
+/* ============ 重命名文件弹窗 ============ */
+/* 主名与扩展名拼成一条输入框：扩展名只读，用户一眼看到「后缀改不了」 */
+.rename-line { display: flex; align-items: stretch; }
+.rename-input {
+  flex: 1; min-width: 0;
+  height: 32px; padding: 0 10px;
+  border-radius: 8px 0 0 8px;
+  border: 1px solid var(--border-soft);
+  border-right: 0;
+  background: var(--bg-input, #1D1F22);
+  color: var(--text-1);
+  font-size: 12.5px; font-family: var(--font);
+  outline: none;
+  user-select: text;
+}
+.rename-input:focus { border-color: #5A8AC9; }
+.rename-ext {
+  display: flex; align-items: center;
+  height: 32px; padding: 0 10px;
+  border-radius: 0 8px 8px 0;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-raised);
+  color: var(--text-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.modal-sub { margin-top: 8px; font-size: 11px; color: var(--text-3); }
+
+/* ============ 详情栏：提示词 / 备注 ============ */
+.d-label-row { display: flex; align-items: center; justify-content: space-between; }
+.note-copy {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; margin: -4px -2px -4px 0;
+  border: 0; border-radius: 5px;
+  background: transparent; color: var(--text-3);
+  cursor: pointer;
+}
+.note-copy svg { width: 12px; height: 12px; }
+.note-copy:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-1); }
+.note-copy:disabled { opacity: 0.35; cursor: default; }
+.note-copy.ok { color: #6FBF87; }
+/* 只读预览：文字可选可复制，但双击才进编辑（避免误触改内容） */
+.note-view {
+  font-size: 11.5px; line-height: 1.6;
+  color: var(--text-2);
+  background: var(--bg-raised);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 168px;
+  overflow-y: auto;
+  user-select: text;
+  cursor: text;
+}
+.note-view:hover { border-color: var(--border-soft); }
+.note-view.empty { color: var(--text-3); font-style: italic; }
+.note-input {
+  display: block;
+  width: 100%; min-height: 76px;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid #5A8AC9;
+  background: var(--bg-input, #1D1F22);
+  color: var(--text-1);
+  font-size: 11.5px; line-height: 1.6; font-family: var(--font);
+  outline: none;
+  user-select: text;
+}
+
+/* ============ 拖文件进窗口的导入提示 ============ */
+/* fixed 而不是 absolute：.grid-wrap 是滚动容器，absolute 会跟着内容滚走 */
+.drop-hint {
+  position: fixed; inset: 0;
+  z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(36, 38, 41, 0.68);
+  pointer-events: none;
+}
+.dh-inner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 22px;
+  border-radius: 12px;
+  border: 1px dashed var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+}
+.dh-inner svg { width: 20px; height: 20px; }
+

@@ -50,7 +50,13 @@ onMounted(async () => {
     } else if (r.added === 0 && r.skipped === 0) {
       setNotice({ kind: 'info', text: '没有可导入的文件（格式不支持或无有效文件）' })
     } else {
-      setNotice({ kind: 'info', text: `导入完成：新增 ${r.added} 个${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}` })
+      // 重名被自动改名也要说出来 —— 不说的话用户只知道「新增 1 个」，
+      // 却在瀑布里找不到自己那个文件名，会以为导入错了。
+      const renamedNote = r.renamed ? `，${r.renamed} 个因重名已自动改名` : ''
+      setNotice({
+        kind: 'info',
+        text: `导入完成：新增 ${r.added} 个${renamedNote}${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}`
+      })
     }
   })
 })

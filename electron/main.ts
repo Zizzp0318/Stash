@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'fs'
 import * as librarySvc from './services/library'
 import * as assetsSvc from './services/assets'
 import * as importerSvc from './services/importer'
+import * as clipboardSvc from './services/clipboard'
 import { unwatchLibrary, watchLibrary } from './services/watcher'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
@@ -12,6 +13,7 @@ import { runSmokeM4 } from './services/smoke4'
 import { runSmokeFolder } from './services/smoke-folder'
 import { runSmokeSearch } from './services/smoke-search'
 import { runSmokeTag } from './services/smoke-tag'
+import { runSmokeEdit } from './services/smoke-edit'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -64,6 +66,14 @@ function bootstrap(): void {
     })
 
     w.on('ready-to-show', () => w.show())
+
+    // 把文件拖进窗口时，Chromium 默认会「导航到该文件」——整个应用会被替换成一张图片。
+    // 渲染层已经 preventDefault 了 drop，这里再兜一层：任何非本应用页面的跳转直接拦掉。
+    w.webContents.on('will-navigate', (e, url) => {
+      const devUrl = process.env['ELECTRON_RENDERER_URL']
+      const allowed = devUrl ? url.startsWith(devUrl) : url.startsWith('file://')
+      if (!allowed) e.preventDefault()
+    })
 
     // 临时诊断模式：--debug-lib <路径> 自动开库 + 渲染层日志透传到 stdout（只执行一次，避免 reload 循环）
     const debugLibIdx = process.argv.indexOf('--debug-lib')
@@ -219,10 +229,21 @@ function bootstrap(): void {
     ipcMain.handle('asset:bulk-update', (_e, { ids, patch }) => wrap(() => assetsSvc.bulkUpdate(ids, patch)))
     ipcMain.handle('asset:move', (_e, { ids, folderId }) => wrap(() => assetsSvc.moveAssets(ids, folderId)))
     ipcMain.handle('asset:delete', (_e, { ids }) => wrap(() => assetsSvc.deleteAssets(ids)))
+    ipcMain.handle('asset:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameAsset(id, name)))
+    /** 库内复制：在目标文件夹生成一份保留评分/喜欢/备注/标签的副本 */
+    ipcMain.handle('asset:copy', (_e, { ids, folderId }) => wrap(() => assetsSvc.copyAssets(ids ?? [], folderId ?? null)))
+    /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（分流在服务层） */
+    ipcMain.handle('asset:paste', (_e, { paths, folderId }) => wrap(() => assetsSvc.pastePaths(paths ?? [], folderId ?? null)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))
+    ipcMain.handle('tag:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameTag(id, name)))
     ipcMain.handle('tag:delete', (_e, { id }) => wrap(() => assetsSvc.deleteTag(id)))
+
+    // 系统剪贴板：读/写「文件列表」（复制源文件 / 粘贴外部文件）与纯文本
+    ipcMain.handle('clipboard:write-files', (_e, paths) => wrap(() => clipboardSvc.writeFiles(paths ?? [])))
+    ipcMain.handle('clipboard:read-files', () => wrap(() => clipboardSvc.readFiles()))
+    ipcMain.handle('clipboard:write-text', (_e, text) => wrap(() => clipboardSvc.writeText(String(text ?? ''))))
 
     // 系统对话框
     ipcMain.handle('dialog:pick-folder', async () => {
@@ -297,6 +318,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-tag')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeTag(win)
+      })
+    }
+
+    // 编辑能力冒烟：重命名素材/标签 + 提示词 + 复制粘贴源文件
+    if (process.argv.includes('--smoke-edit')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeEdit(win)
       })
     }
 

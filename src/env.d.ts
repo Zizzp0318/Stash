@@ -42,7 +42,7 @@ export interface StashFolderApi {
 export interface StashImportApi {
   files: (args: { paths: string[]; folderId?: number | null; mode?: 'copy' | 'move' }) => Promise<{ ok: boolean; data?: { importId: number }; error?: string }>
   onProgress: (cb: (d: { importId: number; done: number; total: number }) => void) => Unsub
-  onDone: (cb: (d: { importId: number; added: number; skipped: number; failed: Array<{ path: string; error: string }> }) => void) => Unsub
+  onDone: (cb: (d: { importId: number; added: number; skipped: number; renamed: number; failed: Array<{ path: string; error: string }> }) => void) => Unsub
 }
 
 export interface StashThumbApi {
@@ -68,6 +68,8 @@ export interface StashAssetRow {
   rating: number
   is_fav: number
   palette: string | null
+  /** 提示词 / 备注（详情栏色板下方那块，双击编辑） */
+  note: string | null
   file_mtime: number
   imported_at: number
   missing: number
@@ -113,11 +115,15 @@ export interface StashAssetApi {
   }) => Promise<{ ok: boolean; data?: { total: number; items: StashAssetRow[] }; error?: string }>
   counts: () => Promise<{ ok: boolean; data?: { total: number; byFolder: Record<string, number>; byTag: Record<string, number> }; error?: string }>
   get: (id: number) => Promise<{ ok: boolean; data?: StashAssetDetail; error?: string }>
-  update: (id: number, patch: { rating?: number; isFav?: boolean }) => Promise<{ ok: boolean; data?: null; error?: string }>
+  update: (id: number, patch: { rating?: number; isFav?: boolean; note?: string }) => Promise<{ ok: boolean; data?: null; error?: string }>
   /** 批量评分 / 喜欢 */
   bulkUpdate: (ids: number[], patch: { rating?: number; isFav?: boolean }) => Promise<{ ok: boolean; data?: { updated: number }; error?: string }>
-  /** 批量移动到库内文件夹（物理文件 + 索引同步） */
-  move: (ids: number[], folderId: number) => Promise<{ ok: boolean; data?: { moved: number; failed: StashBulkFail[] }; error?: string }>
+  /** 批量移动到库内文件夹（物理文件 + 索引同步）；`renamed` = 因目标目录重名被自动改名的数量 */
+  move: (ids: number[], folderId: number) => Promise<{
+    ok: boolean
+    data?: { moved: number; renamed: number; failed: StashBulkFail[] }
+    error?: string
+  }>
   /** 批量删除：直接从磁盘删除，不可恢复（无回收站）。`pruned` = 连带失去全部素材的标签 */
   remove: (ids: number[]) => Promise<{
     ok: boolean
@@ -126,11 +132,41 @@ export interface StashAssetApi {
   }>
   /** 重写素材的标签集合；摘空的标签会被自动删除，清单见 `pruned` */
   setTags: (id: number, tagIds: number[]) => Promise<{ ok: boolean; data?: { pruned: StashPrunedTag[] }; error?: string }>
+  /** 重命名素材文件名（物理文件 + 索引同步；扩展名不可修改）。
+   *  `name` 是最终生效的名字；`renamedFrom` 非空表示原名被占用、已自动改名 */
+  rename: (id: number, name: string) => Promise<{
+    ok: boolean
+    data?: { id: number; name: string; rel_path: string; renamedFrom: string | null }
+    error?: string
+  }>
+  /** 库内复制：在目标文件夹生成一份带评分/喜欢/备注/标签的副本（重名自动加 (n)） */
+  copy: (ids: number[], folderId?: number | null) => Promise<{
+    ok: boolean
+    data?: { copied: number; renamed: number; failed: StashBulkFail[] }
+    error?: string
+  }>
+  /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（进度复用 import 事件） */
+  paste: (paths: string[], folderId?: number | null) => Promise<{
+    ok: boolean
+    data?: { copied: number; renamed: number; failed: StashBulkFail[]; importing: number }
+    error?: string
+  }>
+}
+
+/** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
+export interface StashClipboardApi {
+  /** 把库内文件的绝对路径写进系统剪贴板 */
+  writeFiles: (paths: string[]) => Promise<{ ok: boolean; data?: { count: number }; error?: string }>
+  /** 读系统剪贴板里的文件列表；不是文件时返回空数组 */
+  readFiles: () => Promise<{ ok: boolean; data?: string[]; error?: string }>
+  writeText: (text: string) => Promise<{ ok: boolean; data?: { ok: true }; error?: string }>
 }
 
 export interface StashTagApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ id: number; name: string; color: string }>; error?: string }>
   create: (args: { name: string; color?: string }) => Promise<{ ok: boolean; data?: { id: number }; error?: string }>
+  /** 重命名标签本体（素材关联不受影响） */
+  rename: (id: number, name: string) => Promise<{ ok: boolean; data?: { id: number; name: string }; error?: string }>
   /** 彻底删除标签（不是从素材上摘掉），返回被解绑的素材数 */
   remove: (id: number) => Promise<{ ok: boolean; data?: { unlinked: number }; error?: string }>
 }
@@ -147,6 +183,9 @@ export interface StashApi {
   import: StashImportApi
   thumb: StashThumbApi
   asset: StashAssetApi
+  clipboard: StashClipboardApi
+  /** 拖拽进来的 File → 磁盘绝对路径（Electron 32+ 必须用 webUtils） */
+  pathForFile: (file: File) => string
   tag: StashTagApi
   dialog: StashDialogApi
 }

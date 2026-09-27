@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS assets (
   is_fav INTEGER DEFAULT 0,
   palette TEXT,
   exif TEXT,
+  note TEXT,
   file_mtime INTEGER NOT NULL,
   imported_at INTEGER NOT NULL,
   missing INTEGER DEFAULT 0
@@ -69,5 +70,26 @@ export function openDatabase(stashFile: string): DB {
    */
   db.exec('PRAGMA foreign_keys = ON')
   db.exec(SCHEMA)
+  migrate(db)
   return db
+}
+
+/**
+ * 老库增量迁移。
+ *
+ * `SCHEMA` 里全是 `CREATE TABLE IF NOT EXISTS`，表已存在时新增的列**不会**补上，
+ * 所以每一列都要在这里显式检测 + `ALTER TABLE`（SQLite 支持 ADD COLUMN，
+ * 对已有行填 NULL，不需要重建表）。新库走完 SCHEMA 就已经有列，这里会直接跳过。
+ */
+function migrate(db: DB): void {
+  ensureColumn(db, 'assets', 'note', 'TEXT')
+}
+
+function tableColumns(db: DB, table: string): string[] {
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((r) => r.name)
+}
+
+function ensureColumn(db: DB, table: string, column: string, decl: string): void {
+  if (tableColumns(db, table).includes(column)) return
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`)
 }

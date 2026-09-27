@@ -349,14 +349,17 @@ export const useAssetStore = defineStore('assets', () => {
       return
     }
     const moved = r.data?.moved ?? 0
+    const renamed = r.data?.renamed ?? 0
     const failed = r.data?.failed ?? []
     clearSelection()
     const lib = useLibraryStore()
     const target = lib.folderById.get(folderId)?.name
     await lib.loadMeta()
     await refresh()
+    // 目标文件夹里已有同名文件时会被自动改成 `名字 (1).ext`，得说清楚，否则用户会以为文件被覆盖了
+    const note = renamed ? `（${renamed} 个因重名已自动改名）` : ''
     if (failed.length) notify('error', `${moved} 项已移动，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
-    else notify('info', target ? `已移动 ${moved} 项到「${target}」` : `已移动 ${moved} 项`)
+    else notify('info', `${target ? `已移动 ${moved} 项到「${target}」` : `已移动 ${moved} 项`}${note}`)
   }
 
   /**
@@ -439,6 +442,85 @@ export const useAssetStore = defineStore('assets', () => {
     if (detail.value?.id === id) Object.assign(detail.value, patch)
   }
 
+  /**
+   * 改提示词 / 备注。
+   *
+   * 同样**不能**直接 `Object.assign` 到后端那份 —— 这里传的是 DB 列名 `note`，两边同名，
+   * 但服务层会把纯空白存成 NULL，本地也照着归一化，免得「有内容」和「没内容」判断不一致。
+   */
+  async function saveNote(id: number, note: string): Promise<boolean> {
+    const r = await window.stash.asset.update(id, { note })
+    if (!r.ok) {
+      notify('error', `保存提示词失败：${r.error}`)
+      return false
+    }
+    const normalized = note.trim() ? note : null
+    const it = items.value.find((i) => i.id === id)
+    if (it) it.note = normalized
+    if (detail.value?.id === id) detail.value.note = normalized
+    return true
+  }
+
+  // —— 复制 / 粘贴源文件 ——
+
+  /** 库内相对路径 → 绝对路径（复制源文件时要交给系统剪贴板） */
+  function absPathOf(relPath: string): string {
+    const root = useLibraryStore().info?.path
+    if (!root) return ''
+    return `${root}\\${relPath.replace(/\//g, '\\')}`
+  }
+
+  /**
+   * 复制选中素材的**源文件**到系统剪贴板（Windows 上是 CF_HDROP，
+   * 所以既能去资源管理器 Ctrl+V，也能在本应用内 Ctrl+V 得到副本）。
+   */
+  async function copySelection(ids?: number[]): Promise<void> {
+    const list = (ids ?? selectedIds.value).slice()
+    if (!list.length) return
+    const paths = list
+      .map((id) => items.value.find((i) => i.id === id)?.rel_path)
+      .filter((p): p is string => !!p)
+      .map(absPathOf)
+      .filter(Boolean)
+    if (!paths.length) return void notify('error', '复制失败：找不到源文件路径')
+    const r = await window.stash.clipboard.writeFiles(paths)
+    if (!r.ok) return void notify('error', `复制失败：${r.error}`)
+    notify('info', `已复制 ${paths.length} 个文件，可粘贴到当前文件夹或资源管理器`)
+  }
+
+  /**
+   * 粘贴：读系统剪贴板里的文件列表再交给服务层分流 ——
+   * 库内文件生成**保留评分/喜欢/备注/标签的副本**，库外文件走导入管线。
+   * 导入那部分的进度/完成由 `import:progress|done` 事件驱动（App.vue 统一处理）。
+   */
+  async function pasteInto(folderId: number | null): Promise<void> {
+    const r = await window.stash.clipboard.readFiles()
+    if (!r.ok) return void notify('error', `读取剪贴板失败：${r.error}`)
+    const paths = r.data ?? []
+    if (!paths.length) return void notify('info', '剪贴板里没有可粘贴的文件')
+
+    const p = await window.stash.asset.paste(paths, folderId)
+    if (!p.ok) return void notify('error', `粘贴失败：${p.error}`)
+    const copied = p.data?.copied ?? 0
+    const renamed = p.data?.renamed ?? 0
+    const importing = p.data?.importing ?? 0
+    const failed = p.data?.failed ?? []
+
+    if (copied) {
+      const lib = useLibraryStore()
+      await lib.loadMeta()
+      await refresh()
+    }
+    const parts: string[] = []
+    if (copied) parts.push(`已创建 ${copied} 份副本${renamed ? `（${renamed} 个因重名已自动改名）` : ''}`)
+    if (importing) parts.push(`正在粘贴 ${importing} 个文件…`)
+    if (failed.length) {
+      notify('error', `${parts.join('，') || '粘贴未完成'}；${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
+      return
+    }
+    if (parts.length) notify('info', parts.join('，'))
+  }
+
   return {
     query, items, total, loading,
     selectedId, detail,
@@ -449,7 +531,7 @@ export const useAssetStore = defineStore('assets', () => {
     activeFilterCount, clearFilters,
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
-    patchLocal, bulkRate, bulkFav, bulkMove, bulkDelete, reset,
+    patchLocal, saveNote, copySelection, pasteInto, bulkRate, bulkFav, bulkMove, bulkDelete, reset,
     prunedNote, dropPrunedTagFilter
   }
 })

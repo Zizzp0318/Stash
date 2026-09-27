@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 
 function subscribe(channel: string, cb: (data: unknown) => void): () => void {
@@ -53,11 +53,31 @@ contextBridge.exposeInMainWorld('stash', {
     bulkUpdate: (ids: number[], patch: unknown) => ipcRenderer.invoke('asset:bulk-update', { ids, patch }),
     move: (ids: number[], folderId: number) => ipcRenderer.invoke('asset:move', { ids, folderId }),
     remove: (ids: number[]) => ipcRenderer.invoke('asset:delete', { ids }),
+    /** 重命名文件名（物理文件 + name/rel_path 同步；扩展名不可改） */
+    rename: (id: number, name: string) => ipcRenderer.invoke('asset:rename', { id, name }),
+    /** 库内复制：在目标文件夹生成一份带评分/喜欢/备注/标签的副本 */
+    copy: (ids: number[], folderId?: number | null) => ipcRenderer.invoke('asset:copy', { ids, folderId }),
+    /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线 */
+    paste: (paths: string[], folderId?: number | null) => ipcRenderer.invoke('asset:paste', { paths, folderId }),
     setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds })
   },
+  /** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
+  clipboard: {
+    writeFiles: (paths: string[]) => ipcRenderer.invoke('clipboard:write-files', paths),
+    /** 剪贴板里不是文件时返回空数组 */
+    readFiles: () => ipcRenderer.invoke('clipboard:read-files'),
+    writeText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text)
+  },
+  /**
+   * 拖拽进来的 File 对象 → 磁盘绝对路径。
+   * Electron 32 起已移除 `File.path`，必须走 `webUtils.getPathForFile`，
+   * 且要在 drop 事件里**同步**调用（事件结束后 File 就失效了）。
+   */
+  pathForFile: (file: File) => webUtils.getPathForFile(file),
   tag: {
     list: () => ipcRenderer.invoke('tag:list'),
     create: (args: { name: string; color?: string }) => ipcRenderer.invoke('tag:create', args),
+    rename: (id: number, name: string) => ipcRenderer.invoke('tag:rename', { id, name }),
     remove: (id: number) => ipcRenderer.invoke('tag:delete', { id })
   },
   dialog: {

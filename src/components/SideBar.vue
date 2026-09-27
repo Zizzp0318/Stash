@@ -341,7 +341,7 @@ function openTagMenu(e: MouseEvent, t: TagRow): void {
   e.preventDefault()
   e.stopPropagation()
   const w = 168
-  const h = 92
+  const h = 132
   tagMenu.value = {
     tag: t,
     x: Math.max(6, Math.min(e.clientX, window.innerWidth - w - 6)),
@@ -350,6 +350,79 @@ function openTagMenu(e: MouseEvent, t: TagRow): void {
 }
 function closeTagMenu(): void {
   tagMenu.value = null
+}
+
+// ==================== 标签重命名（内联输入，复用与文件夹相同的草稿序号保护）====================
+const renamingTagId = ref<number | null>(null)
+const tagDraftName = ref('')
+const tagDraftInput = ref<HTMLInputElement | null>(null)
+/** 与 folder 那套 `draftSeq` 同理：blur 提交是异步的，防新编辑被旧回调清掉 */
+let tagDraftSeq = 0
+
+const TAG_ERR: Record<string, string> = {
+  ERR_EMPTY_NAME: '标签名不能为空',
+  ERR_TAG_EXISTS: '已存在同名标签',
+  ERR_TAG_NOT_FOUND: '标签不存在（可能已被删除）'
+}
+function tagErrText(code?: string): string {
+  return TAG_ERR[code ?? ''] ?? String(code ?? '未知错误')
+}
+
+function setTagDraftInput(el: unknown): void {
+  if (el) tagDraftInput.value = el as HTMLInputElement
+}
+
+function startRenameTag(): void {
+  const t = tagMenu.value?.tag
+  closeTagMenu()
+  if (!t) return
+  tagDraftSeq++
+  renamingTagId.value = t.id
+  tagDraftName.value = t.name
+  nextTick(() => {
+    tagDraftInput.value?.focus()
+    tagDraftInput.value?.select() // 预填原名并全选，便于直接覆盖
+  })
+}
+
+function cancelTagRename(): void {
+  tagDraftSeq++
+  renamingTagId.value = null
+  tagDraftName.value = ''
+}
+
+function onTagDraftEnter(e: KeyboardEvent): void {
+  if (e.isComposing) return
+  void commitTagRename()
+}
+
+async function commitTagRename(): Promise<void> {
+  const seq = tagDraftSeq
+  const id = renamingTagId.value
+  if (id == null) return
+  const name = tagDraftName.value.trim()
+  const cur = lib.tags.find((t) => t.id === id)
+  if (!cur) return cancelTagRename()
+  if (!name || name === cur.name) return cancelTagRename()
+
+  try {
+    const r = await window.stash.tag.rename(id, name)
+    if (!r.ok) throw new Error(r.error ?? '重命名失败')
+    if (seq === tagDraftSeq) {
+      tagDraftSeq++
+      renamingTagId.value = null
+      tagDraftName.value = ''
+    }
+    await lib.loadMeta()
+    // 详情面板里挂着这个标签的话，chip 上的名字也要跟着变
+    const openId = assets.selectedId
+    if (openId != null) await assets.loadDetail(openId)
+    assets.notify('info', `标签已重命名为「${name}」`)
+  } catch (e) {
+    // 失败保留输入内容，让用户改完再回车
+    fail(`重命名标签失败：${tagErrText((e as Error).message)}`)
+    nextTick(() => tagDraftInput.value?.focus())
+  }
 }
 
 const pendingTagDelete = ref<TagRow | null>(null)
@@ -392,6 +465,7 @@ async function confirmDeleteTag(): Promise<void> {
 // ==================== 全局按键 / 点击 ====================
 function onKeyDown(e: KeyboardEvent): void {
   if (e.key !== 'Escape') return
+  if (renamingTagId.value != null) return cancelTagRename()
   if (tagMenu.value) return closeTagMenu()
   if (menu.value) return closeMenu()
   if (pendingTagDelete.value) return void (pendingTagDelete.value = null)
@@ -528,7 +602,18 @@ onBeforeUnmount(() => {
           @contextmenu.prevent.stop="openTagMenu($event, t)"
         >
           <span class="tag-dot" :style="{ background: t.color }"></span>
-          {{ t.name }} <span class="n">{{ fmtCount(lib.counts.byTag[String(t.id)] ?? 0) }}</span>
+          <input
+            v-if="renamingTagId === t.id"
+            :ref="setTagDraftInput"
+            v-model="tagDraftName"
+            class="side-rename"
+            spellcheck="false"
+            @click.stop
+            @keydown.enter="onTagDraftEnter"
+            @keydown.esc="cancelTagRename"
+            @blur="commitTagRename"
+          />
+          <template v-else>{{ t.name }} <span class="n">{{ fmtCount(lib.counts.byTag[String(t.id)] ?? 0) }}</span></template>
         </div>
       </div>
     </div>
@@ -604,6 +689,13 @@ onBeforeUnmount(() => {
         @mousedown.stop
       >
         <div class="ctx-head">{{ tagMenu.tag.name }}</div>
+        <button class="ctx-item" data-ctx="rename-tag" @click="startRenameTag">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M8.4 1.9l2.7 2.7-6.6 6.6-3.2.5.5-3.2 6.6-6.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+          </svg>
+          重命名标签
+        </button>
+        <div class="ctx-sep"></div>
         <button class="ctx-item danger" @click="askDeleteTag">
           <svg viewBox="0 0 13 13" fill="none">
             <path d="M2.4 3.6h8.2M5.1 3.6V2.4h2.8v1.2M3.4 3.6l.5 7h5.2l.5-7" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
