@@ -1,0 +1,13 @@
+node_modules/
+out/
+dist/
+*.log
+
+# 库数据（若误在项目内建库，不要把索引和缩略图缓存提交）
+.stash
+.thumbs/
+
+# 调试产物
+debug-shot.png
+shot-*.png
+electron.vite.config.*.mjs

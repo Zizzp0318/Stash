@@ -1,0 +1,28 @@
+{
+  "name": "stash",
+  "version": "0.1.0",
+  "description": "Stash · 素材库 - Windows 本地素材管理软件",
+  "private": true,
+  "main": "out/main/main.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "ffmpeg-static": "^5.3.0",
+    "pinia": "^4.0.3",
+    "sharp": "^0.35.4",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@esbuild/win32-x64": "^0.28.2",
+    "@rollup/rollup-win32-x64-msvc": "^4.63.5",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^44.4.5",
+    "electron-vite": "^2.3.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  }
+}

@@ -1,0 +1,47 @@
+// M0 阶段的静态 mock 数据，M1 接入数据库后移除
+
+export interface MockItem {
+  name: string
+  meta: string
+  art: string
+  ai?: boolean
+  fav?: boolean
+  video?: string
+  tags: string[]
+}
+
+export const thumbs: Record<string, string> = {
+  portrait: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#8a6a4a"/><rect x="120" y="0" width="80" height="170" fill="#a5825c"/><rect x="130" y="18" width="26" height="60" rx="2" fill="#c9a06a"/><circle cx="92" cy="78" r="30" fill="#2b2118"/><path d="M92 108c-26 0-42 20-46 62h92c-4-42-20-62-46-62z" fill="#3a2c1e"/><circle cx="92" cy="78" r="30" fill="#4a3826" opacity="0.35"/><rect width="200" height="170" fill="#e8b04b" opacity="0.08"/></svg>`,
+  street: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#3d4550"/><rect x="0" y="0" width="70" height="170" fill="#2b323b"/><rect x="140" y="0" width="60" height="170" fill="#2b323b"/><rect x="18" y="24" width="14" height="20" fill="#e8c26a"/><rect x="42" y="60" width="14" height="20" fill="#9db4c9"/><rect x="18" y="100" width="14" height="20" fill="#e8c26a"/><rect x="156" y="36" width="14" height="20" fill="#9db4c9"/><rect x="178" y="90" width="14" height="20" fill="#e8c26a"/><rect x="0" y="140" width="200" height="30" fill="#22272e"/><rect x="92" y="96" width="18" height="52" rx="3" fill="#171b20"/><circle cx="92" cy="88" r="9" fill="#171b20"/></svg>`,
+  food: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d9cbb4"/><ellipse cx="100" cy="96" rx="66" ry="40" fill="#f2ece0"/><ellipse cx="100" cy="92" rx="50" ry="28" fill="#c95f3e"/><ellipse cx="88" cy="88" rx="18" ry="10" fill="#e8935c"/><ellipse cx="114" cy="96" rx="14" ry="8" fill="#8a4a2e"/><path d="M60 60c8-10 20-12 28-6" stroke="#7d9464" stroke-width="4" fill="none" stroke-linecap="round"/><rect width="200" height="170" fill="#e8b04b" opacity="0.05"/></svg>`,
+  plant: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#e3e0d5"/><path d="M100 150c0-40-4-70-30-96M100 150c0-36 8-64 26-84M100 150V84" stroke="#5d7a4a" stroke-width="5" fill="none" stroke-linecap="round"/><ellipse cx="70" cy="52" rx="16" ry="9" transform="rotate(-38 70 52)" fill="#6d8f55"/><ellipse cx="128" cy="64" rx="15" ry="8" transform="rotate(30 128 64)" fill="#7da263"/><ellipse cx="100" cy="80" rx="12" ry="7" transform="rotate(-10 100 80)" fill="#5d7a4a"/><rect x="84" y="140" width="32" height="26" rx="4" fill="#b0714a"/></svg>`,
+  night: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#141a26"/><rect x="16" y="30" width="34" height="110" fill="#1d2534"/><rect x="60" y="56" width="30" height="84" fill="#222b3d"/><rect x="100" y="20" width="40" height="120" fill="#1a2230"/><rect x="150" y="48" width="34" height="92" fill="#212a3a"/><rect x="24" y="44" width="7" height="9" fill="#e8c26a"/><rect x="40" y="72" width="7" height="9" fill="#7fa8d9"/><rect x="70" y="70" width="6" height="8" fill="#e8c26a"/><rect x="112" y="34" width="8" height="10" fill="#e8c26a"/><rect x="128" y="64" width="8" height="10" fill="#e8935c"/><rect x="160" y="62" width="7" height="9" fill="#7fa8d9"/><rect x="0" y="140" width="200" height="30" fill="#0d1119"/><rect x="0" y="140" width="200" height="4" fill="#e8c26a" opacity="0.3"/></svg>`,
+  mountain: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d7c9b4"/><path d="M0 118L58 52l40 44 34-30 68 62v42H0z" fill="#7a6a55"/><path d="M0 132l52-40 44 40 40-26 64 40v24H0z" fill="#5d5142"/><circle cx="152" cy="38" r="16" fill="#e8b04b" opacity="0.85"/></svg>`,
+  film: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#c9b8a0"/><rect x="0" y="0" width="200" height="14" fill="#1c1a17"/><rect x="0" y="156" width="200" height="14" fill="#1c1a17"/><g fill="#1c1a17"><rect x="10" y="3" width="8" height="8" rx="1"/><rect x="34" y="3" width="8" height="8" rx="1"/><rect x="58" y="3" width="8" height="8" rx="1"/><rect x="82" y="3" width="8" height="8" rx="1"/><rect x="106" y="3" width="8" height="8" rx="1"/><rect x="130" y="3" width="8" height="8" rx="1"/><rect x="154" y="3" width="8" height="8" rx="1"/><rect x="178" y="3" width="8" height="8" rx="1"/><rect x="10" y="159" width="8" height="8" rx="1"/><rect x="34" y="159" width="8" height="8" rx="1"/><rect x="58" y="159" width="8" height="8" rx="1"/><rect x="82" y="159" width="8" height="8" rx="1"/><rect x="106" y="159" width="8" height="8" rx="1"/><rect x="130" y="159" width="8" height="8" rx="1"/><rect x="154" y="159" width="8" height="8" rx="1"/><rect x="178" y="159" width="8" height="8" rx="1"/></g><circle cx="100" cy="85" r="40" fill="#a08868"/><circle cx="100" cy="85" r="14" fill="#c9b8a0"/><rect width="200" height="170" fill="#e8b04b" opacity="0.07"/></svg>`,
+  abstract: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#2b2e33"/><circle cx="70" cy="66" r="42" fill="#E8B04B"/><rect x="98" y="86" width="72" height="72" rx="8" fill="#7FA8D9"/><rect x="30" y="110" width="52" height="52" rx="8" fill="#3a3e45"/></svg>`,
+  coffee: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#b09478"/><ellipse cx="100" cy="140" rx="80" ry="22" fill="#96795c"/><rect x="62" y="66" width="56" height="70" rx="6" fill="#f2ece0"/><rect x="62" y="66" width="56" height="14" rx="6" fill="#d9cbb4"/><ellipse cx="90" cy="86" rx="16" ry="4" fill="#6b4a2e"/><path d="M128 84c10 2 12 16 2 20" stroke="#f2ece0" stroke-width="6" fill="none"/><rect width="200" height="170" fill="#e8b04b" opacity="0.06"/></svg>`,
+  sea: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#9db4c9"/><rect x="0" y="0" width="200" height="76" fill="#c9d7e2"/><rect x="0" y="76" width="200" height="94" fill="#5d7a94"/><rect x="148" y="40" width="6" height="30" fill="#3a3e45"/><path d="M148 44l16 6-16 6z" fill="#e9ebed"/><rect x="0" y="76" width="200" height="3" fill="#e9ebed" opacity="0.5"/></svg>`,
+  flower: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d9c4c4"/><g fill="#c95f7a"><circle cx="100" cy="66" r="14"/><circle cx="78" cy="80" r="14"/><circle cx="122" cy="80" r="14"/><circle cx="88" cy="102" r="14"/><circle cx="112" cy="102" r="14"/></g><circle cx="100" cy="86" r="11" fill="#e8b04b"/><path d="M100 116v40" stroke="#7d9464" stroke-width="4" stroke-linecap="round"/></svg>`,
+  ui: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#e9ebed"/><rect x="16" y="18" width="168" height="134" rx="8" fill="#ffffff"/><rect x="16" y="18" width="168" height="22" rx="8" fill="#2C2E31"/><circle cx="28" cy="29" r="3.4" fill="#E8B04B"/><circle cx="40" cy="29" r="3.4" fill="#9CA1A8"/><rect x="30" y="54" width="60" height="8" rx="3" fill="#2C2E31"/><rect x="30" y="70" width="90" height="6" rx="3" fill="#c9ccd0"/><rect x="30" y="84" width="74" height="6" rx="3" fill="#c9ccd0"/><rect x="30" y="108" width="50" height="22" rx="6" fill="#E8B04B"/><rect x="88" y="108" width="50" height="22" rx="6" fill="#e9ebed" stroke="#c9ccd0"/></svg>`
+}
+
+export const items: MockItem[] = [
+  { name: 'DSC08241.jpg', meta: '4032 × 3024 · JPEG · 4.2 MB · 今天 09:14', art: 'portrait', ai: true, fav: true, tags: ['人像', '胶片感', '黄昏'] },
+  { name: 'DSC08238.jpg', meta: '4032 × 3024 · JPEG · 3.9 MB · 今天 09:12', art: 'street', ai: true, tags: ['夜景', '城市'] },
+  { name: 'DSC08230.jpg', meta: '4032 × 3024 · JPEG · 4.6 MB · 今天 09:02', art: 'food', ai: true, fav: true, tags: ['食物', '静物'] },
+  { name: 'DSC08226.mov', meta: '3840 × 2160 · MOV · 212 MB · 昨天 18:40', art: 'sea', video: '00:24', tags: ['视频', '海边'] },
+  { name: 'IMG_1120.jpg', meta: '4032 × 3024 · JPEG · 3.1 MB · 昨天 15:22', art: 'plant', ai: true, tags: ['植物', '胶片感'] },
+  { name: 'DSC08190.jpg', meta: '4032 × 3024 · JPEG · 4.0 MB · 昨天 12:08', art: 'night', ai: true, tags: ['夜景', '城市'] },
+  { name: 'DSC08177.jpg', meta: '4032 × 3024 · JPEG · 4.4 MB · 09-25', art: 'mountain', tags: ['风光'] },
+  { name: 'scan_0043.jpg', meta: '2954 × 1968 · JPEG · 2.2 MB · 09-25', art: 'film', ai: true, fav: true, tags: ['胶片', '扫描'] },
+  { name: 'mood_017.png', meta: '2048 × 2048 · PNG · 5.8 MB · 09-24', art: 'abstract', ai: true, tags: ['配色灵感'] },
+  { name: 'DSC08142.jpg', meta: '4032 × 3024 · JPEG · 3.7 MB · 09-24', art: 'coffee', ai: true, tags: ['静物', '食物'] },
+  { name: 'DSC08136.jpg', meta: '4032 × 3024 · JPEG · 4.1 MB · 09-23', art: 'flower', tags: ['植物'] },
+  { name: 'ref_web_02.png', meta: '2880 × 1800 · PNG · 1.9 MB · 09-23', art: 'ui', ai: true, tags: ['排版参考'] }
+]
+
+export const sparkle = `<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 .8l.95 2.85L8.8 4.6l-2.85.95L5 8.4l-.95-2.85L1.2 4.6l2.85-.95L5 .8z"/></svg>`
+
+export const heart = `<svg viewBox="0 0 13 13" fill="currentColor"><path d="M6.5 11.4S1.4 8.4 1.4 4.8c0-1.7 1.3-3 2.9-3 1 0 1.8.6 2.2 1.3.4-.7 1.2-1.3 2.2-1.3 1.6 0 2.9 1.3 2.9 3 0 3.6-5.1 6.6-5.1 6.6z"/></svg>`
+
+export const folderIcon = `<svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>`

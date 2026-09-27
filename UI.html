@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stash · 素材库</title>
+<style>
+  :root {
+    --bg-canvas: #242629;
+    --bg-panel: #2C2E31;
+    --bg-raised: #35383C;
+    --bg-hover: rgba(255,255,255,0.05);
+    --border: #3A3D42;
+    --border-soft: rgba(255,255,255,0.07);
+    --text-1: #E9EBED;
+    --text-2: #9CA1A8;
+    --text-3: #6B7076;
+    --accent: #E8B04B;
+    --accent-soft: rgba(232,176,75,0.13);
+    --accent-border: rgba(232,176,75,0.55);
+    --radius: 8px;
+    --font: "MiSans", "HarmonyOS Sans SC", "Source Han Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--font);
+    background: var(--bg-canvas);
+    color: var(--text-1);
+    font-size: 13px;
+    overflow: hidden;
+    user-select: none;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+
+  /* ============ 顶栏 ============ */
+  .titlebar {
+    position: relative;
+    height: 44px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-soft);
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    gap: 16px;
+    flex-shrink: 0;
+  }
+  .brand { display: flex; align-items: center; gap: 8px; }
+  .brand-mark {
+    width: 20px; height: 20px; border-radius: 6px;
+    background: var(--accent);
+    display: grid; place-items: center;
+  }
+  .brand-mark svg { width: 12px; height: 12px; }
+  .brand-name { font-weight: 600; font-size: 14px; letter-spacing: 0.5px; }
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    padding: 5px 14px;
+    border-radius: 6px;
+    color: var(--text-2);
+    cursor: pointer;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12.5px;
+  }
+  .tab:hover { background: var(--bg-hover); color: var(--text-1); }
+  .tab.active { background: var(--bg-raised); color: var(--text-1); }
+  .tab .count { font-size: 11px; color: var(--text-3); }
+  .tab-add {
+    width: 22px; height: 22px; border-radius: 6px;
+    display: grid; place-items: center;
+    color: var(--text-3); cursor: pointer;
+  }
+  .tab-add:hover { background: var(--bg-hover); color: var(--text-2); }
+  .searchbox {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 300px; height: 28px;
+    background: var(--bg-canvas);
+    border: 1px solid var(--border-soft);
+    border-radius: 7px;
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 10px;
+    color: var(--text-3);
+    cursor: text;
+  }
+  .searchbox:hover { border-color: var(--border); }
+  .searchbox .hint { font-size: 12px; }
+  .searchbox .ai-chip {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--accent);
+    border: 1px solid var(--accent-border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    line-height: 1.4;
+  }
+  .win-controls { display: flex; gap: 16px; align-items: center; color: var(--text-3); padding-left: 6px; margin-left: auto; }
+  .win-controls span { cursor: pointer; font-size: 14px; display: flex; align-items: center; }
+  .win-controls svg { width: 15px; height: 15px; }
+  .win-controls span:hover { color: var(--text-1); }
+
+  /* ============ 主体三栏 ============ */
+  .body { display: flex; flex: 1; min-height: 0; }
+
+  /* ---- 左侧栏 ---- */
+  .sidebar {
+    width: 198px;
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border-soft);
+    padding: 10px 8px 16px;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .side-section { margin-bottom: 14px; }
+  .side-label {
+    font-size: 11px;
+    color: var(--text-3);
+    padding: 0 8px 6px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .side-label .action { cursor: pointer; font-size: 13px; line-height: 1; }
+  .side-label .action:hover { color: var(--text-1); }
+  .side-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    color: var(--text-2);
+    cursor: pointer;
+    font-size: 12.5px;
+  }
+  .side-item:hover { background: var(--bg-hover); color: var(--text-1); }
+  .side-item.active { background: var(--bg-raised); color: var(--text-1); }
+  .side-item.active .n { color: var(--text-1); }
+  .side-item svg { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.75; }
+  .side-item .n {
+    margin-left: auto;
+    font-size: 11px; color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+  }
+  .side-item .indent-1 { margin-left: 6px; }
+  .side-item .indent-2 { margin-left: 24px; }
+  .side-item .spark { color: var(--accent); opacity: 1; }
+  .tag-dot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; }
+
+  /* ---- 中间画廊 ---- */
+  .gallery { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .toolbar {
+    padding: 10px 16px 0;
+    flex-shrink: 0;
+  }
+  .toolbar-head {
+    display: flex; align-items: baseline; gap: 10px;
+    margin-bottom: 10px;
+  }
+  .toolbar-head h1 { font-size: 15px; font-weight: 600; }
+  .toolbar-head .total { font-size: 12px; color: var(--text-3); }
+  .toolbar-head .viewtoggle { margin-left: auto; display: flex; gap: 4px; }
+  .viewtoggle button {
+    width: 24px; height: 24px;
+    background: none; border: none; border-radius: 6px;
+    color: var(--text-3); cursor: pointer;
+    display: grid; place-items: center;
+  }
+  .viewtoggle button:hover { background: var(--bg-hover); color: var(--text-1); }
+  .viewtoggle button.on { background: var(--bg-raised); color: var(--text-1); }
+  .viewtoggle svg { width: 14px; height: 14px; }
+  .chips { display: flex; align-items: center; gap: 6px; padding-bottom: 10px; }
+  .chip {
+    display: flex; align-items: center; gap: 5px;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid var(--border-soft);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-2);
+    font-size: 12px;
+    font-family: var(--font);
+    cursor: pointer;
+  }
+  .chip:hover { background: var(--bg-hover); color: var(--text-1); }
+  .chip.on { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
+  .chip svg { width: 12px; height: 12px; }
+  .chip-sep { width: 1px; height: 14px; background: var(--border); margin: 0 4px; }
+  .chip .sw { width: 10px; height: 10px; border-radius: 3px; }
+  .sort { margin-left: auto; color: var(--text-3); font-size: 12px; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .sort:hover { color: var(--text-1); }
+
+  .grid-wrap { flex: 1; overflow-y: auto; padding: 4px 16px 24px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(172px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    position: relative;
+    border-radius: var(--radius);
+    overflow: hidden;
+    cursor: pointer;
+    background: var(--bg-raised);
+    outline: 1px solid var(--border-soft);
+    outline-offset: -1px;
+    transition: outline-color 0.12s ease;
+  }
+  .card .thumb { aspect-ratio: 4 / 3.4; width: 100%; display: block; }
+  .card .thumb svg { width: 100%; height: 100%; display: block; }
+  .card:hover { outline-color: var(--border); }
+  .card.selected { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .card .hover-veil {
+    position: absolute; inset: 0;
+    background: linear-gradient(to top, rgba(20,22,24,0.88) 0%, rgba(20,22,24,0.35) 38%, transparent 62%);
+    opacity: 0;
+    transition: opacity 0.14s ease;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 10px 11px;
+  }
+  .card:hover .hover-veil { opacity: 1; }
+  .veil-name { font-size: 12px; font-weight: 500; color: #fff; display: flex; align-items: center; gap: 6px; }
+  .veil-meta { font-size: 11px; color: rgba(255,255,255,0.65); margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .veil-tags { display: flex; gap: 4px; margin-top: 6px; }
+  .veil-tag {
+    font-size: 10px;
+    padding: 1.5px 7px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.14);
+    color: rgba(255,255,255,0.85);
+    backdrop-filter: blur(4px);
+  }
+  .card .ai-badge {
+    position: absolute; top: 8px; right: 8px;
+    width: 18px; height: 18px;
+    border-radius: 5px;
+    background: rgba(24,26,28,0.72);
+    border: 1px solid var(--accent-border);
+    display: grid; place-items: center;
+    color: var(--accent);
+  }
+  .card .ai-badge svg { width: 10px; height: 10px; }
+  .card .fav {
+    position: absolute; top: 8px; left: 8px;
+    width: 18px; height: 18px;
+    color: var(--accent);
+    display: grid; place-items: center;
+  }
+  .card .fav svg { width: 13px; height: 13px; }
+  .card .video-len {
+    position: absolute; bottom: 8px; right: 8px;
+    font-size: 10px;
+    color: #fff;
+    background: rgba(24,26,28,0.78);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---- 右侧详情栏 ---- */
+  .detail {
+    width: 238px;
+    background: var(--bg-panel);
+    border-left: 1px solid var(--border-soft);
+    overflow-y: auto;
+    flex-shrink: 0;
+    padding-bottom: 20px;
+  }
+  .detail-preview {
+    aspect-ratio: 4 / 3.6;
+    background: var(--bg-raised);
+    overflow: hidden;
+  }
+  .detail-preview svg { width: 100%; height: 100%; display: block; }
+  .detail-body { padding: 14px 16px 0; }
+  .d-name { font-size: 13.5px; font-weight: 500; display: flex; align-items: center; gap: 7px; }
+  .d-name svg { width: 13px; height: 13px; color: var(--accent); flex-shrink: 0; }
+  .d-meta {
+    font-size: 11.5px; color: var(--text-3);
+    margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .d-section { padding: 12px 0 4px; }
+  .d-label { font-size: 11px; color: var(--text-3); margin-bottom: 8px; }
+  .tag-chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .tag-chip {
+    font-size: 11px;
+    padding: 2.5px 9px;
+    border-radius: 5px;
+    background: var(--bg-raised);
+    color: var(--text-2);
+    cursor: pointer;
+  }
+  .tag-chip:hover { color: var(--text-1); background: var(--bg-hover); border: 0; }
+  .tag-chip.ai { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); }
+  .rate-row {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-top: 16px;
+  }
+  .stars { display: flex; gap: 3px; color: var(--accent); }
+  .stars svg { width: 13px; height: 13px; }
+  .stars .star-off { color: var(--text-3); }
+  .heart-btn {
+    background: none; border: none; padding: 2px;
+    color: var(--text-3); cursor: pointer;
+    display: grid; place-items: center;
+  }
+  .heart-btn svg { width: 15px; height: 15px; }
+  .heart-btn:hover { color: var(--accent); }
+  .palette { display: flex; height: 22px; border-radius: 6px; overflow: hidden; }
+  .palette div { flex: 1; cursor: pointer; transition: flex 0.15s ease; }
+  .palette div:hover { flex: 1.6; }
+  .ai-note {
+    background: var(--accent-soft);
+    border: 1px solid rgba(232,176,75,0.28);
+    border-radius: var(--radius);
+    padding: 9px 11px;
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: #D9CBA8;
+  }
+  .ai-note-head {
+    display: flex; align-items: center; gap: 5px;
+    color: var(--accent);
+    font-size: 10.5px;
+    margin-bottom: 4px;
+  }
+  .ai-note-head svg { width: 10px; height: 10px; }
+  .kv { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 12px; }
+  .kv .k { color: var(--text-3); }
+  .kv .v { color: var(--text-2); font-variant-numeric: tabular-nums; }
+  .kv .v.link { color: var(--text-2); text-decoration: none; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  .kv .v.path { font-size: 11px; text-align: right; word-break: break-all; line-height: 1.4; max-width: 130px; }
+  .kv .v.link:hover { color: var(--text-1); }
+  .d-actions { display: flex; gap: 6px; padding-top: 14px; }
+  .d-btn {
+    flex: 1;
+    height: 28px;
+    border-radius: 7px;
+    border: 1px solid var(--border-soft);
+    background: transparent;
+    color: var(--text-2);
+    font-size: 12px;
+    font-family: var(--font);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center; gap: 5px;
+  }
+  .d-btn:hover { background: var(--bg-hover); color: var(--text-1); }
+  .d-btn svg { width: 12px; height: 12px; }
+
+  /* 滚动条 */
+  ::-webkit-scrollbar { width: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.09); border-radius: 5px; border: 3px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); background-clip: content-box; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- 顶栏 -->
+  <header class="titlebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="2.2" fill="#242629"/><path d="M6 0.5v2.4M6 9.1v2.4M0.5 6h2.4M9.1 6h2.4" stroke="#242629" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </div>
+      <span class="brand-name">Stash</span>
+    </div>
+    <nav class="tabs">
+      <div class="tab active">拍摄素材 <span class="count">6</span></div>
+    </nav>
+    <div class="searchbox">
+      <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="5.2" cy="5.2" r="3.7" stroke="currentColor" stroke-width="1.3"/><path d="M8.2 8.2L11 11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      <span class="hint">用一句话搜索素材，如「黄昏的胶片人像」</span>
+    </div>
+    <div class="win-controls">
+      <span title="收起侧栏"><svg width="11" height="11" viewBox="0 0 12 12" fill="none"><rect x="1" y="1.8" width="10" height="8.4" rx="1.6" stroke="currentColor" stroke-width="1.1"/><path d="M4.2 1.8v8.4" stroke="currentColor" stroke-width="1.1"/><path d="M8.4 4.8L7 6l1.4 1.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span>─</span><span>□</span><span>✕</span>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <!-- ============ 左侧栏 ============ -->
+    <aside class="sidebar">
+      <div class="side-section">
+        <div class="side-item">
+          <svg viewBox="0 0 14 14" fill="none"><rect x="1.4" y="1.4" width="11.2" height="11.2" rx="2.4" stroke="currentColor" stroke-width="1.2"/><path d="M1.4 5h11.2" stroke="currentColor" stroke-width="1.2"/></svg>
+          所有素材 <span class="n">1 284</span>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <div class="side-label">文件夹 <span class="action">＋</span></div>
+        <div class="side-item">
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          2026 拍摄 <span class="n">612</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-1"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          人像写真 <span class="n">248</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          胶片人像 <span class="n">132</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          室内棚拍 <span class="n">116</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-1"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          风光Citywalk <span class="n">190</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          城市夜景 <span class="n">98</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          海边湖畔 <span class="n">92</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-1"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          静物食物 <span class="n">174</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          咖啡饮品 <span class="n">88</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          手作静物 <span class="n">86</span>
+        </div>
+        <div class="side-item">
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          参考收集 <span class="n">407</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-1"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          配色灵感 <span class="n">163</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          暖调色板 <span class="n">82</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          冷调色板 <span class="n">81</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-1"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          排版参考 <span class="n">244</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          杂志版式 <span class="n">132</span>
+        </div>
+        <div class="side-item">
+          <span class="indent-2"></span>
+          <svg viewBox="0 0 14 14" fill="none"><path d="M1.6 4c0-.8.6-1.4 1.4-1.4h2.4l1.2 1.5h4.4c.8 0 1.4.6 1.4 1.4v5c0 .8-.6 1.4-1.4 1.4H3c-.8 0-1.4-.6-1.4-1.4V4z" stroke="currentColor" stroke-width="1.2"/></svg>
+          海报字体 <span class="n">112</span>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <div class="side-label">标签 <span class="action">＋</span></div>
+        <div class="side-item">
+          <span class="tag-dot" style="background:#E8B04B"></span> 胶片感 <span class="n">203</span>
+        </div>
+        <div class="side-item">
+          <span class="tag-dot" style="background:#7FA8D9"></span> 夜景 <span class="n">96</span>
+        </div>
+        <div class="side-item">
+          <span class="tag-dot" style="background:#9CB97F"></span> 植物 <span class="n">64</span>
+        </div>
+        <div class="side-item">
+          <span class="tag-dot" style="background:#D98F7F"></span> 食物 <span class="n">88</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ============ 中间画廊 ============ -->
+    <main class="gallery">
+      <div class="toolbar">
+        <div class="toolbar-head">
+          <h1>所有素材</h1>
+          <span class="total">1 284 个文件</span>
+          <div class="viewtoggle">
+            <button class="on" title="网格视图"><svg viewBox="0 0 14 14" fill="none"><rect x="1.5" y="1.5" width="4.6" height="4.6" rx="1.2" fill="currentColor"/><rect x="7.9" y="1.5" width="4.6" height="4.6" rx="1.2" fill="currentColor"/><rect x="1.5" y="7.9" width="4.6" height="4.6" rx="1.2" fill="currentColor"/><rect x="7.9" y="7.9" width="4.6" height="4.6" rx="1.2" fill="currentColor"/></svg></button>
+            <button title="列表视图"><svg viewBox="0 0 14 14" fill="none"><path d="M2 3.5h10M2 7h10M2 10.5h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg></button>
+          </div>
+        </div>
+        <div class="chips">
+          <button class="chip">
+            <svg viewBox="0 0 12 12" fill="none"><path d="M6 1.4l1.4 2.9 3.2.5-2.3 2.2.5 3.2L6 8.7l-2.8 1.5.5-3.2L1.4 4.8l3.2-.5L6 1.4z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>
+            评分
+          </button>
+          <button class="chip">
+            <svg viewBox="0 0 12 12" fill="none"><path d="M6 10.2S1.4 7.5 1.4 4.3c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2 1.2.3-.6 1-1.2 2-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.2-4.6 5.9-4.6 5.9z" stroke="currentColor" stroke-width="1.1"/></svg>
+            喜欢
+          </button>
+          <button class="chip">
+            <svg viewBox="0 0 12 12" fill="none"><path d="M2 2.8h8M3.8 6h4.4M5.4 9.2h1.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+            排序
+          </button>
+        </div>
+      </div>
+
+      <div class="grid-wrap">
+        <div class="grid" id="grid"></div>
+      </div>
+    </main>
+
+    <!-- ============ 右侧详情栏 ============ -->
+    <aside class="detail">
+      <div class="detail-preview" id="d-preview"></div>
+      <div class="detail-body">
+        <div class="d-name">
+          <svg viewBox="0 0 13 13" fill="currentColor"><path d="M6.5 1l1.2 3.6 3.6 1.2-3.6 1.2L6.5 10.6 5.3 7 1.7 5.8l3.6-1.2L6.5 1z"/></svg>
+          <span id="d-name">DSC08241.jpg</span>
+        </div>
+        <div class="d-meta" id="d-meta">4032 × 3024 · JPEG · 4.2 MB · 今天 09:14</div>
+
+        <div class="d-section">
+          <div class="d-label">标签</div>
+          <div class="tag-chips">
+            <span class="tag-chip">人像</span>
+            <span class="tag-chip ai">✦ 胶片感</span>
+            <span class="tag-chip ai">✦ 黄昏</span>
+            <span class="tag-chip">＋</span>
+          </div>
+          <div class="rate-row">
+            <div class="stars">
+              <svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z"/></svg>
+              <svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z"/></svg>
+              <svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z"/></svg>
+              <svg viewBox="0 0 12 12" fill="currentColor"><path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z"/></svg>
+              <svg class="star-off" viewBox="0 0 12 12" fill="none"><path d="M6 1.2l1.45 2.95 3.25.5-2.35 2.3.55 3.25L6 8.7 3.1 10.2l.55-3.25L1.3 4.65l3.25-.5L6 1.2z" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/></svg>
+            </div>
+            <button class="heart-btn" title="喜欢">
+              <svg viewBox="0 0 13 13" fill="none"><path d="M6.5 10.8S1.8 8.2 1.8 4.9c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2.1 1.2.4-.6 1.1-1.2 2.1-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.3-4.7 5.9-4.7 5.9z" stroke="currentColor" stroke-width="1.1"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="d-section">
+          <div class="d-label">色板</div>
+          <div class="palette">
+            <div style="background:#2B2118"></div>
+            <div style="background:#6B4A2E"></div>
+            <div style="background:#C68B4E"></div>
+            <div style="background:#E5C893"></div>
+            <div style="background:#8FA3B0"></div>
+          </div>
+        </div>
+
+        <div class="d-section">
+          <div class="ai-note">
+            <div class="ai-note-head">
+              <svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 .8l.95 2.85L8.8 4.6l-2.85.95L5 8.4l-.95-2.85L1.2 4.6l2.85-.95L5 .8z"/></svg>
+              提示词（备注）
+            </div>
+            黄昏窗边的人像，暖调逆光，胶片颗粒质感，85mm f/1.8，背景虚化自然，轮廓光柔和。
+          </div>
+        </div>
+
+        <div class="d-section">
+          <div class="d-label">基本信息</div>
+          <div class="kv"><span class="k">格式</span><span class="v">JPEG</span></div>
+          <div class="kv"><span class="k">大小</span><span class="v">4.2 MB</span></div>
+          <div class="kv"><span class="k">尺寸</span><span class="v">4032 × 3024</span></div>
+          <div class="kv"><span class="k">来源</span><span class="v">SONY α7C II</span></div>
+          <div class="kv"><span class="k">导入时间</span><span class="v">今天 09:14</span></div>
+        </div>
+
+        <div class="d-section">
+          <div class="kv"><span class="k">存储位置</span><span class="v path">D:\Photos\2026\人像写真</span></div>
+        </div>
+      </div>
+    </aside>
+
+  </div>
+</div>
+
+<script>
+  // —— 缩略图：内联 SVG 模拟照片内容 ——
+  const thumbs = {
+    portrait: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#8a6a4a"/><rect x="120" y="0" width="80" height="170" fill="#a5825c"/><rect x="130" y="18" width="26" height="60" rx="2" fill="#c9a06a"/><circle cx="92" cy="78" r="30" fill="#2b2118"/><path d="M92 108c-26 0-42 20-46 62h92c-4-42-20-62-46-62z" fill="#3a2c1e"/><circle cx="92" cy="78" r="30" fill="#4a3826" opacity="0.35"/><rect width="200" height="170" fill="#e8b04b" opacity="0.08"/></svg>`,
+    street: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#3d4550"/><rect x="0" y="0" width="70" height="170" fill="#2b323b"/><rect x="140" y="0" width="60" height="170" fill="#2b323b"/><rect x="18" y="24" width="14" height="20" fill="#e8c26a"/><rect x="42" y="60" width="14" height="20" fill="#9db4c9"/><rect x="18" y="100" width="14" height="20" fill="#e8c26a"/><rect x="156" y="36" width="14" height="20" fill="#9db4c9"/><rect x="178" y="90" width="14" height="20" fill="#e8c26a"/><rect x="0" y="140" width="200" height="30" fill="#22272e"/><rect x="92" y="96" width="18" height="52" rx="3" fill="#171b20"/><circle cx="92" cy="88" r="9" fill="#171b20"/></svg>`,
+    food: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d9cbb4"/><ellipse cx="100" cy="96" rx="66" ry="40" fill="#f2ece0"/><ellipse cx="100" cy="92" rx="50" ry="28" fill="#c95f3e"/><ellipse cx="88" cy="88" rx="18" ry="10" fill="#e8935c"/><ellipse cx="114" cy="96" rx="14" ry="8" fill="#8a4a2e"/><path d="M60 60c8-10 20-12 28-6" stroke="#7d9464" stroke-width="4" fill="none" stroke-linecap="round"/><rect width="200" height="170" fill="#e8b04b" opacity="0.05"/></svg>`,
+    plant: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#e3e0d5"/><path d="M100 150c0-40-4-70-30-96M100 150c0-36 8-64 26-84M100 150V84" stroke="#5d7a4a" stroke-width="5" fill="none" stroke-linecap="round"/><ellipse cx="70" cy="52" rx="16" ry="9" transform="rotate(-38 70 52)" fill="#6d8f55"/><ellipse cx="128" cy="64" rx="15" ry="8" transform="rotate(30 128 64)" fill="#7da263"/><ellipse cx="100" cy="80" rx="12" ry="7" transform="rotate(-10 100 80)" fill="#5d7a4a"/><rect x="84" y="140" width="32" height="26" rx="4" fill="#b0714a"/></svg>`,
+    night: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#141a26"/><rect x="16" y="30" width="34" height="110" fill="#1d2534"/><rect x="60" y="56" width="30" height="84" fill="#222b3d"/><rect x="100" y="20" width="40" height="120" fill="#1a2230"/><rect x="150" y="48" width="34" height="92" fill="#212a3a"/><rect x="24" y="44" width="7" height="9" fill="#e8c26a"/><rect x="40" y="72" width="7" height="9" fill="#7fa8d9"/><rect x="70" y="70" width="6" height="8" fill="#e8c26a"/><rect x="112" y="34" width="8" height="10" fill="#e8c26a"/><rect x="128" y="64" width="8" height="10" fill="#e8935c"/><rect x="160" y="62" width="7" height="9" fill="#7fa8d9"/><rect x="0" y="140" width="200" height="30" fill="#0d1119"/><rect x="0" y="140" width="200" height="4" fill="#e8c26a" opacity="0.3"/></svg>`,
+    mountain: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d7c9b4"/><path d="M0 118L58 52l40 44 34-30 68 62v42H0z" fill="#7a6a55"/><path d="M0 132l52-40 44 40 40-26 64 40v24H0z" fill="#5d5142"/><circle cx="152" cy="38" r="16" fill="#e8b04b" opacity="0.85"/></svg>`,
+    film: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#c9b8a0"/><rect x="0" y="0" width="200" height="14" fill="#1c1a17"/><rect x="0" y="156" width="200" height="14" fill="#1c1a17"/><g fill="#1c1a17"><rect x="10" y="3" width="8" height="8" rx="1"/><rect x="34" y="3" width="8" height="8" rx="1"/><rect x="58" y="3" width="8" height="8" rx="1"/><rect x="82" y="3" width="8" height="8" rx="1"/><rect x="106" y="3" width="8" height="8" rx="1"/><rect x="130" y="3" width="8" height="8" rx="1"/><rect x="154" y="3" width="8" height="8" rx="1"/><rect x="178" y="3" width="8" height="8" rx="1"/><rect x="10" y="159" width="8" height="8" rx="1"/><rect x="34" y="159" width="8" height="8" rx="1"/><rect x="58" y="159" width="8" height="8" rx="1"/><rect x="82" y="159" width="8" height="8" rx="1"/><rect x="106" y="159" width="8" height="8" rx="1"/><rect x="130" y="159" width="8" height="8" rx="1"/><rect x="154" y="159" width="8" height="8" rx="1"/><rect x="178" y="159" width="8" height="8" rx="1"/></g><circle cx="100" cy="85" r="40" fill="#a08868"/><circle cx="100" cy="85" r="14" fill="#c9b8a0"/><rect width="200" height="170" fill="#e8b04b" opacity="0.07"/></svg>`,
+    abstract: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#2b2e33"/><circle cx="70" cy="66" r="42" fill="#E8B04B"/><rect x="98" y="86" width="72" height="72" rx="8" fill="#7FA8D9"/><rect x="30" y="110" width="52" height="52" rx="8" fill="#3a3e45"/></svg>`,
+    coffee: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#b09478"/><ellipse cx="100" cy="140" rx="80" ry="22" fill="#96795c"/><rect x="62" y="66" width="56" height="70" rx="6" fill="#f2ece0"/><rect x="62" y="66" width="56" height="14" rx="6" fill="#d9cbb4"/><ellipse cx="90" cy="86" rx="16" ry="4" fill="#6b4a2e"/><path d="M128 84c10 2 12 16 2 20" stroke="#f2ece0" stroke-width="6" fill="none"/><rect width="200" height="170" fill="#e8b04b" opacity="0.06"/></svg>`,
+    sea: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#9db4c9"/><rect x="0" y="0" width="200" height="76" fill="#c9d7e2"/><rect x="0" y="76" width="200" height="94" fill="#5d7a94"/><rect x="148" y="40" width="6" height="30" fill="#3a3e45"/><path d="M148 44l16 6-16 6z" fill="#e9ebed"/><rect x="0" y="76" width="200" height="3" fill="#e9ebed" opacity="0.5"/></svg>`,
+    flower: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#d9c4c4"/><g fill="#c95f7a"><circle cx="100" cy="66" r="14"/><circle cx="78" cy="80" r="14"/><circle cx="122" cy="80" r="14"/><circle cx="88" cy="102" r="14"/><circle cx="112" cy="102" r="14"/></g><circle cx="100" cy="86" r="11" fill="#e8b04b"/><path d="M100 116v40" stroke="#7d9464" stroke-width="4" stroke-linecap="round"/></svg>`,
+    ui: `<svg viewBox="0 0 200 170" preserveAspectRatio="xMidYMid slice"><rect width="200" height="170" fill="#e9ebed"/><rect x="16" y="18" width="168" height="134" rx="8" fill="#ffffff"/><rect x="16" y="18" width="168" height="22" rx="8" fill="#2C2E31"/><circle cx="28" cy="29" r="3.4" fill="#E8B04B"/><circle cx="40" cy="29" r="3.4" fill="#9CA1A8"/><rect x="30" y="54" width="60" height="8" rx="3" fill="#2C2E31"/><rect x="30" y="70" width="90" height="6" rx="3" fill="#c9ccd0"/><rect x="30" y="84" width="74" height="6" rx="3" fill="#c9ccd0"/><rect x="30" y="108" width="50" height="22" rx="6" fill="#E8B04B"/><rect x="88" y="108" width="50" height="22" rx="6" fill="#e9ebed" stroke="#c9ccd0"/></svg>`,
+  };
+
+  // —— 素材数据 ——
+  const items = [
+    { name: "DSC08241.jpg", meta: "4032 × 3024 · JPEG · 4.2 MB · 今天 09:14", art: "portrait", ai: true, fav: true, tags: ["人像", "胶片感", "黄昏"] },
+    { name: "DSC08238.jpg", meta: "4032 × 3024 · JPEG · 3.9 MB · 今天 09:12", art: "street", ai: true, tags: ["夜景", "城市"] },
+    { name: "DSC08230.jpg", meta: "4032 × 3024 · JPEG · 4.6 MB · 今天 09:02", art: "food", ai: true, fav: true, tags: ["食物", "静物"] },
+    { name: "DSC08226.mov", meta: "3840 × 2160 · MOV · 212 MB · 昨天 18:40", art: "sea", ai: false, video: "00:24", tags: ["视频", "海边"] },
+    { name: "IMG_1120.jpg", meta: "4032 × 3024 · JPEG · 3.1 MB · 昨天 15:22", art: "plant", ai: true, tags: ["植物", "胶片感"] },
+    { name: "DSC08190.jpg", meta: "4032 × 3024 · JPEG · 4.0 MB · 昨天 12:08", art: "night", ai: true, tags: ["夜景", "城市"] },
+    { name: "DSC08177.jpg", meta: "4032 × 3024 · JPEG · 4.4 MB · 09-25", art: "mountain", ai: false, tags: ["风光"] },
+    { name: "scan_0043.jpg", meta: "2954 × 1968 · JPEG · 2.2 MB · 09-25", art: "film", ai: true, fav: true, tags: ["胶片", "扫描"] },
+    { name: "mood_017.png", meta: "2048 × 2048 · PNG · 5.8 MB · 09-24", art: "abstract", ai: true, tags: ["配色灵感"] },
+    { name: "DSC08142.jpg", meta: "4032 × 3024 · JPEG · 3.7 MB · 09-24", art: "coffee", ai: true, tags: ["静物", "食物"] },
+    { name: "DSC08136.jpg", meta: "4032 × 3024 · JPEG · 4.1 MB · 09-23", art: "flower", ai: false, tags: ["植物"] },
+    { name: "ref_web_02.png", meta: "2880 × 1800 · PNG · 1.9 MB · 09-23", art: "ui", ai: true, tags: ["排版参考"] },
+  ];
+
+  const grid = document.getElementById("grid");
+  const sparkle = `<svg viewBox="0 0 10 10" fill="currentColor"><path d="M5 .8l.95 2.85L8.8 4.6l-2.85.95L5 8.4l-.95-2.85L1.2 4.6l2.85-.95L5 .8z"/></svg>`;
+  const heart = `<svg viewBox="0 0 13 13" fill="currentColor"><path d="M6.5 11.4S1.4 8.4 1.4 4.8c0-1.7 1.3-3 2.9-3 1 0 1.8.6 2.2 1.3.4-.7 1.2-1.3 2.2-1.3 1.6 0 2.9 1.3 2.9 3 0 3.6-5.1 6.6-5.1 6.6z"/></svg>`;
+
+  items.forEach((it, i) => {
+    const card = document.createElement("div");
+    card.className = "card" + (i === 0 ? " selected" : "");
+    card.innerHTML = `
+      <div class="thumb">${thumbs[it.art]}</div>
+      ${it.fav ? `<span class="fav">${heart}</span>` : ""}
+      ${it.ai ? `<span class="ai-badge" title="AI 已整理">${sparkle}</span>` : ""}
+      ${it.video ? `<span class="video-len">${it.video}</span>` : ""}
+      <div class="hover-veil">
+        <div class="veil-name">${it.name}</div>
+        <div class="veil-meta">${it.meta.split(" · ")[0]} · ${it.meta.split(" · ")[1]}</div>
+        <div class="veil-tags">${it.tags.slice(0, 3).map(t => `<span class="veil-tag">${t}</span>`).join("")}</div>
+      </div>`;
+    card.addEventListener("click", () => {
+      document.querySelectorAll(".card.selected").forEach(c => c.classList.remove("selected"));
+      card.classList.add("selected");
+      document.getElementById("d-name").textContent = it.name;
+      document.getElementById("d-meta").textContent = it.meta;
+      document.getElementById("d-preview").innerHTML = thumbs[it.art];
+    });
+    grid.appendChild(card);
+  });
+</script>
+</body>
+</html>

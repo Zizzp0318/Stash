@@ -1,0 +1,66 @@
+// 数据库连接管理 + schema 初始化
+// 驱动：node:sqlite（Electron ≥36 内置，无需 native 编译）
+import type { DatabaseSync } from 'node:sqlite'
+
+export type DB = DatabaseSync
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE TABLE IF NOT EXISTS folders (
+  id INTEGER PRIMARY KEY,
+  parent_id INTEGER,
+  path TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS assets (
+  id INTEGER PRIMARY KEY,
+  folder_id INTEGER NOT NULL REFERENCES folders(id),
+  name TEXT NOT NULL,
+  rel_path TEXT UNIQUE NOT NULL,
+  source_path TEXT,
+  type TEXT NOT NULL,
+  ext TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  width INTEGER, height INTEGER,
+  duration_ms INTEGER,
+  content_hash TEXT,
+  rating INTEGER DEFAULT 0,
+  is_fav INTEGER DEFAULT 0,
+  palette TEXT,
+  exif TEXT,
+  file_mtime INTEGER NOT NULL,
+  imported_at INTEGER NOT NULL,
+  missing INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_assets_type   ON assets(type);
+CREATE INDEX IF NOT EXISTS idx_assets_rating ON assets(rating);
+CREATE INDEX IF NOT EXISTS idx_assets_folder ON assets(folder_id);
+CREATE INDEX IF NOT EXISTS idx_assets_name   ON assets(name);
+CREATE INDEX IF NOT EXISTS idx_assets_hash   ON assets(content_hash);
+
+CREATE TABLE IF NOT EXISTS tags (
+  id INTEGER PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  color TEXT NOT NULL DEFAULT '#7FA8D9'
+);
+
+CREATE TABLE IF NOT EXISTS asset_tags (
+  asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
+  PRIMARY KEY (asset_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_tags_tag ON asset_tags(tag_id);
+`
+
+export function openDatabase(stashFile: string): DB {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { DatabaseSync } = require('node:sqlite')
+  const db = new DatabaseSync(stashFile) as DB
+  db.exec('PRAGMA journal_mode = WAL')
+  db.exec('PRAGMA foreign_keys = ON')
+  db.exec(SCHEMA)
+  return db
+}

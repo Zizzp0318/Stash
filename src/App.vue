@@ -1,0 +1,83 @@
+<script setup lang="ts">
+import { onMounted } from 'vue'
+import TitleBar from './components/TitleBar.vue'
+import SideBar from './components/SideBar.vue'
+import GalleryGrid from './components/GalleryGrid.vue'
+import DetailPanel from './components/DetailPanel.vue'
+import Welcome from './components/Welcome.vue'
+import { useLibraryStore } from './stores/library'
+import { useAssetStore } from './stores/assets'
+
+const lib = useLibraryStore()
+const assets = useAssetStore()
+
+let noticeTimer: ReturnType<typeof setTimeout> | null = null
+function setNotice(n: { kind: 'error' | 'info'; text: string }): void {
+  assets.importNotice = n
+  if (noticeTimer) clearTimeout(noticeTimer)
+  noticeTimer = setTimeout(() => (assets.importNotice = null), n.kind === 'error' ? 10000 : 5000)
+}
+
+onMounted(async () => {
+  await lib.bootstrap()
+  if (lib.info) {
+    await assets.refresh()
+    // 打开已有库：回填缺失缩略图（已存在的会跳过，只生成缺的）
+    window.stash.thumb.backfill('grid')
+  }
+
+  // 缩略图批量生成完成 → bump 版本号，让所有 <img> 重新加载
+  window.stash.thumb.onDone(() => assets.bumpThumbs())
+
+  // 导入进度事件（全局一份）
+  window.stash.import.onProgress((d) => {
+    assets.importing = { done: d.done, total: d.total }
+  })
+  window.stash.import.onDone(async (r) => {
+    assets.importing = null
+    await lib.loadMeta()
+    await lib.refreshCounts()
+    await assets.refresh()
+    // 导入后为新素材排队生成缩略图
+    window.stash.thumb.backfill('grid')
+    if (r.failed.length) {
+      const first = r.failed[0]
+      const name = first.path.split(/[\\/]/).pop()
+      setNotice({
+        kind: 'error',
+        text: `${r.failed.length} 个文件导入失败（首个：${name}：${first.error}）`
+      })
+    } else if (r.added === 0 && r.skipped === 0) {
+      setNotice({ kind: 'info', text: '没有可导入的文件（格式不支持或无有效文件）' })
+    } else {
+      setNotice({ kind: 'info', text: `导入完成：新增 ${r.added} 个${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}` })
+    }
+  })
+})
+</script>
+
+<template>
+  <Welcome v-if="!lib.info" />
+  <div v-else class="app">
+    <TitleBar />
+    <div class="body">
+      <SideBar />
+      <GalleryGrid />
+      <DetailPanel />
+    </div>
+    <!-- 导入进度浮层 -->
+    <div v-if="assets.importing" class="import-overlay">
+      <div class="import-box">
+        <div class="import-title">正在导入素材…</div>
+        <div class="import-bar">
+          <div class="import-fill" :style="{ width: (assets.importing.total ? (assets.importing.done / assets.importing.total) * 100 : 0) + '%' }"></div>
+        </div>
+        <div class="import-meta">{{ assets.importing.done }} / {{ assets.importing.total }}</div>
+      </div>
+    </div>
+    <!-- 导入结果提示 -->
+    <div v-if="assets.importNotice" class="notice-toast" :class="assets.importNotice.kind" @click="assets.importNotice = null">
+      {{ assets.importNotice.text }}
+    </div>
+  </div>
+</template>
