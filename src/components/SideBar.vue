@@ -25,8 +25,9 @@ function hiddenByCollapse(path: string): boolean {
 }
 
 /**
- * count 用 `directCount`（直属素材），口径与点进去的列表一致：后端 folderId 筛选不递归，
- * 用子树数会让「对照 7」点进去只看到 0 张。删除确认框仍走 subtreeCount（那里删的是整棵树）。
+ * count 用 `subtreeCount`（含子文件夹），与点进去列表里实际会看到的卡片数一致：
+ * 后端 `folderDeep` 会按 folders.path 前缀把整棵子树的 `folder_id` 一起匹配。
+ * 用直属数会让父文件夹显示 0、点进去却有一屏卡片（数字与列表对不上）。
  */
 const folderRows = computed(() =>
   lib.folders
@@ -36,13 +37,25 @@ const folderRows = computed(() =>
     .map((f) => ({
       ...f,
       indent: f.path.split('/').length - 1,
-      count: lib.directCount(f),
+      count: lib.subtreeCount(f),
+      /** 只算本层：仅在悬停提示里用来解释「数字里有多少是子文件夹贡献的」 */
+      own: lib.counts.byFolder[String(f.id)] ?? 0,
       hasChildren: parentPaths.value.has(f.path),
       folded: lib.isCollapsed(f.path)
     }))
 )
 
 const noFilter = computed(() => assets.query.folderId == null && assets.query.tagId == null)
+
+/**
+ * 文件夹计数的悬停解释。
+ *
+ * 数字含子文件夹，所以父文件夹的数字常常大于「本层肉眼能数到的张数」——
+ * 不说清楚就会被当成数错了。本层就是全部时不啰嗦（绝大多数叶子文件夹走这一支）。
+ */
+function folderCountTitle(f: { count: number; own: number }): string {
+  return f.count > f.own ? `含子文件夹（本层 ${f.own} 张）` : '本文件夹内的素材'
+}
 
 async function pickFolder(f: FolderRow): Promise<void> {
   assets.query.folderId = f.id
@@ -467,7 +480,7 @@ onBeforeUnmount(() => {
               @keydown.esc="cancelDraft"
               @blur="commitDraft"
             />
-            <template v-else>{{ f.name }} <span class="n" title="仅本文件夹内的素材，不含子文件夹">{{ fmtCount(f.count) }}</span></template>
+            <template v-else>{{ f.name }} <span class="n" :title="folderCountTitle(f)">{{ fmtCount(f.count) }}</span></template>
           </div>
           <div
             v-if="creatingIn === f.id"

@@ -27,13 +27,16 @@ const title = computed(() => {
 /**
  * 当前范围（文件夹/标签）内的素材总数，**不含**工具栏筛选 —— 用作「N / 共 M」的分母。
  *
- * 刻意与列表查询保持同一语义：后端 `folderId != null` 只匹配 `a.folder_id = ?`（直接子项，不递归），
- * 所以这里用 `byFolder` 直接计数而不是 `subtreeCount`（后者含子文件夹子树）。
- * 用 subtreeCount 会让分母比不带筛选时列表里实际能看到的还多，数字对不上。
- * 侧栏文件夹的计数走同一条口径（`lib.directCount`），三处保持一致。
+ * 必须与列表查询同一语义：点文件夹时后端走 `folderDeep`（整棵子树的 `folder_id`），
+ * 所以这里用 `subtreeCount` 而不是 `byFolder`。用直属数会让分母比列表里实际
+ * 能看到的还小（出现「12 / 共 3」这种读不通的比值）。
+ * 侧栏文件夹计数走同一个函数，删除确认弹窗也是。
  */
 const scopeTotal = computed(() => {
-  if (assets.query.folderId != null) return lib.counts.byFolder[String(assets.query.folderId)] ?? 0
+  if (assets.query.folderId != null) {
+    const f = lib.folderById.get(assets.query.folderId)
+    return f ? lib.subtreeCount(f) : 0
+  }
   if (assets.query.tagId != null) return lib.counts.byTag[String(assets.query.tagId)] ?? 0
   return lib.counts.total
 })

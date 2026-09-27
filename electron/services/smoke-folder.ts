@@ -562,9 +562,9 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
     await capture('shot-folder-done.png')
 
-    // ==================== K. 侧栏计数口径：只算直接子项 ====================
-    // 素材全在「对照」的子目录里，所以「对照」直属 0、子树 3 —— 两种口径必然不同，
-    // 能真正区分改没改（只断言「显示 == 直属」在两边都是 0 时是恒真的假绿）。
+    // ==================== K. 侧栏计数与列表口径：都含整棵子树 ====================
+    // 素材全在「对照」的子目录里，所以「对照」直属 0、子树 >0 —— 两种口径必然不同，
+    // 只断言「侧栏 == 某个数」在两边都是 0 时是恒真的假绿，必须同时验证两种口径不相等。
     step('K')
     await sleep(700)
 
@@ -581,7 +581,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
 
     const kFolders = folderRows()
     const kIdToPath = new Map(kFolders.map((f) => [f.id, f.path]))
-    /** 后端直属计数：path → count（与后端 folderId 筛选同源；无素材的文件夹补 0） */
+    /** 后端直属计数：path → count（与 `folder_id = ?` 筛选同源；无素材的文件夹补 0） */
     const directByPath = (): Record<string, number> => {
       const rows = D()
         .prepare('SELECT folder_id, count(*) AS c FROM assets WHERE folder_id IS NOT NULL GROUP BY folder_id')
@@ -597,20 +597,94 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       return out
     }
     const kDirect = directByPath()
-    /** 子树总数（旧口径）：自身 + 所有前缀子目录 */
+    /** 期望值（新口径）：自身 + 所有路径前缀子目录 —— 与后端 `folderDeep` 一致 */
     const subtreeOf = (p: string): number => {
       let n = kDirect[p] ?? 0
       for (const f of kFolders) if (f.path.startsWith(p + '/')) n += kDirect[f.path] ?? 0
       return n
     }
+    const kSubtree: Record<string, number> = {}
+    for (const f of kFolders) kSubtree[f.path] = subtreeOf(f.path)
 
     R.k_ui = await sidebarCounts()
-    R.k_backend = kDirect
+    R.k_backend = kSubtree
+    R.k_directOnly = kDirect
     R.k_mismatch = Object.entries(R.k_ui as Record<string, number>)
-      .filter(([p, n]) => (kDirect[p] ?? 0) !== n)
-      .map(([p, n]) => `${p}: 侧栏${n} != 直属${kDirect[p] ?? 0}`)
+      .filter(([p, n]) => (kSubtree[p] ?? 0) !== n)
+      .map(([p, n]) => `${p}: 侧栏${n} != 子树${kSubtree[p] ?? 0}`)
     R.k_treeDiff = { direct: kDirect['对照'] ?? 0, subtree: subtreeOf('对照') }
-    step(`K direct=${JSON.stringify(R.k_backend)} ui=${JSON.stringify(R.k_ui)} mismatch=${JSON.stringify(R.k_mismatch)}`)
+    step(`K direct=${JSON.stringify(kDirect)} subtree=${JSON.stringify(kSubtree)} ui=${JSON.stringify(R.k_ui)} mismatch=${JSON.stringify(R.k_mismatch)}`)
+
+    // ==================== K2. 点文件夹 → 列表含整棵子树的素材 ====================
+    const cardIds = async (): Promise<number[]> =>
+      ((await js(`[...document.querySelectorAll('.masonry-card')].map(c => Number(c.dataset.id)).sort((a, b) => a - b)`)) as
+        | number[]
+        | null) ?? []
+    /** DB 里落在某目录（含其子孙目录）下的素材 id —— 与后端按 rel_path 前缀取子树的判定同源 */
+    const dbIdsUnder = (p: string): number[] =>
+      (D().prepare('SELECT id, rel_path FROM assets ORDER BY id').all() as Array<{ id: number; rel_path: string }>)
+        .filter((a) => a.rel_path === p || a.rel_path.startsWith(p + '/'))
+        .map((a) => a.id)
+        .sort((a, b) => a - b)
+    /** 目录（含子孙）+ 文件名包含关键词的素材数 —— 用来核对「X / 共 Y 个匹配」的分子 */
+    const dbMatchesUnder = (p: string, kw: string): number =>
+      (D().prepare('SELECT name, rel_path FROM assets').all() as Array<{ name: string; rel_path: string }>)
+        .filter((a) => (a.rel_path === p || a.rel_path.startsWith(p + '/')) && a.name.includes(kw)).length
+    /** 把「12 个文件」/「3 / 共 12 个匹配」解析成数字 */
+    const parseTotal = (raw: string | null): { shown: number[] } => ({
+      shown: [...String(raw ?? '').matchAll(/(\d+)/g)].map((m) => Number(m[1]))
+    })
+
+    const clickRow = async (path: string): Promise<boolean> => {
+      const r = await rowAt(path)
+      if (!r) return false
+      await clickAt({ x: r.cx, y: r.cy })
+      await sleep(900)
+      return true
+    }
+
+    // ① 点父文件夹「对照」：列表里要出现子目录里的素材（递归），数量与侧栏数字一致
+    const kParentClicked = await clickRow('对照')
+    R.k2_parent = {
+      clicked: kParentClicked,
+      active: await activeKey(),
+      cards: await cardIds(),
+      expect: dbIdsUnder('对照'),
+      // 侧栏数字要从 **DOM** 采（不是拿测试端的计算值），否则「数字 == 卡片数」会变成自证
+      sidebarUi: (await sidebarCounts())['对照'] ?? -1,
+      direct: kDirect['对照'] ?? 0,
+      treeTotal: kSubtree['对照'] ?? -1,
+      total: parseTotal(await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)),
+      totalText: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)
+    }
+    await capture('shot-folder-recursive.png')
+
+    // ② 叠一个关键词筛选：分母必须是**子树**数（旧口径会显示「X / 共 0」）
+    await js(`(() => { const i = document.querySelector('.search-input'); if (i) { i.focus(); i.select() } })()`)
+    await sleep(150)
+    win.webContents.insertText('png')
+    await sleep(900)
+    R.k2_filter = {
+      totalText: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
+      parsed: parseTotal(await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)),
+      numerator: dbMatchesUnder('对照', 'png'),
+      denominator: kSubtree['对照'] ?? 0
+    }
+    await js(`(() => { const c = document.querySelector('.search-clear'); if (c) c.click() })()`)
+    await sleep(800)
+
+    // ③ 再点一个**叶子**子文件夹：递归不能退化成一味显示全部
+    const kLeafPath = '对照/目标'
+    const kLeafClicked = await clickRow(kLeafPath)
+    R.k2_leaf = {
+      clicked: kLeafClicked,
+      active: await activeKey(),
+      cards: await cardIds(),
+      expect: dbIdsUnder(kLeafPath),
+      parentExpect: dbIdsUnder('对照')
+    }
+    await capture('shot-folder-leaf.png')
+    step(`K2 parent=${JSON.stringify(R.k2_parent)} filter=${JSON.stringify(R.k2_filter)} leaf=${JSON.stringify(R.k2_leaf)}`)
 
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
@@ -649,6 +723,17 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const j3m = (R.j3_midway ?? {}) as { marquee?: boolean; ghost?: boolean }
     const j3 = R.j3_ctrlStillBand as { relUnchanged?: boolean; stillOnDisk?: boolean } | undefined
     const j4 = R.j4_batch as { movedCount?: number; allInTarget?: boolean } | undefined
+    const k2p = (R.k2_parent ?? {}) as {
+      clicked?: boolean; active?: string | null; cards?: number[]; expect?: number[]
+      sidebarUi?: number; direct?: number; treeTotal?: number
+      total?: { shown: number[] }; totalText?: string | null
+    }
+    const k2f = (R.k2_filter ?? {}) as {
+      totalText?: string | null; parsed?: { shown: number[] }; numerator?: number; denominator?: number
+    }
+    const k2l = (R.k2_leaf ?? {}) as {
+      clicked?: boolean; active?: string | null; cards?: number[]; expect?: number[]; parentExpect?: number[]
+    }
 
     R.checks = {
       // A 多级新建
@@ -726,13 +811,40 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // J4 拖动已多选中的一张 → 整批一起走
       dragBatch: j4?.allInTarget === true && (j4?.movedCount ?? 0) >= 1,
 
-      // K 侧栏文件夹计数 = 后端直属计数（与列表同口径），逐行比对无一例外
-      sidebarCountIsDirect: (R.k_mismatch as string[]).length === 0 &&
+      // K 侧栏文件夹计数 = 后端子树计数（与列表同口径），逐行比对无一例外
+      sidebarCountIsSubtree: (R.k_mismatch as string[]).length === 0 &&
         (R.k_ui as Record<string, number>)['对照'] === ((R.k_backend as Record<string, number>)['对照'] ?? 0),
-      // 且必须与旧口径（含子树）不同 —— 否则「显示==直属」在全 0 时是恒真的假绿，测不出回归
-      sidebarCountNotSubtree: (R.k_treeDiff as { direct: number; subtree: number }).subtree >
+      // 且必须与旧口径（只算直属）不同 —— 否则「显示==子树」在两者相等时测不出回归
+      sidebarCountDiffersFromDirect: (R.k_treeDiff as { direct: number; subtree: number }).subtree >
         (R.k_treeDiff as { direct: number; subtree: number }).direct &&
-        (R.k_ui as Record<string, number>)['对照'] === (R.k_treeDiff as { direct: number; subtree: number }).direct
+        (R.k_ui as Record<string, number>)['对照'] === (R.k_treeDiff as { direct: number; subtree: number }).subtree &&
+        (R.k_ui as Record<string, number>)['对照'] !== (R.k_directOnly as Record<string, number>)['对照'],
+      // K2 点父文件夹：列表含子目录里的素材，且卡片数 == 侧栏数字 == DB 子树集合
+      folderClickShowsSubtree: k2p?.clicked === true && k2p?.active === '对照' &&
+        (k2p?.cards ?? []).join('|') === (k2p?.expect ?? []).join('|') &&
+        (k2p?.expect?.length ?? 0) > (k2p?.direct ?? 0),
+      // 侧栏数字（DOM）与列表里实际渲染的卡片数一致（数字不再虚高/虚低）。
+      // 左边必须取自 DOM：若拿测试端算出来的子树数去比，就成了拿同一份 DB 自证。
+      folderCountMatchesCards: (k2p?.sidebarUi ?? -1) === (k2p?.cards?.length ?? -2) &&
+        (k2p?.sidebarUi ?? -1) === (k2p?.treeTotal ?? -3) &&
+        (k2p?.cards?.length ?? 0) > 0,
+      // 不带筛选时工具栏总数也走同一条口径：「N 个文件」的 N == 卡片数（按数字比，不用 includes 防串位）
+      folderTotalTextMatches: (k2p?.total?.shown?.length ?? 0) === 1 &&
+        k2p?.total?.shown?.[0] === k2p?.expect?.length,
+      // K2 叠关键词后「X / 共 Y 个匹配」的格式与分子分母都要对：
+      // 关键是 Y 必须是**子树**数 —— 旧口径（只看直属）这里会渲染成「3 / 共 0」。
+      // 注意别断言 X < Y：本用例里素材全是 .png，关键词 png 命中全部，分子分母相等是正常的。
+      scopeDenominatorIsSubtree: (k2f?.parsed?.shown?.length ?? 0) === 2 &&
+        k2f?.parsed?.shown?.[0] === k2f?.numerator &&
+        k2f?.parsed?.shown?.[1] === k2f?.denominator &&
+        (k2f?.numerator ?? 0) > 0 &&
+        (k2f?.denominator ?? 0) === (k2p?.treeTotal ?? -1) &&
+        (k2f?.denominator ?? 0) > (k2p?.direct ?? 0),
+      // K2 点叶子文件夹：只剩它自己的素材，递归不能退化成一味显示全部
+      leafFolderStaysDirect: k2l?.clicked === true && k2l?.active === '对照/目标' &&
+        (k2l?.cards ?? []).join('|') === (k2l?.expect ?? []).join('|') &&
+        (k2l?.expect?.length ?? 0) > 0 &&
+        (k2l?.parentExpect?.length ?? 0) > (k2l?.expect?.length ?? 0)
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

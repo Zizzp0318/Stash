@@ -100,19 +100,13 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   /**
-   * 文件夹直接子项素材数（不含子文件夹里的），**侧栏列表用它**。
+   * 文件夹素材数 = **自身 + 整棵子树**（子文件夹里的也算）。
    *
-   * 必须与列表语义一致：后端 `folderId != null` 只匹配 `a.folder_id = ?`（不递归），
-   * 点进去看到几张卡片，侧栏就应显示几。用子树数会让数字比列表里实际能看到的还大。
-   */
-  function directCount(f: FolderRow): number {
-    return counts.value.byFolder[String(f.id)] ?? 0
-  }
-
-  /**
-   * 文件夹子树素材数：自身 + 所有路径前缀子目录之和。
-   * 只用于「删除文件夹」的确认弹窗 —— 那里删的是整棵子树，必须报真实会被删掉的总数，
-   * 与列表/侧栏的显示口径刻意不同。
+   * 与列表语义严格一致：点文件夹时后端走 `folderDeep`（`folder_id IN 子树`），
+   * 所以「侧栏显示 12」点进去就该看到 12 张卡片。三个地方共用这一个口径：
+   * 侧栏文件夹行、画廊「N / 共 M」的分母、删除确认弹窗。
+   *
+   * 别改回「只算直属」：那样父文件夹会显示 0，点进去却有一屏卡片（本项目踩过）。
    */
   function subtreeCount(f: FolderRow): number {
     let n = counts.value.byFolder[String(f.id)] ?? 0
@@ -239,6 +233,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, directCount, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

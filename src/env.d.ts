@@ -95,6 +95,11 @@ export interface StashPrunedTag {
 export interface StashAssetApi {
   list: (q?: {
     folderId?: number | null
+    /**
+     * 点文件夹时是否把子文件夹的素材一起取出来（递归）。
+     * 侧栏一律传 `true`：数字口径、列表内容、「N / 共 M」分母三处必须一致。
+     */
+    folderDeep?: boolean
     tagId?: number | null
     /** null = 不限类型（与 folderId / tagId 同样用 null 表示「不筛选」） */
     type?: string | null

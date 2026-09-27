@@ -166,9 +166,18 @@ export const useAssetStore = defineStore('assets', () => {
     detail.value = null
   }
 
+  /**
+   * 点文件夹时递归取子文件夹的素材。
+   *
+   * 只有真的选了文件夹才加这个键 —— 没选文件夹时后端压根不看它，
+   * 但传出去会让「同一次浏览的查询对象长什么样」变得不一致（调试时容易被误导）。
+   * 刻意写成普通函数而不是 `computed`：store setup 内部拿到的是 ref，`...ref` 展开是空的。
+   */
+  const deepOpt = (): { folderDeep?: boolean } => (query.folderId != null ? { folderDeep: true } : {})
+
   async function refresh(): Promise<void> {
     loading.value = true
-    const r = await window.stash.asset.list({ ...query, offset: 0, limit: PAGE })
+    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: 0, limit: PAGE })
     loading.value = false
     if (r.data) {
       items.value = r.data.items
@@ -187,7 +196,7 @@ export const useAssetStore = defineStore('assets', () => {
   async function loadMore(): Promise<void> {
     if (loading.value || items.value.length >= total.value) return
     loading.value = true
-    const r = await window.stash.asset.list({ ...query, offset: items.value.length, limit: PAGE })
+    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: items.value.length, limit: PAGE })
     loading.value = false
     if (r.data) {
       const seen = new Set(items.value.map((i) => i.id))

@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, unlinkSync } from 'fs'
 import { extname, join } from 'path'
 import { requireCurrent, pruneUnlinkedTags } from './library'
+import type { DB } from './db'
 
 /** 拼接库内相对路径（统一用 / 分隔） */
 function toRel(...segs: string[]): string {
@@ -9,6 +10,14 @@ function toRel(...segs: string[]): string {
 
 export interface AssetQuery {
   folderId?: number | null
+  /**
+   * 连同整棵子树一起匹配（只在 `folderId` 非空时有意义）。
+   *
+   * 默认 `false` = 只匹配该文件夹的**直属**素材，保留给需要精确口径的调用方；
+   * 侧栏点文件夹走 `true` —— 素材管理场景里「点进一个分类要看全部内容」才是直觉，
+   * 子文件夹是分组手段而不是隔离手段。
+   */
+  folderDeep?: boolean
   tagId?: number | null
   type?: string
   rating?: number
@@ -35,13 +44,38 @@ function escapeLike(s: string): string {
   return s.replace(/[\\%_]/g, (c) => `\\${c}`)
 }
 
+/**
+ * 某文件夹及其整棵子树的文件夹 id（含自身）。
+ *
+ * 用内存里的 path 前缀比较，不用 SQL `LIKE` —— 文件夹名里含 `_` / `%` 时 LIKE 会误匹配
+ * （`报告_2024` 会连上 `报告X2024`）。与 `library.subtreeRows` 同一套判断，别各写一份。
+ * 找得到根就用子树；根不在 folders 表里（理论不该发生）退化成「只看自身」，
+ * 至少不会因为一个悬空 id 把整张表的素材都捞出来。
+ */
+function subtreeIds(db: DB, rootId: number): number[] {
+  const all = db.prepare('SELECT id, path FROM folders').all() as Array<{ id: number; path: string }>
+  const root = all.find((f) => f.id === rootId)
+  if (!root) return [rootId]
+  const prefix = root.path + '/'
+  return all.filter((f) => f.path === root.path || f.path.startsWith(prefix)).map((f) => f.id)
+}
+
 export function listAssets(q: AssetQuery): { total: number; items: unknown[] } {
   const { db } = requireCurrent()
 
   const where: string[] = []
   const params: Array<string | number> = []
 
-  if (q.folderId != null) { where.push('a.folder_id = ?'); params.push(q.folderId) }
+  if (q.folderId != null) {
+    if (q.folderDeep) {
+      const ids = subtreeIds(db, q.folderId)
+      where.push(`a.folder_id IN (${ids.map(() => '?').join(',')})`)
+      params.push(...ids)
+    } else {
+      where.push('a.folder_id = ?')
+      params.push(q.folderId)
+    }
+  }
   if (q.tagId != null) { where.push('a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id = ?)'); params.push(q.tagId) }
   if (q.type) { where.push('a.type = ?'); params.push(q.type) }
   if (q.rating != null && q.rating > 0) { where.push('a.rating >= ?'); params.push(q.rating) }
