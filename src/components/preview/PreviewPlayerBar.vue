@@ -154,7 +154,9 @@ function fmt(sec: number): string {
 </script>
 
 <template>
-  <div class="pp-bar" :class="{ compact }" data-pp-bar>
+  <!-- @click.stop：控制条浮在画面里（视频那条是绝对定位在舞台上的），
+       不拦住冒泡的话，点播放键/进度条会顺带触发外层的「点画面播放/暂停」。 -->
+  <div class="pp-bar" :class="{ compact }" data-pp-bar @click.stop>
     <button class="pp-btn" data-pp-play type="button" :title="playing ? '暂停' : '播放'" @click="togglePlay">
       <svg v-if="!playing" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M8 5.4v13.2L19 12z" />

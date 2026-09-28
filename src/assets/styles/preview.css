@@ -206,6 +206,8 @@
   background: #000;
   border-radius: var(--radius);
   overflow: hidden;
+  /* 点画面任意处即可播放/暂停，给个可点的光标提示 */
+  cursor: pointer;
 }
 .pv-video-el {
   width: 100%;
@@ -234,6 +236,8 @@
   justify-content: center;
   gap: 14px;
   padding: 0 24px;
+  /* 同上：点空白处即可播放/暂停 */
+  cursor: pointer;
 }
 .pv-audio-glyph { color: var(--text-3); }
 .pv-audio-glyph svg { width: 40px; height: 40px; display: block; }

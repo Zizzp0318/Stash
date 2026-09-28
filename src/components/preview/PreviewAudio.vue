@@ -28,6 +28,14 @@ function onError(): void {
   if ((audioEl.value?.error?.code ?? null) === 4) unsupported.value = true
 }
 
+/** 点空白区域 = 播放 / 暂停（控制条自己 `@click.stop`，不会误触发） */
+function togglePlay(): void {
+  const el = audioEl.value
+  if (!el) return
+  if (el.paused || el.ended) void el.play().catch(() => { /* 自动播放被拦等，忽略 */ })
+  else el.pause()
+}
+
 async function openExternal(): Promise<void> {
   const r = await window.stash.shell.open(props.asset.id)
   if (!r.ok) assets.notify('error', `打开失败：${r.error}`)
@@ -58,7 +66,7 @@ async function openExternal(): Promise<void> {
       <button class="pv-btn" data-pv-open-external type="button" @click="openExternal">用系统播放器打开</button>
     </div>
 
-    <div v-else class="pv-audio-body">
+    <div v-else class="pv-audio-body" data-pv-audio-body @click="togglePlay">
       <div class="pv-audio-glyph" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
           <path d="M9 18V6l10-2v12" />

@@ -35,6 +35,17 @@ function onError(): void {
   if ((videoEl.value?.error?.code ?? null) === 4) unsupported.value = true
 }
 
+/**
+ * 点画面任意处 = 播放 / 暂停（用户要求：不必非得点播放键）。
+ * 控制条自己会 `@click.stop`，所以点播放键/进度条不会顺带触发这里。
+ */
+function togglePlay(): void {
+  const el = videoEl.value
+  if (!el) return
+  if (el.paused || el.ended) void el.play().catch(() => { /* 自动播放被拦等，忽略 */ })
+  else el.pause()
+}
+
 async function openExternal(): Promise<void> {
   const r = await window.stash.shell.open(props.asset.id)
   if (!r.ok) assets.notify('error', `打开失败：${r.error}`)
@@ -66,7 +77,7 @@ async function openExternal(): Promise<void> {
       <button class="pv-btn" data-pv-open-external type="button" @click="openExternal">用系统播放器打开</button>
     </div>
 
-    <div v-else ref="stageEl" class="pv-video-stage" data-pv-video-stage>
+    <div v-else ref="stageEl" class="pv-video-stage" data-pv-video-stage @click="togglePlay">
       <video
         ref="videoEl"
         class="pv-video-el"

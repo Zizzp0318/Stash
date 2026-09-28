@@ -798,6 +798,48 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
     }
 
+    // ---- U 点画面即可播放/暂停（控制条不该误触发）----
+    {
+      interface ClickToggle {
+        ok: boolean
+        afterClick: boolean
+        afterSecond: boolean
+        afterBarClick: boolean
+      }
+      const r = await js<ClickToggle>(
+        '(async () => {' +
+        ' const empty = { ok: false, afterClick: false, afterSecond: false, afterBarClick: false };' +
+        ' const card = document.querySelector(\'.card[data-id="' + mp4Id + '"]\');' +
+        ' if (!card) return empty;' +
+        ' card.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));' +
+        ' const t0 = Date.now(); let media = null;' +
+        ' while (Date.now() - t0 < 15000) {' +
+        '   media = document.querySelector(".pv-video [data-pv-video]");' +
+        '   if (media && media.readyState >= 1) break;' +
+        '   await new Promise((r) => setTimeout(r, 120));' +
+        ' }' +
+        ' if (!media) return empty;' +
+        ' media.currentTime = 0;' +
+        ' const stage = document.querySelector("[data-pv-video-stage]");' +
+        ' const bar = document.querySelector(".pv-video [data-pp-bar]");' +
+        ' const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));' +
+        ' click(stage);' +                                    // 点画面 → 播放
+        ' await new Promise((r) => setTimeout(r, 400));' +
+        ' const afterClick = !media.paused;' +
+        ' click(stage);' +                                    // 再点 → 暂停
+        ' await new Promise((r) => setTimeout(r, 300));' +
+        ' const afterSecond = !media.paused;' +
+        ' click(bar);' +                                      // 点控制条 → 不该改变播放状态（此刻应仍暂停）
+        ' await new Promise((r) => setTimeout(r, 300));' +
+        ' const afterBarClick = !media.paused;' +
+        ' window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));' +
+        ' return { ok: true, afterClick, afterSecond, afterBarClick };' +
+        '})()')
+      check('U 点画面可播放', r.ok && r.afterClick === true, JSON.stringify(r))
+      check('U 再点画面可暂停', r.ok && r.afterSecond === false, JSON.stringify(r))
+      check('U 点控制条不会误触发播放/暂停', r.ok && r.afterBarClick === false, JSON.stringify(r))
+    }
+
     const errsAfterPlay = await js<string[]>('window.__pvErrors || []')
     check('U 播放期间渲染层无运行期错误', errsAfterPlay.length === 0,
       errsAfterPlay.length ? errsAfterPlay.join(' | ').slice(0, 300) : undefined)
