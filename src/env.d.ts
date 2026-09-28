@@ -26,6 +26,8 @@ export interface StashLibraryApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ path: string; name: string }>; error?: string }>
   close: () => Promise<{ ok: boolean; data?: null; error?: string }>
   getInfo: () => Promise<{ ok: boolean; data?: { path: string; name: string } | null; error?: string }>
+  /** 在资源管理器里打开库目录 */
+  reveal: () => Promise<{ ok: boolean; data?: { opened: boolean; error: string | null }; error?: string }>
 }
 
 export interface StashFolderApi {
@@ -263,6 +265,14 @@ export interface StashPreviewSettings {
   autoPlay: boolean
 }
 
+/** 导入偏好 */
+export interface StashImportSettings {
+  /** move 会把原文件从原位置搬走（源目录里就没有了） */
+  mode: 'copy' | 'move'
+  dedupe: boolean
+  palette: boolean
+}
+
 /** 全局偏好（存在 userData/config.json，跨库一份） */
 export interface StashSettings {
   defaultView: 'masonry' | 'list'
@@ -271,13 +281,17 @@ export interface StashSettings {
   detailCollapsed: boolean
   thumbs: StashThumbSettings
   preview: StashPreviewSettings
+  importing: StashImportSettings
 }
 
 /** 深可选补丁：Partial<StashSettings> 只让顶层可选，嵌套对象得单独放开 */
-export type StashSettingsPatch = Partial<Omit<StashSettings, 'cardFields' | 'thumbs' | 'preview'>> & {
+export type StashSettingsPatch = Partial<
+  Omit<StashSettings, 'cardFields' | 'thumbs' | 'preview' | 'importing'>
+> & {
   cardFields?: Partial<StashCardFields>
   thumbs?: Partial<StashThumbSettings>
   preview?: Partial<StashPreviewSettings>
+  importing?: Partial<StashImportSettings>
 }
 
 export interface StashSettingsChoices {
@@ -317,6 +331,35 @@ export interface StashCacheStats {
   other: StashCacheBucket
 }
 
+export interface StashLibraryStats {
+  name: string
+  path: string
+  assets: number
+  missingFlagged: number
+  bytes: number
+}
+
+export interface StashScanResult {
+  checked: number
+  missing: number
+  samples: string[]
+  flagFixed: number
+}
+
+export interface StashCleanMissingResult {
+  removed: number
+  freed: number
+  pruned: Array<{ id: number; name: string }>
+}
+
+export interface StashHealthApi {
+  stats: () => Promise<{ ok: boolean; data?: StashLibraryStats; error?: string }>
+  /** 逐个核对磁盘（慢，用户显式点才跑） */
+  scan: () => Promise<{ ok: boolean; data?: StashScanResult; error?: string }>
+  /** 清理失效索引行（只动索引与缓存，不碰磁盘上的用户文件） */
+  clean: () => Promise<{ ok: boolean; data?: StashCleanMissingResult; error?: string }>
+}
+
 export interface StashCacheApi {
   stats: () => Promise<{ ok: boolean; data?: StashCacheStats; error?: string }>
   /** kind=thumbs 只清缩略图（可秒级重建）；derived 清派生预览（下次打开要重新转码） */
@@ -345,6 +388,7 @@ export interface StashApi {
   dialog: StashDialogApi
   settings: StashSettingsApi
   cache: StashCacheApi
+  health: StashHealthApi
   app: StashAppApi
 }
 

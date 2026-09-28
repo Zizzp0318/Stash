@@ -11,21 +11,50 @@
 // 不吃掉的话关设置会顺带把网格的选中一起清了。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../stores/assets'
+import { useLibraryStore } from '../stores/library'
 import { useSettingsStore } from '../stores/settings'
-import { fmtSize } from '../utils/format'
-import type { StashAppInfo, StashCacheStats, StashSettingsChoices } from '../env'
+import { fmtCount, fmtSize } from '../utils/format'
+import type {
+  StashAppInfo,
+  StashCacheStats,
+  StashLibraryStats,
+  StashScanResult,
+  StashSettingsChoices
+} from '../env'
 
 const settings = useSettingsStore()
 const assets = useAssetStore()
+const lib = useLibraryStore()
 
-type GroupKey = 'appearance' | 'preview' | 'cache' | 'about'
+type GroupKey = 'appearance' | 'preview' | 'importing' | 'cache' | 'library' | 'shortcuts' | 'about'
 const GROUPS: Array<{ key: GroupKey; label: string }> = [
   { key: 'appearance', label: '外观与浏览' },
   { key: 'preview', label: '预览与播放' },
+  { key: 'importing', label: '导入' },
   { key: 'cache', label: '缩略图与缓存' },
+  { key: 'library', label: '库与存储' },
+  { key: 'shortcuts', label: '快捷键' },
   { key: 'about', label: '关于' }
 ]
 const active = ref<GroupKey>('appearance')
+
+/**
+ * 快捷键清单。**必须是真实存在的键位** —— 这张表是给用户看的说明书，
+ * 写进去一个不存在的键等于骗人。改键位时这里要一起改。
+ * 自定义键位还没做，所以这一组是**只读**的（不做「假设置」）。
+ */
+const SHORTCUTS: Array<{ keys: string; what: string; where: string }> = [
+  { keys: '双击卡片', what: '打开中栏浮层预览', where: '网格' },
+  { keys: 'Esc', what: '关闭浮层 / 取消多选 / 关掉当前小面板', where: '全局' },
+  { keys: '← / →', what: '上一张 / 下一张', where: '浮层预览' },
+  { keys: 'Ctrl/⌘ + C', what: '复制选中素材的文件（可直接粘到资源管理器）', where: '网格' },
+  { keys: 'Ctrl/⌘ + V', what: '粘贴到当前文件夹（库内生成副本，库外的走导入）', where: '网格' },
+  { keys: 'Ctrl + Enter', what: '保存提示词修改', where: '详情栏' },
+  { keys: 'Enter / Esc', what: '确认 / 取消重命名', where: '重命名输入框' },
+  { keys: '滚轮', what: '缩放图片', where: '图片预览' },
+  { keys: '拖拽', what: '平移图片（放大之后才生效）', where: '图片预览' },
+  { keys: '双击图片', what: '在「适配画面 / 1:1」之间切换', where: '图片预览' }
+]
 
 const info = ref<StashAppInfo | null>(null)
 const stats = ref<StashCacheStats | null>(null)
@@ -36,6 +65,14 @@ const busy = ref(false)
 const arm = ref<'thumbs' | 'derived' | null>(null)
 /** 重置的二次确认：点一下变「再点一次确认」，避免误触 */
 const resetArmed = ref(false)
+
+/** 库与存储：快照（纯查库）、体检结果（跑一次才有）、各自的二次确认 */
+const libStats = ref<StashLibraryStats | null>(null)
+const scan = ref<StashScanResult | null>(null)
+const scanning = ref(false)
+const libBusy = ref(false)
+const cleanArmed = ref(false)
+const deleteLibArmed = ref(false)
 
 const s = computed(() => settings.settings)
 const densityLabel = computed(() => (s.value.viewZoom <= 165 ? '紧凑' : s.value.viewZoom <= 225 ? '适中' : '放大'))
@@ -48,11 +85,23 @@ async function loadStats(): Promise<void> {
   const r = await window.stash.cache.stats()
   if (r.ok && r.data) stats.value = r.data
 }
+async function loadLibStats(): Promise<void> {
+  const r = await window.stash.health.stats()
+  if (r.ok && r.data) libStats.value = r.data
+}
 /** 切分组：顺手把这一组要的数据拉一下（缓存占用是会变的，别停在打开面板那一刻的旧数字） */
 function pickGroup(k: GroupKey): void {
   active.value = k
   arm.value = null
+  // 离开分组就把二次确认收掉：举着「再点一次确认」的状态换到别处再回来，
+  // 会让人以为自己已经点过一次了
+  cleanArmed.value = false
+  deleteLibArmed.value = false
   if (k === 'cache') void loadStats()
+  if (k === 'library') {
+    void loadLibStats()
+    scan.value = null // 上次的体检结果只对上次那一刻负责，进来就让它作废
+  }
   // 「预览与播放」和「缩略图与缓存」的档位都来自主进程（校验与 UI 同源），一次拉好共用
   if ((k === 'cache' || k === 'preview') && !choices.value) {
     void window.stash.settings.choices().then((r) => {
@@ -136,6 +185,87 @@ async function doClear(kind: 'thumbs' | 'derived'): Promise<void> {
     assets.notify('info', `已清理 ${removed} 个派生预览（${freed}），下次打开会重新转码`)
   }
   await loadStats()
+}
+
+function pickImportMode(m: 'copy' | 'move'): void {
+  void settings.patch({ importing: { mode: m } })
+}
+function toggleDedupe(): void {
+  void settings.patch({ importing: { dedupe: !s.value.importing.dedupe } })
+}
+function togglePalette(): void {
+  void settings.patch({ importing: { palette: !s.value.importing.palette } })
+}
+
+/** 体检：逐个核对磁盘。**只在用户点的时候跑** —— 大库是几千次 statSync，不该在开面板时自动跑 */
+async function runScan(): Promise<void> {
+  scanning.value = true
+  const r = await window.stash.health.scan()
+  scanning.value = false
+  if (!r.ok || !r.data) {
+    assets.notify('error', `体检失败：${r.error ?? '未知原因'}`)
+    return
+  }
+  scan.value = r.data
+  await loadLibStats() // 体检会顺手修正 missing 标记，快照要跟着更新
+  assets.notify(
+    'info',
+    r.data.missing === 0
+      ? `体检完成：${fmtCount(r.data.checked)} 个素材的文件都在`
+      : `体检完成：${r.data.missing} 个素材的文件已不在磁盘上`
+  )
+}
+
+async function cleanMissing(): Promise<void> {
+  if (!cleanArmed.value) {
+    cleanArmed.value = true
+    return
+  }
+  cleanArmed.value = false
+  libBusy.value = true
+  const r = await window.stash.health.clean()
+  libBusy.value = false
+  if (!r.ok || !r.data) {
+    assets.notify('error', `清理失败：${r.error ?? '未知原因'}`)
+    return
+  }
+  const parts = [`已清掉 ${r.data.removed} 条失效记录`]
+  if (r.data.pruned.length) parts.push(`${r.data.pruned.length} 个空标签`)
+  if (r.data.freed) parts.push(`释放 ${fmtSize(r.data.freed)}`)
+  assets.notify('info', parts.join('、'))
+  scan.value = null
+  await loadLibStats()
+  await assets.refresh()
+  await lib.refreshCounts()
+}
+
+async function revealLibrary(): Promise<void> {
+  const r = await window.stash.library.reveal()
+  if (!r.ok || !r.data?.opened) assets.notify('error', `打开失败：${r.data?.error ?? r.error ?? '未知原因'}`)
+}
+
+/**
+ * 删除当前库。**不可恢复**，所以要点两次，且删除的是「当前这个库的目录」，
+ * 不接受任意路径 —— 主进程那边还会再确认它确实在最近列表里（见 deleteLibrary）。
+ */
+async function doDeleteLibrary(): Promise<void> {
+  if (!deleteLibArmed.value) {
+    deleteLibArmed.value = true
+    return
+  }
+  deleteLibArmed.value = false
+  const target = lib.info?.path
+  if (!target) return
+  libBusy.value = true
+  const err = await lib.deleteLibrary(target)
+  libBusy.value = false
+  if (err) {
+    assets.notify('error', `删除失败：${err}`)
+    return
+  }
+  // 库已经没了，面板也别留着 —— 对着欢迎页开一个「库与存储」很怪
+  settings.closePanel()
+  assets.notify('info', '库已删除')
 }
 
 async function openCacheDir(): Promise<void> {
@@ -521,6 +651,173 @@ async function copyDiagnostics(): Promise<void> {
 
             <div class="sp-actions">
               <button class="sp-btn" type="button" data-sp-open-cache @click="openCacheDir">打开缓存目录</button>
+            </div>
+          </template>
+
+          <!-- ============ 导入 ============ -->
+          <template v-else-if="active === 'importing'">
+            <h3 class="sp-h">导入</h3>
+            <p class="sp-sub">工具栏的「导入」按钮与拖文件进窗口，都按这里的设置走</p>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">默认导入方式</div>
+                <div class="sp-tip">「移动」会把原文件从原位置搬进库（源目录里就没有了），不是复制一份</div>
+              </div>
+              <div class="sp-seg" data-sp-import-mode>
+                <button
+                  type="button"
+                  :class="{ on: s.importing.mode === 'copy' }"
+                  @click="pickImportMode('copy')"
+                >
+                  复制
+                </button>
+                <button
+                  type="button"
+                  :class="{ on: s.importing.mode === 'move' }"
+                  @click="pickImportMode('move')"
+                >
+                  移动
+                </button>
+              </div>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">按内容去重</div>
+                <div class="sp-tip">同内容的文件再导一次会跳过；关掉则照样导入（重名自动改名，不覆盖）</div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.importing.dedupe }"
+                type="button"
+                role="switch"
+                data-sp-dedupe
+                :aria-checked="s.importing.dedupe"
+                @click="toggleDedupe"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">生成主色板</div>
+                <div class="sp-tip">导入图片时顺带提取配色（详情栏那些色块）。关掉省一点 CPU，已有的不受影响</div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.importing.palette }"
+                type="button"
+                role="switch"
+                data-sp-palette
+                :aria-checked="s.importing.palette"
+                @click="togglePalette"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-note">
+              <b>重名规则是固定的</b>：目标目录已有同名文件时自动改成「名字 (1).ext」，绝不覆盖、也绝不清空；
+              文件类型不支持则整体跳过。导入 / 移动 / 复制 / 重命名共用同一套规则，避免各写一份后出现分叉。
+            </div>
+          </template>
+
+          <!-- ============ 库与存储 ============ -->
+          <template v-else-if="active === 'library'">
+            <h3 class="sp-h">库与存储</h3>
+            <p class="sp-sub">库是自包含的：素材文件 + .stash 索引 + .thumbs 缓存，全在库目录里</p>
+
+            <div class="sp-kv">
+              <span>库名称</span><b data-sp-lib-name>{{ libStats?.name || lib.info?.name || '—' }}</b>
+              <span>位置</span>
+              <b class="sp-path" :title="libStats?.path">{{ libStats?.path ?? '—' }}</b>
+              <span>素材</span>
+              <b data-sp-lib-assets>
+                {{ fmtCount(libStats?.assets ?? 0) }} 个 · {{ libStats ? fmtSize(libStats.bytes) : '—' }}
+              </b>
+              <span>失效记录</span>
+              <b data-sp-lib-missing>{{ libStats?.missingFlagged ?? 0 }} 条</b>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">库体检</div>
+                <div class="sp-tip">逐个核对磁盘，找出「索引里还留着、文件已经不在」的素材</div>
+              </div>
+              <button class="sp-btn" type="button" data-sp-scan :disabled="scanning" @click="runScan">
+                {{ scanning ? '核对中…' : '开始体检' }}
+              </button>
+            </div>
+
+            <div v-if="scan" class="sp-note" data-sp-scan-result>
+              <template v-if="scan.missing === 0">
+                核对了 {{ fmtCount(scan.checked) }} 个素材，文件都在。
+              </template>
+              <template v-else>
+                核对了 {{ fmtCount(scan.checked) }} 个素材，其中 <b>{{ scan.missing }} 个</b>
+                的文件已经不在磁盘上：{{ scan.samples.join('、')
+                }}{{ scan.missing > scan.samples.length ? ' 等' : '' }}
+              </template>
+            </div>
+
+            <div v-if="scan && scan.missing > 0" class="sp-danger">
+              <div class="sp-label">
+                <div class="sp-name">清理失效记录</div>
+                <div class="sp-tip">只删索引行与对应缓存，磁盘上的用户文件一个都不碰</div>
+              </div>
+              <button
+                class="sp-btn danger"
+                :class="{ armed: cleanArmed }"
+                type="button"
+                data-sp-clean-missing
+                :disabled="libBusy"
+                @click="cleanMissing"
+              >
+                {{ cleanArmed ? '再点一次确认' : `清理 ${scan.missing} 条` }}
+              </button>
+            </div>
+
+            <div class="sp-actions">
+              <button class="sp-btn" type="button" data-sp-open-lib @click="revealLibrary">在资源管理器打开库目录</button>
+              <button class="sp-btn" type="button" data-sp-lib-data-dir @click="openDataDir">打开数据目录</button>
+            </div>
+
+            <div class="sp-danger">
+              <div class="sp-label">
+                <div class="sp-name">删除此库</div>
+                <div class="sp-tip">库目录连同里面的素材一起从磁盘物理删除，不进回收站、无法恢复</div>
+              </div>
+              <button
+                class="sp-btn danger"
+                :class="{ armed: deleteLibArmed }"
+                type="button"
+                data-sp-delete-lib
+                :disabled="libBusy"
+                @click="doDeleteLibrary"
+              >
+                {{ deleteLibArmed ? '再点一次确认' : '删除此库' }}
+              </button>
+            </div>
+          </template>
+
+          <!-- ============ 快捷键（只读） ============ -->
+          <template v-else-if="active === 'shortcuts'">
+            <h3 class="sp-h">快捷键</h3>
+            <p class="sp-sub">目前支持的键位一览；自定义键位还没做，这里只读</p>
+
+            <div class="sp-keys" data-sp-shortcuts>
+              <div v-for="k in SHORTCUTS" :key="k.keys" class="sp-key-row">
+                <kbd class="sp-kbd">{{ k.keys }}</kbd>
+                <span class="sp-key-what">{{ k.what }}</span>
+                <span class="sp-key-where">{{ k.where }}</span>
+              </div>
+            </div>
+
+            <div class="sp-note">
+              另有两处不用键盘的习惯性操作：把文件<b>拖进窗口</b>即导入到当前文件夹；
+              中栏浮层里<b>点画面</b>即播放 / 暂停。
             </div>
           </template>
 

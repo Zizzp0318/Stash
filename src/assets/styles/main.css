@@ -1531,3 +1531,39 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .sp-card-sub { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .sp-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* 设置面板 · 快捷键清单（只读） */
+.sp-keys {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 14px;
+}
+.sp-key-row {
+  display: grid;
+  grid-template-columns: 108px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.sp-key-row:last-child { border-bottom: 0; }
+/* kbd 用等宽 + 描边，让键位读起来像「按键」而不是普通文本 */
+.sp-kbd {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-1);
+  background: var(--bg-hover);
+  border: 1px solid var(--border-soft);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sp-key-what { font-size: 12.5px; color: var(--text-2); }
+.sp-key-where { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+
+/* 库与存储：路径可能很长，键值表里要能截断 */
+.sp-kv .sp-path { max-width: 100%; }

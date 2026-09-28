@@ -261,11 +261,15 @@ function pump(): void {
         if (r?.generated && job.size === 'grid' && job.asset.type === 'image') {
           const abs = join(requireCurrent().path, ...job.asset.rel_path.split('/'))
           await writeImageMeta(job.asset)
-          const { db } = requireCurrent()
-          const row = db.prepare('SELECT palette FROM assets WHERE id=?').get(job.asset.id) as { palette: string | null } | undefined
-          if (row && !row.palette) {
-            const pal = await computePalette(abs)
-            if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, job.asset.id)
+          // 色板可以在设置里关掉（省一点 CPU）——关掉只是「以后不再算」，
+          // 已经算过的保留着；想补算就重新打开设置、再清一次缓存重建。
+          if (getSettings().importing.palette) {
+            const { db } = requireCurrent()
+            const row = db.prepare('SELECT palette FROM assets WHERE id=?').get(job.asset.id) as { palette: string | null } | undefined
+            if (row && !row.palette) {
+              const pal = await computePalette(abs)
+              if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, job.asset.id)
+            }
           }
         }
       })

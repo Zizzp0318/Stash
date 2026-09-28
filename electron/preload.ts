@@ -20,7 +20,9 @@ contextBridge.exposeInMainWorld('stash', {
     open: (target: string) => ipcRenderer.invoke('library:open', target),
     list: () => ipcRenderer.invoke('library:list'),
     close: () => ipcRenderer.invoke('library:close'),
-    getInfo: () => ipcRenderer.invoke('library:info')
+    getInfo: () => ipcRenderer.invoke('library:info'),
+    /** 在资源管理器里打开库目录 */
+    reveal: () => ipcRenderer.invoke('library:reveal')
   },
   folder: {
     mkdir: (relPath: string) => ipcRenderer.invoke('folder:mkdir', relPath),
@@ -119,6 +121,12 @@ contextBridge.exposeInMainWorld('stash', {
     stats: () => ipcRenderer.invoke('cache:stats'),
     clear: (kind: 'thumbs' | 'derived' | 'all') => ipcRenderer.invoke('cache:clear', { kind }),
     reveal: () => ipcRenderer.invoke('cache:reveal')
+  },
+  /** 库体检：失效素材（索引还在、文件没了）的统计 / 核对 / 清理 */
+  health: {
+    stats: () => ipcRenderer.invoke('health:stats'),
+    scan: () => ipcRenderer.invoke('health:scan'),
+    clean: () => ipcRenderer.invoke('health:clean')
   },
   app: {
     info: () => ipcRenderer.invoke('app:info'),

@@ -211,10 +211,12 @@ function hlName(name: string): string {
 }
 
 // —— 导入 ——
+// 方式（复制 / 移动）与「按内容去重」都不在这里传，交给主进程按设置决定 ——
+// 两条导入路径（对话框选文件、拖文件进窗口）才不会各写一份、也就不会各偏一次。
 async function importFiles(): Promise<void> {
   const paths = await window.stash.dialog.pickFiles()
   if (!paths.length) return
-  await window.stash.import.files({ paths, folderId: assets.query.folderId, mode: 'copy' })
+  await window.stash.import.files({ paths, folderId: assets.query.folderId })
 }
 
 // —— 卡片 ——
@@ -884,7 +886,8 @@ async function onDrop(e: DragEvent): Promise<void> {
   // Electron 32 起 File.path 已移除，路径只能从 webUtils 拿
   const paths = files.map((f) => window.stash.pathForFile(f)).filter(Boolean)
   if (!paths.length) return
-  await window.stash.import.files({ paths, folderId: assets.query.folderId, mode: 'copy' })
+  // 同样不传 mode：跟着设置走（见 importFiles 的注释）
+  await window.stash.import.files({ paths, folderId: assets.query.folderId })
   void lib.loadMeta()
 }
 

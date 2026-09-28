@@ -7,7 +7,14 @@
 //    （键没了，迁移自然只跑一次，不需要额外记标记）。
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { StashCardFields, StashPreviewSettings, StashSettings, StashThumbSettings } from '../env'
+import type {
+  StashCardFields,
+  StashImportSettings,
+  StashPreviewSettings,
+  StashSettings,
+  StashSettingsPatch,
+  StashThumbSettings
+} from '../env'
 
 /**
  * 瀑布视图缩放：滑块值 = 目标列宽（px），上下限刻意压低，避免放大到只剩一两列。
@@ -18,10 +25,11 @@ export const VIEW_ZOOM_MAX = 280
 export const VIEW_ZOOM_DEFAULT = 170
 
 /**
- * 补丁类型：`Partial<StashSettings>` 只会把**顶层**变可选，cardFields 整个对象仍是必填 ——
- * 而我们要的是「只改其中一两个开关」。所以单独声明一层深可选。
+ * 补丁类型：`Partial<StashSettings>` 只会把**顶层**变可选，嵌套对象仍是必填 ——
+ * 而我们要的是「只改其中一两个开关」。直接复用 `env.d.ts` 里那份深可选定义，
+ * 别再抄一遍（抄漏一层就是「改 A 把 B 弄没了」）。
  */
-export type SettingsPatch = Partial<Omit<StashSettings, 'cardFields'>> & { cardFields?: Partial<StashCardFields> }
+export type SettingsPatch = StashSettingsPatch
 
 const FALLBACK: StashSettings = {
   defaultView: 'masonry',
@@ -29,7 +37,8 @@ const FALLBACK: StashSettings = {
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true },
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
-  preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false }
+  preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
+  importing: { mode: 'copy', dedupe: true, palette: true }
 }
 
 /** 老键（搬家前的位置） */
@@ -40,7 +49,13 @@ const LEGACY = {
 } as const
 
 function clone(s: StashSettings): StashSettings {
-  return { ...s, cardFields: { ...s.cardFields }, thumbs: { ...s.thumbs }, preview: { ...s.preview } }
+  return {
+    ...s,
+    cardFields: { ...s.cardFields },
+    thumbs: { ...s.thumbs },
+    preview: { ...s.preview },
+    importing: { ...s.importing }
+  }
 }
 
 /** 把后端/旧数据来的值补齐并钳到合法范围（配置文件是能手改的，不能信） */
@@ -58,6 +73,7 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
   // 范围与白名单的校验在主进程（config.ts 的 sanitizeSettings），这里只补默认值，别两处各判一次。
   const th = (src.thumbs ?? {}) as Partial<StashThumbSettings>
   const pv = (src.preview ?? {}) as Partial<StashPreviewSettings>
+  const im = (src.importing ?? {}) as Partial<StashImportSettings>
   const conc = Number(th.concurrency)
   const qual = Number(th.quality)
   const z = Number(src.viewZoom)
@@ -81,6 +97,13 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
         ? Math.min(1, Math.max(0, Number(pv.volume)))
         : FALLBACK.preview.volume,
       autoPlay: pv.autoPlay === true
+    },
+    importing: {
+      mode: im.mode === 'move' ? 'move' : 'copy',
+      // 判据写成 `!== false`：这两项默认都是「开」，只有明确 false 才关，
+      // 否则老配置里缺键会被判成关 → 升级后行为悄悄变了
+      dedupe: im.dedupe !== false,
+      palette: im.palette !== false
     }
   }
 }
@@ -136,7 +159,8 @@ export const useSettingsStore = defineStore('settings', () => {
       // 嵌套对象要各自深合并：浅合并会把没传的那层整个替换掉
       cardFields: { ...settings.value.cardFields, ...(next.cardFields ?? {}) },
       thumbs: { ...settings.value.thumbs, ...(next.thumbs ?? {}) },
-      preview: { ...settings.value.preview, ...(next.preview ?? {}) }
+      preview: { ...settings.value.preview, ...(next.preview ?? {}) },
+      importing: { ...settings.value.importing, ...(next.importing ?? {}) }
     })
   }
 

@@ -3,6 +3,7 @@ import { basename, extname, join } from 'path'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { requireCurrent, mkdirRel } from './library'
+import { getSettings } from './config'
 import { uniqueName } from './naming'
 import type { DB } from './db'
 
@@ -60,7 +61,10 @@ let importSeq = 0
 export function importFiles(args: ImportArgs): { importId: number } {
   const { db, path: libPath } = requireCurrent()
   const importId = ++importSeq
-  const mode = args.mode ?? 'copy'
+  // 调用方没指定方式就按设置走（用时现读，不做模块级快照）
+  const mode = args.mode ?? getSettings().importing.mode
+  // 按内容去重也归设置管：关掉之后重复文件照样导入，靠 uniqueName 改名避开覆盖
+  const dedupe = getSettings().importing.dedupe
   const total = args.paths.length
 
   // 异步执行，不阻塞 IPC 返回
@@ -100,7 +104,7 @@ export function importFiles(args: ImportArgs): { importId: number } {
         if (!type) { skipped++; continue }
 
         const hash = contentHash(src)
-        if (dupStmt.get(hash)) { skipped++; continue }
+        if (dedupe && dupStmt.get(hash)) { skipped++; continue }
 
         // 目标目录已有同名文件 → 自动换一个不冲突的名字（`名字 (1).png`），
         // 绝不覆盖也不跳过。规则与移动/复制/重命名共用 `uniqueName`。

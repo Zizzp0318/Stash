@@ -40,6 +40,19 @@ export interface Settings {
     /** 中栏浮层打开时是否自动播放（右侧信息栏不自动播 —— 那会一路点一路响） */
     autoPlay: boolean
   }
+  /**
+   * 导入。
+   * 命名不用 `import`：它是保留字，`const { import } = x` 得改名才能解构，
+   * 徒增一处将来会踩的坑（属性名其实合法，只是没必要）。
+   */
+  importing: {
+    /** 默认导入方式。⚠️ `move` 会把原文件从原位置搬走（源目录里就没有了），不是复制一份 */
+    mode: 'copy' | 'move'
+    /** 按内容哈希跳过库里已存在的重复素材。关掉则照样导入（重名会自动改名，不覆盖） */
+    dedupe: boolean
+    /** 生成缩略图时顺带算主色板。关掉可省一点 CPU，代价是详情栏没有色板可看 */
+    palette: boolean
+  }
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -48,7 +61,8 @@ export const DEFAULT_SETTINGS: Settings = {
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true },
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
-  preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false }
+  preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
+  importing: { mode: 'copy', dedupe: true, palette: true }
 }
 
 /** 可选的 webp 质量档位（面板上给三档，别让用户随便填个 1） */
@@ -85,6 +99,7 @@ export function sanitizeSettings(raw: unknown): Settings {
   }
   const th = (r.thumbs && typeof r.thumbs === 'object' ? r.thumbs : {}) as Partial<Settings['thumbs']>
   const pv = (r.preview && typeof r.preview === 'object' ? r.preview : {}) as Partial<Settings['preview']>
+  const im = (r.importing && typeof r.importing === 'object' ? r.importing : {}) as Partial<Settings['importing']>
   const pickOf = (list: readonly number[], v: unknown, def: number): number => {
     const n = Number(v)
     return list.includes(n) ? n : def
@@ -112,6 +127,13 @@ export function sanitizeSettings(raw: unknown): Settings {
       textMaxBytes: pickOf(TEXT_MAX_MB_CHOICES, Math.round(Number(pv.textMaxBytes) / 1024 / 1024), 2) * 1024 * 1024,
       volume: vol,
       autoPlay: pv.autoPlay === true
+    },
+    importing: {
+      mode: im.mode === 'move' ? 'move' : 'copy',
+      // 这三项默认都是「开」，所以判据写成 `!== false`：只有明确写了 false 才关掉。
+      // 写成 `=== true` 的话，老配置文件里没这个键会被判成关 → 升级后行为悄悄变了。
+      dedupe: im.dedupe !== false,
+      palette: im.palette !== false
     }
   }
 }
@@ -207,7 +229,7 @@ export function getSettings(): Settings {
   return load().settings
 }
 
-/** 只覆盖传进来的字段（浅合并；cardFields 单独深合并一层，否则会把没传的开关抹成 undefined） */
+/** 只覆盖传进来的字段（浅合并；**每个**嵌套对象单独深合并一层，否则会把没传的项抹成 undefined） */
 export function patchSettings(patch: Partial<Settings>): Settings {
   const c = load()
   c.settings = sanitizeSettings({
@@ -218,7 +240,8 @@ export function patchSettings(patch: Partial<Settings>): Settings {
     // sanitize 回落默认值 → 用户「只改了质量」却把并发数悄悄重置了（冒烟当场抓到过）。
     cardFields: { ...c.settings.cardFields, ...(patch.cardFields ?? {}) },
     thumbs: { ...c.settings.thumbs, ...(patch.thumbs ?? {}) },
-    preview: { ...c.settings.preview, ...(patch.preview ?? {}) }
+    preview: { ...c.settings.preview, ...(patch.preview ?? {}) },
+    importing: { ...c.settings.importing, ...(patch.importing ?? {}) }
   })
   save()
   return c.settings

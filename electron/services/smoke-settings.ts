@@ -11,11 +11,15 @@
 //   S7 缓存组     —— 占用统计（缩略图/派生分开算）、并发与质量落盘、清理缩略图后真被重建
 //   S8 预览与播放 —— 自动隐藏延迟**真的改行为**（浮层提示常驻/淡出）、高清预览上限换了档
 //                    会生成**新文件名**的派生文件（不是复用旧的）、音量/自动播放/文本上限落盘
+//   S9 导入组     —— 方式/去重/色板落盘，且**不传 mode 直接调 import.files** 时管线真的按设置走
+//                    （移动真的搬走源文件、关掉去重真的会重复导入、关掉色板真的不再回写色板）
+//   S10 库与存储  —— 体检能找出「文件已不在磁盘」的素材、清理点两次才生效且**不碰磁盘上还在的文件**
+//   S11 快捷键    —— 只读清单：有内容、不留空行、且**里面不该有任何可点控件**（防「假设置」）
 //
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
 import { app, BrowserWindow } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
@@ -172,7 +176,8 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       "[...document.querySelectorAll('[data-sp-group]')].map((b) => b.textContent.trim())"
     )
     check('S1 面板分组导航正确',
-      JSON.stringify(nav) === JSON.stringify(['外观与浏览', '预览与播放', '缩略图与缓存', '关于']),
+      JSON.stringify(nav) ===
+        JSON.stringify(['外观与浏览', '预览与播放', '导入', '缩略图与缓存', '库与存储', '快捷键', '关于']),
       JSON.stringify(nav))
     const bodyTitle = await js<string>("document.querySelector('.sp-h')?.textContent.trim() ?? ''")
     check('S1 默认停在「外观与浏览」', bodyTitle === '外观与浏览', bodyTitle ?? '')
@@ -426,6 +431,198 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
     check('S6 关于页显示的版本号与主进程一致', ver === app.getVersion(), `dom=${ver} app=${app.getVersion()}`)
     check('S6 关于页列出了运行环境与数据目录', (kvCount ?? 0) >= 4, String(kvCount))
     await capture('shot-settings-about.png')
+
+    // ==================== S9 导入 ====================
+    {
+      await clickEl('[data-sp-group="importing"]')
+      const imOpen = await waitFor("!!document.querySelector('[data-sp-import-mode]')", 6000)
+      const imCtrl = await js<Record<string, boolean>>(
+        `(() => ({
+           mode: !!document.querySelector('[data-sp-import-mode]'),
+           dedupe: !!document.querySelector('[data-sp-dedupe]'),
+           palette: !!document.querySelector('[data-sp-palette]')
+         }))()`
+      )
+      check('S9 「导入」分组能打开且三个控件都在',
+        imOpen && Object.values(imCtrl ?? {}).every(Boolean), JSON.stringify(imCtrl))
+      check('S9 默认是「复制 + 去重 + 算色板」',
+        diskSettings().importing.mode === 'copy' &&
+          diskSettings().importing.dedupe === true &&
+          diskSettings().importing.palette === true,
+        JSON.stringify(diskSettings().importing))
+
+      const names = (): string[] =>
+        (requireCurrent().db.prepare('SELECT name FROM assets').all() as Array<{ name: string }>).map((r) => r.name)
+      /** 轮询到条件成立（导入是异步的，不能睡固定时长就断言） */
+      const until = async (fn: () => boolean, ms = 10000): Promise<boolean> => {
+        const t0 = Date.now()
+        while (Date.now() - t0 < ms) {
+          if (fn()) return true
+          await new Promise((r) => setTimeout(r, 200))
+        }
+        return fn()
+      }
+
+      // —— 方式：设成「移动」后导入真的会把源文件搬走 ——
+      // ⚠️ 调 import.files 时**故意不传 mode**：真实的两个入口（对话框、拖入）都不传，
+      // 让主进程自己按设置决定。传死 mode 的话就变成「测我自己传的值」，白测。
+      const moveSrc = join(src, 'move-me.png')
+      await sharp({ create: { width: 120, height: 120, channels: 3, background: '#884400' } }).png().toFile(moveSrc)
+      await clickEl('[data-sp-import-mode] button:nth-child(2)') // 移动到库
+      await new Promise((r) => setTimeout(r, 300))
+      check('S9 切成「移动」会落盘', diskSettings().importing.mode === 'move', String(diskSettings().importing.mode))
+      await js(`window.stash.import.files({ paths: [${JSON.stringify(moveSrc)}], folderId: ${folder.id} })`)
+      const movedOk = await until(() => names().includes('move-me.png'))
+      check('S9 「移动」方式：文件搬进库、原位置不再有它',
+        movedOk && !existsSync(moveSrc), `入库=${movedOk} 源文件还在=${existsSync(moveSrc)}`)
+
+      const copySrc = join(src, 'copy-me.png')
+      await sharp({ create: { width: 120, height: 120, channels: 3, background: '#008844' } }).png().toFile(copySrc)
+      await clickEl('[data-sp-import-mode] button:nth-child(1)') // 复制
+      await new Promise((r) => setTimeout(r, 300))
+      check('S9 切成「复制」会落盘', diskSettings().importing.mode === 'copy', String(diskSettings().importing.mode))
+      await js(`window.stash.import.files({ paths: [${JSON.stringify(copySrc)}], folderId: ${folder.id} })`)
+      const copiedOk = await until(() => names().includes('copy-me.png'))
+      check('S9 「复制」方式：源文件留在原处', copiedOk && existsSync(copySrc),
+        `入库=${copiedOk} 源文件还在=${existsSync(copySrc)}`)
+
+      // —— 去重：同一个文件再导一次 ——
+      await clickEl('[data-sp-dedupe]')
+      await new Promise((r) => setTimeout(r, 300))
+      check('S9 关掉「按内容去重」会落盘', diskSettings().importing.dedupe === false)
+      const beforeDup = names().length
+      await js(`window.stash.import.files({ paths: [${JSON.stringify(copySrc)}], folderId: ${folder.id} })`)
+      const dupAdded = await until(() => names().length === beforeDup + 1)
+      check('S9 关掉去重后，同一文件会再导入一份（重名自动改名）',
+        dupAdded && names().includes('copy-me (1).png'), names().join(' | '))
+
+      await clickEl('[data-sp-dedupe]')
+      await new Promise((r) => setTimeout(r, 300))
+      check('S9 「按内容去重」已恢复成开', diskSettings().importing.dedupe === true)
+      const beforeSkip = names().length
+      await js(`window.stash.import.files({ paths: [${JSON.stringify(copySrc)}], folderId: ${folder.id} })`)
+      await new Promise((r) => setTimeout(r, 1500))
+      check('S9 打开去重后，同一文件被跳过（没有多出素材）', names().length === beforeSkip,
+        `${beforeSkip} → ${names().length}`)
+
+      // —— 色板：关掉之后新导入的图片不该再回写色板 ——
+      // 色板是缩略图生成时顺带回写的，所以要等它的 grid 缩略图出来再看，
+      // 再多等一会儿——「本不该发生」的计算若真跑了，这段时间足够它落库（抓现行）。
+      await clickEl('[data-sp-palette]')
+      await new Promise((r) => setTimeout(r, 300))
+      check('S9 关掉「生成主色板」会落盘', diskSettings().importing.palette === false)
+      const palSrc = join(src, 'nopal.png')
+      await sharp({ create: { width: 200, height: 200, channels: 3, background: '#AA3355' } }).png().toFile(palSrc)
+      await js(`window.stash.import.files({ paths: [${JSON.stringify(palSrc)}], folderId: ${folder.id} })`)
+      const palRow = (): { content_hash: string; palette: string | null } | undefined =>
+        requireCurrent().db
+          .prepare("SELECT content_hash, palette FROM assets WHERE name='nopal.png'")
+          .get() as { content_hash: string; palette: string | null } | undefined
+      const palIn = await until(() => !!palRow())
+      check('S9 关掉色板不影响导入本身', palIn)
+      const thumbReady = await until(
+        () => existsSync(join(lib.path, '.thumbs', palRow()?.content_hash ?? 'x', 'grid.webp')),
+        25000
+      )
+      await new Promise((r) => setTimeout(r, 900))
+      // ⚠️ 判据只能写 `=== null`：写成 `(x?.palette ?? 'n/a') === null` 的话，
+      // `??` 连 null 一起吞掉 → 永远得到 'n/a' → 这条断言永远红（本轮真就这么错的，
+      // 而这恰恰是它要抓的那类「空值合并」坑）。
+      check('S9 关掉色板后，新导入的图片不会再回写色板',
+        thumbReady && palRow()?.palette === null,
+        `缩略图=${thumbReady} palette=${String(palRow()?.palette)}`)
+      await clickEl('[data-sp-palette]')
+      await new Promise((r) => setTimeout(r, 250))
+      check('S9 「生成主色板」已恢复成开', diskSettings().importing.palette === true)
+      await capture('shot-settings-import.png')
+    }
+
+    // ==================== S10 库与存储 ====================
+    {
+      await clickEl('[data-sp-group="library"]')
+      const libOpen = await waitFor("!!document.querySelector('[data-sp-scan]')", 6000)
+      await waitFor(
+        "(document.querySelector('[data-sp-lib-missing]')?.textContent ?? '').trim() !== ''",
+        6000
+      )
+      const nameShown =
+        (await js<string>("document.querySelector('[data-sp-lib-name]')?.textContent.trim() ?? ''")) ?? ''
+      const libAssets =
+        (await js<string>("document.querySelector('[data-sp-lib-assets]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 「库与存储」分组能打开且读到库信息', libOpen, libAssets)
+      check('S10 显示的是当前库的名称', nameShown === lib.name, `dom=${nameShown} lib=${lib.name}`)
+      check('S10 有「打开库目录 / 打开数据目录」入口',
+        (await js<boolean>("!!document.querySelector('[data-sp-open-lib]')")) === true &&
+          (await js<boolean>("!!document.querySelector('[data-sp-lib-data-dir]')")) === true)
+      check('S10 读到了素材数与占用', /个/.test(libAssets) && /B|KB|MB|GB/.test(libAssets), libAssets)
+
+      // —— 体检：在软件外删掉一个素材文件，应当被找出来 ——
+      const victim = q<{ rel_path: string }>("SELECT rel_path FROM assets WHERE name='copy-me.png'")
+      unlinkSync(join(lib.path, ...victim.rel_path.split('/')))
+      await new Promise((r) => setTimeout(r, 600))
+      await clickEl('[data-sp-scan]')
+      const scanDone = await waitFor("!!document.querySelector('[data-sp-scan-result]')", 20000)
+      const scanText = (await js<string>("document.querySelector('[data-sp-scan-result]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 体检能跑出结果', scanDone, scanText)
+      check('S10 体检找出了「文件已不在磁盘」的那个素材',
+        scanText.includes('copy-me.png') && /1\s*个/.test(scanText), scanText)
+      const missingTxt = (await js<string>("document.querySelector('[data-sp-lib-missing]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 体检后「失效记录」数变成 1', /^1/.test(missingTxt), missingTxt)
+
+      // —— 清理：点两次才生效，且**绝不碰磁盘上还在的文件** ——
+      const rowCount = (): number => (q<{ c: number }>('SELECT count(*) AS c FROM assets')).c
+      const survivor = q<{ rel_path: string }>("SELECT rel_path FROM assets WHERE name='s0.png'")
+      const beforeRows = rowCount()
+      await clickEl('[data-sp-clean-missing]')
+      const armedTxt = (await js<string>("document.querySelector('[data-sp-clean-missing]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 清理失效记录要先二次确认', armedTxt === '再点一次确认', armedTxt)
+      check('S10 第一次点击不会真删', rowCount() === beforeRows, String(rowCount()))
+      await clickEl('[data-sp-clean-missing]')
+      await new Promise((r) => setTimeout(r, 900))
+      check('S10 第二次点击才真的删掉失效索引行', rowCount() === beforeRows - 1, `${beforeRows} → ${rowCount()}`)
+      check('S10 清理不碰磁盘上还在的素材文件', existsSync(join(lib.path, ...survivor.rel_path.split('/'))))
+      const missingAfter = (await js<string>("document.querySelector('[data-sp-lib-missing]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 清理后失效记录归零', /^0/.test(missingAfter), missingAfter)
+
+      // —— 删除库：只验「要点两次」，不真删（真删了后面几段就没库可用了）——
+      await clickEl('[data-sp-delete-lib]')
+      const delArmed = (await js<string>("document.querySelector('[data-sp-delete-lib]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 删除库要先二次确认', delArmed === '再点一次确认', delArmed)
+      check('S10 第一次点击不会真删库', existsSync(join(lib.path, '.stash')))
+      // 换个分组再回来：二次确认必须被收掉（不然回到这一组会让人以为已经点过一次了）
+      await clickEl('[data-sp-group="shortcuts"]')
+      await waitFor("!!document.querySelector('[data-sp-shortcuts]')", 6000)
+      await clickEl('[data-sp-group="library"]')
+      await waitFor("!!document.querySelector('[data-sp-delete-lib]')", 6000)
+      const delReset = (await js<string>("document.querySelector('[data-sp-delete-lib]')?.textContent.trim() ?? ''")) ?? ''
+      check('S10 换分组会收掉「删除」的二次确认', delReset === '删除此库', delReset)
+      await capture('shot-settings-library.png')
+    }
+
+    // ==================== S11 快捷键（只读） ====================
+    {
+      await clickEl('[data-sp-group="shortcuts"]')
+      const scOpen = await waitFor("!!document.querySelector('[data-sp-shortcuts]')", 6000)
+      const rows = await js<Array<{ keys: string; what: string }>>(
+        `[...document.querySelectorAll('[data-sp-shortcuts] .sp-key-row')].map((r) => ({
+           keys: r.querySelector('.sp-kbd')?.textContent.trim() ?? '',
+           what: r.querySelector('.sp-key-what')?.textContent.trim() ?? ''
+         }))`
+      )
+      check('S11 快捷键页有内容', scOpen && (rows?.length ?? 0) >= 8, String(rows?.length))
+      check('S11 每条键位都有说明（没有空行）',
+        (rows ?? []).every((r) => r.keys.length > 0 && r.what.length > 0), JSON.stringify(rows))
+      const keys = (rows ?? []).map((r) => r.keys)
+      check('S11 列出的都是真实存在的键位（含 Esc / 复制 / 双击卡片）',
+        keys.includes('Esc') && keys.some((k) => k.includes('Ctrl/⌘ + C')) && keys.some((k) => k.includes('双击')),
+        JSON.stringify(keys))
+      // 这一组**只读**：里面混进任何可点控件就说明开始做「假设置」了
+      const interactive = await js<number>(
+        "document.querySelectorAll('[data-sp-shortcuts] button, [data-sp-shortcuts] input, [data-sp-shortcuts] [role=\"switch\"]').length"
+      )
+      check('S11 快捷键页是只读的（没有可点控件）', interactive === 0, String(interactive))
+      await capture('shot-settings-shortcuts.png')
+    }
 
     // ==================== S3 持久化（reload 后仍然生效） ====================
     // 说明：这条验的是「启动时从后端重新读一次」，不是「落盘」—— 主进程的 config 有内存缓存，

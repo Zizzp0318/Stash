@@ -10,6 +10,7 @@ import * as previewSvc from './services/preview'
 import { unwatchLibrary, watchLibrary } from './services/watcher'
 import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
+import * as healthSvc from './services/health'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
@@ -344,6 +345,21 @@ function bootstrap(): void {
         const dir = join(lib.path, '.thumbs')
         if (!existsSync(dir)) throw new Error('ERR_NO_CACHE')
         const err = await shell.openPath(dir)
+        return { opened: !err, error: err || null }
+      })
+    )
+
+    // 库体检：找「索引还在、文件没了」的失效素材
+    ipcMain.handle('health:stats', () => wrap(() => healthSvc.libraryStats()))
+    ipcMain.handle('health:scan', () => wrap(() => healthSvc.scanMissing()))
+    ipcMain.handle('health:clean', () => wrap(() => healthSvc.cleanMissing()))
+
+    // 在资源管理器里打开**库目录**（不是 .thumbs）
+    ipcMain.handle('library:reveal', () =>
+      wrap(async () => {
+        const lib = librarySvc.getLibrary()
+        if (!lib) throw new Error('ERR_NO_LIBRARY')
+        const err = await shell.openPath(lib.path)
         return { opened: !err, error: err || null }
       })
     )
