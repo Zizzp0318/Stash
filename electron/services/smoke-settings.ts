@@ -25,6 +25,7 @@ import { join } from 'path'
 import sharp from 'sharp'
 import { closeCurrent, createLibrary, mkdirRel, requireCurrent } from './library'
 import { importFiles } from './importer'
+import { libraryUsage } from './health'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
 
 interface Check { name: string; pass: boolean; detail?: string }
@@ -606,6 +607,61 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       const delReset = (await js<string>("document.querySelector('[data-sp-delete-lib]')?.textContent.trim() ?? ''")) ?? ''
       check('S10 换分组会收掉「删除」的二次确认', delReset === '删除此库', delReset)
       await capture('shot-settings-library.png')
+    }
+
+    // ==================== S11b 侧栏「占用空间」 ====================
+    {
+      // 关掉设置面板，让侧栏露出来
+      await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      await new Promise((r) => setTimeout(r, 400))
+
+      // ① 位置与文案：必须在「设置」上方（用户明确要求的位置）
+      const raw = (await js<string>(`(() => {
+        const u = document.querySelector('[data-side-usage]')
+        const s = document.querySelector('[data-open-settings]')
+        if (!u || !s) return ''
+        const ur = u.getBoundingClientRect()
+        const sr = s.getBoundingClientRect()
+        return JSON.stringify({
+          ub: Math.round(ur.bottom),
+          st: Math.round(sr.top),
+          w: Math.round(ur.width),
+          h: Math.round(ur.height),
+          txt: (u.querySelector('[data-side-usage-value]')?.textContent ?? '').trim(),
+          title: u.getAttribute('title') ?? ''
+        })
+      })()`)) as string | null
+      const g = raw ? (JSON.parse(raw) as { ub: number; st: number; w: number; h: number; txt: string; title: string }) : null
+      check('S11b 侧栏有「占用空间」这一行', !!g && g.w > 0 && g.h > 0, raw ?? '(元素不存在)')
+      check('S11b 它排在「设置」上方', !!g && g.ub <= g.st + 1, g ? `usage.bottom=${g.ub} settings.top=${g.st}` : '')
+      check('S11b 显示的是格式化后的大小（不是裸字节数）',
+        !!g && /^\d+(\.\d+)? (B|KB|MB|GB)$/.test(g.txt), g?.txt)
+      check('S11b 悬停提示里把素材与缓存分开列',
+        !!g && /素材 .+ · 缩略图缓存 .+/.test(g.title), g?.title)
+      await capture('shot-settings-usage.png')
+
+      // ② 数值本身：素材取自索引、缓存是真扫目录算的
+      const u1 = libraryUsage()
+      const sumAssets = q<{ c: number }>('SELECT coalesce(sum(size),0) AS c FROM assets WHERE missing=0').c
+      check('S11b 服务层：素材占用 = 索引里有效素材 size 之和', u1.assetsBytes === sumAssets,
+        `${u1.assetsBytes} vs ${sumAssets}`)
+      check('S11b 服务层：总计 = 素材 + 缓存', u1.totalBytes === u1.assetsBytes + u1.thumbsBytes, JSON.stringify(u1))
+
+      // 往 .thumbs 里塞 4KB 再读一次：数值必须跟着涨（证明不是写死的常量/缓存）
+      const probeHash = join(lib.path, '.thumbs', 'zz-probe-usage')
+      mkdirSync(probeHash, { recursive: true })
+      writeFileSync(join(probeHash, 'grid.webp'), Buffer.alloc(4096))
+      const u2 = libraryUsage()
+      check('S11b 缓存占用是实扫目录算出来的（塞 4KB 进去，数值跟着涨）',
+        u2.thumbsBytes === u1.thumbsBytes + 4096, `${u1.thumbsBytes} → ${u2.thumbsBytes}`)
+      rmSync(probeHash, { recursive: true, force: true })
+      check('S11b 移除探针后数值回落', libraryUsage().thumbsBytes === u1.thumbsBytes,
+        String(libraryUsage().thumbsBytes))
+
+      // ⚠️ 必须把面板开回去：后面的「快捷键页」段还要在设置面板里查 DOM。
+      // 这一段为了看侧栏把面板 Esc 掉了，不恢复就会把下一段整片弄红（实测踩过）。
+      await clickEl('[data-open-settings]')
+      await waitFor("!!document.querySelector('[data-settings-panel]')", 6000)
     }
 
     // ==================== S11 快捷键（只读） ====================

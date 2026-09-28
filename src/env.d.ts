@@ -26,6 +26,12 @@ export interface StashLibraryApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ path: string; name: string }>; error?: string }>
   close: () => Promise<{ ok: boolean; data?: null; error?: string }>
   getInfo: () => Promise<{ ok: boolean; data?: { path: string; name: string } | null; error?: string }>
+  /** 库占用空间：素材（索引 size 之和）+ `.thumbs` 缓存实际占用 */
+  usage: () => Promise<{
+    ok: boolean
+    data?: { assetsBytes: number; thumbsBytes: number; totalBytes: number }
+    error?: string
+  }>
   /** 在资源管理器里打开库目录 */
   reveal: () => Promise<{ ok: boolean; data?: { opened: boolean; error: string | null }; error?: string }>
 }

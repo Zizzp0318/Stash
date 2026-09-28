@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld('stash', {
     list: () => ipcRenderer.invoke('library:list'),
     close: () => ipcRenderer.invoke('library:close'),
     getInfo: () => ipcRenderer.invoke('library:info'),
+    /** 库占用空间：素材 + 缩略图缓存（侧栏那一行用） */
+    usage: () => ipcRenderer.invoke('library:usage'),
     /** 在资源管理器里打开库目录 */
     reveal: () => ipcRenderer.invoke('library:reveal')
   },

@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
 import { folderIcon } from '@/data/mock'
 import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { useSettingsStore } from '../stores/settings'
-import { fmtCount } from '../utils/format'
+import { fmtCount, fmtSize } from '../utils/format'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -482,13 +482,49 @@ function onWindowMouseDown(e: MouseEvent): void {
   if (tagMenu.value && !t.closest('.ctx-menu')) closeTagMenu()
 }
 
+// ==================== 占用空间（侧栏底部） ====================
+/**
+ * 库占用 = 素材文件 + `.thumbs` 缩略图缓存。
+ *
+ * 为什么要 debounce：导入/删除会让 `lib.counts.total` 连着变好几次，
+ * 而每次刷新都要遍历一遍缓存目录（几千个文件）—— 不拦一下就成了「边导入边扫盘」。
+ * 数值本身只是给用户看个大概，晚半秒完全没关系；点一下那一行可以立即重算。
+ */
+const usage = ref<{ assetsBytes: number; thumbsBytes: number; totalBytes: number } | null>(null)
+const usageBusy = ref(false)
+let usageTimer: ReturnType<typeof setTimeout> | null = null
+
+async function refreshUsage(): Promise<void> {
+  if (usageBusy.value) return
+  usageBusy.value = true
+  const r = await window.stash.library.usage()
+  usageBusy.value = false
+  if (r.ok && r.data) usage.value = r.data
+}
+
+function scheduleUsage(): void {
+  if (usageTimer) clearTimeout(usageTimer)
+  usageTimer = setTimeout(() => void refreshUsage(), 800)
+}
+
+/** 悬停说明：把两块钱分开写清楚，用户才知道「占用」里都算了什么 */
+const usageTitle = computed(() => {
+  const u = usage.value
+  if (!u) return '正在统计库占用…（点一下可重新统计）'
+  return `素材 ${fmtSize(u.assetsBytes)} · 缩略图缓存 ${fmtSize(u.thumbsBytes)}（点一下重新统计）`
+})
+
+watch(() => lib.counts.total, scheduleUsage)
+
 onMounted(() => {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
+  void refreshUsage()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousedown', onWindowMouseDown)
+  if (usageTimer) clearTimeout(usageTimer)
 })
 </script>
 
@@ -621,6 +657,24 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="side-footer">
+      <!-- 占用空间：素材 + 缩略图缓存。放在「设置」上方，点一下立即重算（数值会跟着增删自动刷新） -->
+      <div
+        class="side-usage"
+        role="button"
+        tabindex="0"
+        data-side-usage
+        :title="usageTitle"
+        @click="refreshUsage"
+        @keydown.enter="refreshUsage"
+      >
+        <svg viewBox="0 0 14 14" fill="none">
+          <ellipse cx="7" cy="3.6" rx="4.6" ry="1.9" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.4 3.6v6.8c0 1.05 2.06 1.9 4.6 1.9s4.6-.85 4.6-1.9V3.6" stroke="currentColor" stroke-width="1.2" />
+          <path d="M2.4 7c0 1.05 2.06 1.9 4.6 1.9s4.6-.85 4.6-1.9" stroke="currentColor" stroke-width="1.2" />
+        </svg>
+        <span class="su-label">占用空间</span>
+        <span class="su-value" data-side-usage-value>{{ usage ? fmtSize(usage.totalBytes) : '…' }}</span>
+      </div>
       <div
         class="side-item"
         role="button"

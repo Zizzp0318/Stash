@@ -127,6 +127,27 @@ body {
   flex-shrink: 0;
 }
 .side-footer .side-item { color: var(--text-2); }
+
+/*
+ * 侧栏底部的「占用空间」行（在「设置」上方）。
+ * 与 .side-item 同一套间距/圆角，但它是**只读数值 + 点击重算**：
+ * 数值用等宽数字（tabular-nums）对齐，否则每次刷新位数变化会让右侧跳动。
+ */
+.side-usage {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.side-usage:hover { background: var(--bg-hover); }
+.side-usage svg { width: 14px; height: 14px; flex-shrink: 0; }
+.side-usage .su-value {
+  margin-left: auto;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
 .side-section { margin-bottom: 14px; }
 .side-label {
   font-size: 11px;

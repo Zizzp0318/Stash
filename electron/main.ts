@@ -253,6 +253,8 @@ function bootstrap(): void {
       })
     )
     ipcMain.handle('library:list', () => wrap(() => librarySvc.listLibraries()))
+    // 库占用空间（素材 + 缩略图缓存）：侧栏「占用空间」那一行
+    ipcMain.handle('library:usage', () => wrap(() => healthSvc.libraryUsage()))
     ipcMain.handle('library:info', () => wrap(() => librarySvc.getLibrary()))
     ipcMain.handle('library:close', () =>
       wrap(() => {

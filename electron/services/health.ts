@@ -35,6 +35,62 @@ export function libraryStats(): LibraryStats {
   }
 }
 
+/**
+ * `.thumbs/<hash>/` 两层的总字节数。
+ *
+ * 只下探两层（缓存结构就是固定两层，不去递归子目录）；任何一处读失败都当 0 跳过 ——
+ * 这只是给用户看个大概，不该因为它报错，也不该为了精确去 stat 每一个文件（那是体检的活）。
+ */
+function thumbsDirBytes(root: string): number {
+  let hashes: string[]
+  try {
+    hashes = readdirSync(root)
+  } catch {
+    return 0 // 还没生成过任何缩略图
+  }
+  let total = 0
+  for (const h of hashes) {
+    const dir = join(root, h)
+    let files: string[]
+    try {
+      files = readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const f of files) {
+      try {
+        total += statSync(join(dir, f)).size
+      } catch {
+        /* 正被写入/刚被清理，跳过 */
+      }
+    }
+  }
+  return total
+}
+
+export interface LibraryUsage {
+  /** 素材文件占用（索引里的 size 之和，不碰磁盘） */
+  assetsBytes: number
+  /** `.thumbs` 缩略图缓存占用（要遍历目录，几千个文件约几十毫秒） */
+  thumbsBytes: number
+  totalBytes: number
+}
+
+/**
+ * 库占用空间 —— 侧栏那一行用的。
+ *
+ * 与 `libraryStats()` 分开的原因：那个要「快、一打开面板就有」，而这里多了缓存目录遍历；
+ * 并且侧栏的数值会跟着素材增减反复刷新（导入/删除后），必须 debounce，不能每次 counts 变动都去扫目录。
+ */
+export function libraryUsage(): LibraryUsage {
+  const { db, path } = requireCurrent()
+  const assetsBytes = (
+    db.prepare('SELECT coalesce(sum(size),0) AS c FROM assets WHERE missing=0').get() as { c: number }
+  ).c
+  const thumbsBytes = thumbsDirBytes(join(path, '.thumbs'))
+  return { assetsBytes, thumbsBytes, totalBytes: assetsBytes + thumbsBytes }
+}
+
 export interface ScanResult {
   /** 核对了多少个素材 */
   checked: number
