@@ -1,0 +1,63 @@
+# Windows 打包配置（M8）。跑法：npm run package:win
+#
+# 两条与「本机环境」强相关的设置，别删：
+# ① electronDist 指向已经装好的 electron 二进制 —— 打包时若让它自己去 GitHub 下，
+#    本机直连会挂起（必须过代理），而且那 300 多 MB 早就躺在 node_modules 里了。
+# ② npmRebuild: false —— sharp / ffmpeg-static 都是预编译的 N-API 包，跨 Node/Electron
+#    通用，不需要按 Electron ABI 重建；开着只会白花几分钟、还容易在缺构建工具时失败。
+appId: com.stash.library
+productName: Stash
+copyright: Stash 素材库
+
+directories:
+  output: dist
+  buildResources: build
+
+electronDist: node_modules/electron/dist
+npmRebuild: false
+
+# 只带运行时真正需要的东西：out/ 是 electron-vite 的产物，package.json 决定入口
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+  - '!**/{.workbuddy,.git,scripts}/**'
+  - '!开发文档.md'
+  - '!electron/**'
+  - '!src/**'
+  # 渲染层的 vue / pinia / markdown-it / @panzoom 已经被 vite 打进 out/renderer，
+  # 再随包分发一遍纯属浪费（省十几 MB）。
+  # 保留的判断依据是主进程产物的 require 列表：chokidar / ffmpeg-static / sharp 三个必须留。
+  - '!node_modules/{vue,pinia,markdown-it,@panzoom}/**'
+
+# 原生模块必须解出 asar：sharp 的 .node 不能被 asar 里的 dlopen 加载，
+# ffmpeg-static 的 exe 也必须落在真实磁盘上才能 spawn（见 electron/services/ffmpeg.ts）
+asarUnpack:
+  - '**/node_modules/sharp/**'
+  - '**/node_modules/@img/**'
+  - '**/node_modules/ffmpeg-static/**'
+
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+
+# 产物名用 ASCII：中文文件名在旧解压工具/网盘上容易乱码，中文只留在快捷方式与卸载项里。
+# ⚠️ 根级没有 `zip:` 这个配置段（electron-builder 26 会直接报 unknown property 'zip'），
+# 所以「便携版」这个名字只能靠顶层 artifactName 承担，再由 nsis 覆盖成安装版的名字。
+artifactName: ${productName}-${version}-portable.${ext}
+
+# 安装版：给用户选安装目录，不写注册表以外的东西，卸载**不动**用户数据
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Stash
+  uninstallDisplayName: Stash 素材库
+  deleteAppDataOnUninstall: false
+  artifactName: ${productName}-${version}-setup.${ext}

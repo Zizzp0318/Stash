@@ -2,6 +2,7 @@
   "name": "stash",
   "version": "0.1.0",
   "description": "Stash · 素材库 - Windows 本地素材管理软件",
+  "author": "Zizzp0318",
   "private": true,
   "main": "out/main/main.js",
   "scripts": {
@@ -9,7 +10,10 @@
     "predev": "node scripts/clean-vite-tmp.mjs",
     "build": "electron-vite build",
     "postbuild": "node scripts/clean-vite-tmp.mjs",
-    "start": "electron-vite preview"
+    "start": "electron-vite preview",
+    "icon": "node scripts/make-icon.mjs",
+    "clean:build": "node scripts/clean-build.mjs",
+    "package:win": "npm run clean:build && npm run build && electron-builder --win --x64 --publish never"
   },
   "dependencies": {
     "@panzoom/panzoom": "^4.6.2",
@@ -25,6 +29,7 @@
     "@rollup/rollup-win32-x64-msvc": "^4.63.5",
     "@vitejs/plugin-vue": "^5.2.1",
     "electron": "^44.4.5",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
