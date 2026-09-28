@@ -2,7 +2,7 @@
 // 图片: sharp → webp（两级尺寸）；视频: ffmpeg 截帧 → sharp 缩放；
 // 音频/文本: 生成占位图。缓存: {库目录}/.thumbs/{hash}/{size}.webp
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, copyFileSync } from 'fs'
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync } from 'fs'
 import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
@@ -29,7 +29,7 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
   if (!existsSync(abs)) return null
 
   mkdirSync(join(out, '..'), { recursive: true })
-  const tmp = `${out}.tmp`
+  const tmp = tmpPath(out)
 
   try {
     if (asset.type === 'image') {
@@ -43,13 +43,13 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
         .webp({ quality: 82 })
         .toFile(tmp)
     } else if (asset.type === 'video') {
-      const frame = `${out}.frame.png`
+      const frame = tmpPath(out, '.frame.png')
       await extractFrame(abs, frame)
       await sharp(frame)
         .resize({ width: SIZES[size], height: SIZES[size], fit: 'inside', withoutEnlargement: true })
         .webp({ quality: 82 })
         .toFile(tmp)
-      try { require('fs').unlinkSync(frame) } catch { /* ignore */ }
+      try { unlinkSync(frame) } catch { /* ignore */ }
     } else {
       // 音频/文本占位图（全局缓存一份，按需复制）
       const ph = await placeholder(asset.type)
@@ -66,15 +66,26 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
     renameTmp(tmp, out)
     return { path: out, generated: true }
   } catch {
-    try { require('fs').unlinkSync(tmp) } catch { /* ignore */ }
+    try { unlinkSync(tmp) } catch { /* ignore */ }
     return null
   }
 }
 
+/**
+ * 每个 job 用**独立**的临时文件名。
+ * 早先是固定的 `${out}.tmp` / `${out}.frame.png`：同一目标被两个并发 job 处理时
+ * （同一批 grid 重复入队、或 grid 与 detail 撞在一起）会互相写坏对方正在写的文件 ——
+ * 和占位图那个竞态是同一类问题，一起收掉。
+ */
+let tmpSeq = 0
+function tmpPath(out: string, ext = '.tmp'): string {
+  return `${out}.${process.pid}-${++tmpSeq}${ext}`
+}
+
 function renameTmp(tmp: string, out: string): void {
   // Windows 上 rename 不覆盖已存在文件，先尝试删除
-  try { require('fs').unlinkSync(out) } catch { /* ignore */ }
-  require('fs').renameSync(tmp, out)
+  try { unlinkSync(out) } catch { /* ignore */ }
+  renameSync(tmp, out)
 }
 
 /** ffmpeg 截帧：取 10% 处（不足 1s 取 0s），同时把时长/分辨率写回 assets */
@@ -129,20 +140,44 @@ function relOf(abs: string): string {
 }
 
 // —— 占位图（音频/文本）：按类型生成一次，内存缓存 ——
+//
+// ⚠️ **必须 single-flight**，不能只是「不存在就生成」：
+// 队列并发是 4，同一批导入里的音频会同时走到这里，而那一刻 `.thumbs/placeholder-audio.webp`
+// 还不存在 —— 4 个 `sharp().toFile()` 往**同一个路径**写，libvips 的落盘不是原子的，
+// 实测每轮都有 1~2 个抛 `unable to ...` / `Warning treated as error due to failOn setting`。
+// 失败的 job 在 `ensureOne` 里被 catch → 返回 null → **这个素材的缩略图永远不会生成**，
+// 渲染层 `stash://thumb/...` 404 → 卡片一块灰（`onImgErr` 只隐藏不重试），
+// 要等下次开库 backfill 才补上。用户表现就是「**有时候**导入素材进去预览图是灰色的」。
+// 所以并发调用共享**同一个 Promise**，并且先写临时文件再原子 rename，别让半个文件留在最终路径。
 const placeholderCache = new Map<string, string>()
+const placeholderPending = new Map<string, Promise<string>>()
 
-async function placeholder(type: string): Promise<string> {
+function placeholder(type: string): Promise<string> {
   const hit = placeholderCache.get(type)
-  if (hit && existsSync(hit)) return hit
-  const tmp = join(requireCurrent().path, '.thumbs', `placeholder-${type}.webp`)
-  if (!existsSync(tmp)) {
-    const svg = type === 'audio'
-      ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="#7FA8D9"><circle cx="140" cy="180" r="14"/><circle cx="190" cy="164" r="14"/><rect x="150" y="100" width="6" height="82" rx="3"/><rect x="200" y="84" width="6" height="82" rx="3"/></g></svg>`
-      : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
-    await sharp(Buffer.from(svg)).webp().toFile(tmp)
+  if (hit && existsSync(hit)) return Promise.resolve(hit)
+  const pending = placeholderPending.get(type)
+  if (pending) return pending // 已经有人在生成了，等他就行
+  const p = generatePlaceholder(type).finally(() => placeholderPending.delete(type))
+  placeholderPending.set(type, p)
+  return p
+}
+
+async function generatePlaceholder(type: string): Promise<string> {
+  const out = join(requireCurrent().path, '.thumbs', `placeholder-${type}.webp`)
+  if (existsSync(out)) {
+    placeholderCache.set(type, out)
+    return out
   }
-  placeholderCache.set(type, tmp)
-  return tmp
+  mkdirSync(join(out, '..'), { recursive: true })
+  const svg = type === 'audio'
+    ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="#7FA8D9"><circle cx="140" cy="180" r="14"/><circle cx="190" cy="164" r="14"/><rect x="150" y="100" width="6" height="82" rx="3"/><rect x="200" y="84" width="6" height="82" rx="3"/></g></svg>`
+    : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
+  const buf = await sharp(Buffer.from(svg)).webp().toBuffer()
+  const tmp = tmpPath(out)
+  writeFileSync(tmp, buf)
+  renameTmp(tmp, out) // 原子替换：失败也只可能留下临时文件，最终路径要么没有、要么是完整的
+  placeholderCache.set(type, out)
+  return out
 }
 
 // —— 图片元数据 + 主色回写 ——

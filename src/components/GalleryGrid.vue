@@ -210,6 +210,36 @@ async function importFiles(): Promise<void> {
 // —— 卡片 ——
 const TYPE_ICON: Record<string, string> = { image: '🖼', video: '🎬', audio: '🎵', text: '📄' }
 
+/**
+ * 缩略图右上角的类型角标（图标 + 文字）。
+ *
+ * 为什么必须有：视频缩略图就是「某一帧的画面」，和照片长得一模一样。
+ * 之前唯一的区分线索是右下的**时长**角标，而时长是异步探测回写的 ——
+ * 刚导入、还没探完的那批视频**连时长都没有**，于是一整屏图片和视频完全没法分。
+ * 所以类型标识不能依赖任何异步字段，必须由 `type` 直接渲染。
+ *
+ * 图标用内联 SVG（不用 TYPE_ICON 那套 emoji）：emoji 各平台字形/配色不一致，
+ * 而且角标里 10px 的 emoji 会糊成一团色点。
+ */
+const TYPE_BADGE: Record<string, { label: string; icon: string }> = {
+  image: {
+    label: '图片',
+    icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.2" y="3.2" width="11.6" height="9.6" rx="1.8"/><circle cx="5.9" cy="6.6" r="1.05"/><path d="M2.6 11.4l3.1-2.8 2.6 2.3 2.2-1.9 3.3 2.9"/></svg>'
+  },
+  video: {
+    label: '视频',
+    icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><rect x="2.2" y="3.6" width="11.6" height="8.8" rx="1.8"/><path d="M6.7 6.2l3.4 1.8-3.4 1.8z" fill="currentColor" stroke="none"/></svg>'
+  },
+  audio: {
+    label: '音频',
+    icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.6" cy="11.2" r="2.3"/><path d="M8.9 11.2V3.8l3.4 1.4"/></svg>'
+  },
+  text: {
+    label: '文本',
+    icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3.4 4.6h9.2"/><path d="M3.4 8h9.2"/><path d="M3.4 11.4h5.6"/></svg>'
+  }
+}
+
 /** 尺寸：仅宽×高 / 时长，取不到时留空（不再回落到文件大小，避免与「大小」重复） */
 function dimsOnly(it: StashAssetRow): string {
   if (it.width && it.height) return `${it.width} × ${it.height}`
@@ -348,9 +378,27 @@ const placed = computed<Placed[]>(() => {
 /** 瀑布容器总高度 = 最长列的底部 */
 const masonryHeight = computed(() => placed.value.reduce((m, p) => Math.max(m, p.y + p.h), 0))
 
+/** 已经补生成过一次的素材：别在 error ↔ 重试之间打转 */
+const thumbRetried = new Set<number>()
+
 function onImgErr(it: StashAssetRow, ev: Event): void {
-  ;(ev.target as HTMLImageElement).style.opacity = '0'
+  const img = ev.target as HTMLImageElement
+  img.style.opacity = '0'
   console.warn('IMG_ERR', it.name, it.content_hash)
+  // 缩略图 404 只有两种可能：生成时失败、或还没生成（协议就是直接读文件，没有别的失败面）。
+  // 不补的话这张卡会一直灰到下次开库 backfill —— 用户看到的就是「有时候导入进来预览图是灰的」。
+  // 所以这里补一次生成 + 换 URL 重试；每个素材每个会话只补一次，避免死循环。
+  if (thumbRetried.has(it.id)) return
+  thumbRetried.add(it.id)
+  void (async () => {
+    try {
+      const r = await window.stash.thumb.ensure(it.id, 'grid')
+      if (!r.ok || !r.data?.url || !img.isConnected) return
+      // 只给这一张换 URL：不用 bumpThumbs，那会把整片网格的 <img> 全部重发一次请求、白闪一下
+      img.src = assets.thumbUrl(it.content_hash) + '&retry=' + Date.now()
+      img.style.opacity = '1' // 真失败的话 onImgErr 会再把它压回 0
+    } catch { /* 补生成失败就维持现状，不吵用户 */ }
+  })()
 }
 
 /** 加载完成：恢复透明度；索引缺尺寸时用图片真实宽高补算比例，保证排布不歪 */
@@ -1044,6 +1092,11 @@ function onWindowMouseDown(e: MouseEvent): void {
             />
             <span v-if="!p.it.content_hash" class="thumb-fallback">{{ TYPE_ICON[p.it.type] }}</span>
             <span v-if="p.it.is_fav" class="fav" v-html="heart"></span>
+            <!-- 类型角标：绝对定位，不参与瀑布流的高度计算（卡片高 = padding + 缩略图 + 信息区） -->
+            <span class="thumb-type" :data-thumb-type="p.it.type">
+              <span class="tt-ico" v-html="(TYPE_BADGE[p.it.type] ?? TYPE_BADGE.text).icon"></span>
+              <span class="tt-label">{{ (TYPE_BADGE[p.it.type] ?? TYPE_BADGE.text).label }}</span>
+            </span>
             <span v-if="p.it.type === 'video' && p.it.duration_ms" class="video-len">{{ fmtDuration(p.it.duration_ms) }}</span>
           </div>
           <div v-if="assets.cardFields.name || metaText(p.it)" class="card-info">

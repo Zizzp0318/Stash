@@ -6,11 +6,14 @@
 //   不然用户面对的是一片黑。
 // - **缩放平移用 @panzoom/panzoom**（~5KB、MIT）：滚轮缩放、拖拽平移、双击在「适配 / 1:1」间切。
 //   刻意**不自己写 transform**：定位与缩放全交给它，避免和 contain 布局打架。
+// - **底部操作提示**：静止 / 离开画面就淡出（同 `useIdleHide`）。它压在**任意亮度的图片**上，
+//   所以配色**不能用主题文字色**（曾是 `var(--text-3)` + 半透明黑底，亮图下对比度归零、字看不清）。
 import { computed, onBeforeUnmount, ref, watch, type PropType } from 'vue'
 import Panzoom from '@panzoom/panzoom'
 import type { StashAssetRow } from '../../env'
 import { useAssetStore } from '../../stores/assets'
 import { usePreviewMedia } from './usePreviewMedia'
+import { useIdleHide } from './useIdleHide'
 
 const props = defineProps({
   asset: { type: Object as PropType<StashAssetRow>, required: true }
@@ -23,6 +26,26 @@ const stage = ref<HTMLElement | null>(null)
 const imgEl = ref<HTMLImageElement | null>(null)
 const bigLoaded = ref(false)
 let pz: ReturnType<typeof Panzoom> | null = null
+
+/* 底部操作提示：静止 / 离开画面就淡出，别长期压在图片上（规则见 `useIdleHide.ts`）。
+   判定区传 `stage` 而不是让它退回父级：`.pv-stage` 是 `v-show`（一直在 DOM 里），
+   所以 onMounted 就能挂上监听；而提示自己是 `v-if="status === 'ready'"`，
+   拿它当 root 会在「还没 ready」时挂不上监听、之后永远不自动隐藏。 */
+const hintEl = ref<HTMLElement | null>(null)
+const {
+  shown: hintShown,
+  reveal: revealHint,
+  reschedule: rescheduleHint
+} = useIdleHide({
+  enabled: () => status.value === 'ready',
+  root: () => hintEl.value,
+  target: () => stage.value
+})
+// 图片就绪后才开始计时：就绪前提示还没渲染，计时会白跑一趟（甚至把首次显示也算没了）
+watch(status, (s) => {
+  if (s === 'ready') revealHint()
+  else rescheduleHint()
+})
 
 /** 1:1 需要的缩放倍数：图片真实宽 ÷ 当前显示宽（每次现算，所以窗口缩放后也准） */
 const fitScale = computed(() => {
@@ -114,6 +137,14 @@ onBeforeUnmount(destroyPz)
       />
     </div>
 
-    <div v-if="status === 'ready'" class="pv-hint">滚轮缩放 · 拖拽平移 · 双击 1:1</div>
+    <div
+      v-if="status === 'ready'"
+      ref="hintEl"
+      class="pv-hint"
+      :class="{ 'is-hidden': !hintShown }"
+      data-pv-hint
+    >
+      滚轮缩放 · 拖拽平移 · 双击 1:1
+    </div>
   </div>
 </template>

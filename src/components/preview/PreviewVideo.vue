@@ -89,12 +89,16 @@ async function openExternal(): Promise<void> {
       ></video>
       <!-- 控制条只在中栏浮层里给：右侧信息栏（compact）那条面板太窄，控件挤在一起反而难用，
            双击卡片到中栏才是完整播放器。但**点画面播放/暂停**两处都保留。
-           全屏目标是整个舞台（连控制条一起进全屏），不是 <video> 本身。 -->
+           全屏目标是整个舞台（连控制条一起进全屏），不是 <video> 本身。
+           auto-hide：静止 2.6s 或指针离开画面就淡出，别长期挡住画面（用户反馈）。
+           hover-target 传舞台而不是控制条自己 —— 指针在画面上任意处一动就该把它叫回来。 -->
       <PreviewPlayerBar
         v-if="!compact"
         class="pv-bar-floating"
         :el="videoEl"
         :fullscreen-target="stageEl"
+        :hover-target="stageEl"
+        auto-hide
         show-rate
       />
     </div>

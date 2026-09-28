@@ -10,6 +10,7 @@
 //
 // 边界：这里只做**控制**，不碰播放策略 —— 能不能播由主进程判定 + 原生 `error` 兜底。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { useIdleHide } from './useIdleHide'
 
 const props = defineProps({
   /** 被控制的媒体元素（由父组件持有，src 也由父组件设） */
@@ -17,7 +18,11 @@ const props = defineProps({
   /** 全屏按钮的目标元素；不给就不渲染全屏按钮 */
   fullscreenTarget: { type: Object as () => HTMLElement | null, default: null },
   /** 倍速按钮：在 1× / 1.5× / 2× 之间循环 */
-  showRate: { type: Boolean, default: false }
+  showRate: { type: Boolean, default: false },
+  /** 自动隐藏（视频浮层用）：静止/离开画面就淡出，别长期挡住画面。音频那条在流内，不需要 */
+  autoHide: { type: Boolean, default: false },
+  /** 悬停判定区，一般传「画面」（舞台元素）；不给就退回本节点的父级 */
+  hoverTarget: { type: Object as () => HTMLElement | null, default: null }
 })
 
 const playing = ref(false)
@@ -29,6 +34,30 @@ const rate = ref(1)
 const fullscreen = ref(false)
 /** 正在拖进度条：此时不要被 timeupdate 拉回去，否则拇指会跟指针打架 */
 const scrubbing = ref(false)
+
+/* ---- 自动隐藏（只给视频浮层开）----
+   规则与踩过的坑见 `useIdleHide.ts`。这里只补两条本组件专有的「绝不隐藏」：
+   ① 拖进度条中（`scrubbing`）—— 拇指跟着指针跑，条没了就没法看进度；
+   ② 指针正停在控制条上（`overBar`）—— 正要点播放键它自己没了最恼人。
+   `overBar` 用 enter/leave 判决（这俩不冒泡，只会因为真的进出而变），不依赖 mousemove：
+   指针在条上停着不动时也必须算「在用」。 */
+const barEl = ref<HTMLElement | null>(null)
+let overBar = false
+const { shown, reveal, reschedule } = useIdleHide({
+  enabled: () => props.autoHide,
+  root: () => barEl.value,
+  target: () => props.hoverTarget,
+  hold: () => scrubbing.value || overBar
+})
+
+function onBarEnter(): void {
+  overBar = true
+  reveal()
+}
+function onBarLeave(): void {
+  overBar = false
+  reschedule()
+}
 
 function sync(): void {
   const el = props.el
@@ -89,6 +118,7 @@ function seekTo(clientX: number, track: HTMLElement): void {
 function onTrackDown(e: PointerEvent): void {
   const track = e.currentTarget as HTMLElement
   scrubbing.value = true
+  reveal()
   seekTo(e.clientX, track)
   // 先定位再尝试捕获指针：合成事件（自动化测试）没有活动指针，setPointerCapture 会抛，
   // 放在 seekTo 后面就不会把定位也一起带崩。
@@ -106,6 +136,7 @@ function onTrackUp(e: PointerEvent): void {
   const track = e.currentTarget as HTMLElement
   if (track.hasPointerCapture(e.pointerId)) track.releasePointerCapture(e.pointerId)
   sync()
+  reschedule() // 松手后重新开始静止计时（拖拽期间是锁住的）
 }
 
 function toggleMute(): void {
@@ -154,7 +185,15 @@ function fmt(sec: number): string {
 <template>
   <!-- @click.stop：控制条浮在画面里（视频那条是绝对定位在舞台上的），
        不拦住冒泡的话，点播放键/进度条会顺带触发外层的「点画面播放/暂停」。 -->
-  <div class="pp-bar" data-pp-bar @click.stop>
+  <div
+    ref="barEl"
+    class="pp-bar"
+    data-pp-bar
+    :class="{ 'is-hidden': !shown }"
+    @click.stop
+    @pointerenter="onBarEnter"
+    @pointerleave="onBarLeave"
+  >
     <button class="pp-btn" data-pp-play type="button" :title="playing ? '暂停' : '播放'" @click="togglePlay">
       <svg v-if="!playing" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M8 5.4v13.2L19 12z" />

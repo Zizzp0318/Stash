@@ -136,18 +136,32 @@
   opacity: 0.7;
   pointer-events: none;
 }
+/* 底部操作提示。
+   ⚠️ 配色**不能用主题文字色**：它压在用户图片上，亮度完全不可控 ——
+   曾经的 `var(--text-3)`（暗色主题的灰）配 half-transparent 黑底，在白绒毛这类亮图上
+   对比度直接归零，用户反馈「字看不清」。改成固定的「深色底 + 浅色字 + 投影」，
+   任何图（纯黑 / 纯白 / 中间调）上都读得清，与主题明暗无关。 */
 .pv-hint {
   position: absolute;
   left: 50%;
   bottom: 12px;
   transform: translateX(-50%);
   font-size: 11.5px;
-  color: var(--text-3);
-  background: rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(4px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   border-radius: 999px;
   padding: 4px 12px;
   pointer-events: none;
   white-space: nowrap;
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+/* 静止 / 离开画面后淡出（同播放控制条那套）：只用 opacity，不移除 DOM。
+   ⚠️ 隐藏态必须自己写全 transform，否则会覆盖掉上面的 translateX(-50%) 把提示甩到右边。 */
+.pv-hint.is-hidden {
+  opacity: 0;
+  transform: translate(-50%, 6px);
 }
 
 /* ---- 等待 / 提示态（派生中、不支持、出错、未接入）---- */
@@ -268,6 +282,14 @@
   backdrop-filter: blur(10px);
   color: var(--text-1);
   font-size: 11.5px;
+  transition: opacity 0.22s ease, transform 0.22s ease;
+}
+/* 自动隐藏（视频浮层）：淡出并让出点击 —— 隐藏后点画面依然是「播放 / 暂停」。
+   用 opacity 而不是 display / v-if：控件不重挂载，隐藏与淡入之间位置、状态都不跳。 */
+.pp-bar.is-hidden {
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
 }
 .pp-btn {
   flex: 0 0 auto;

@@ -8,10 +8,14 @@
 //
 // P2 覆盖（渲染层中栏浮层）：
 //   U2 浮层       —— 双击打开 / 单击不打开 / Esc 关闭 / ←→ 切换 / 滚轮缩放 / 不压住右侧信息栏
+//   U2 卡片       —— 缩略图右上角的类型角标（图片/视频/音频/文本）与素材类型一致、不撑高卡片
+//   U2 缩略图     —— 缩略图缺失（404）时渲染层会补生成并自动重试
 //
 // P3 覆盖（视频与音频）：
 //   U 真实播放    —— mp4 / mkv 直出可播可 seek；avi 转码后可播可 seek；wav 可播可 seek
 //   U 控制条      —— 自绘播放条（PreviewPlayerBar）的版式与「点进度条 seek」
+//   U 自动隐藏    —— 视频浮层那条静止/离开画面就淡出，指针一动就回来，且隐藏时不再挡点击
+//   U 图片提示    —— 底部操作提示「浅字 + 深底」压在亮图上也读得清，且静止后自动淡出
 //
 // P4 覆盖（文本读写）：
 //   S5 文本读写   —— UTF-8 / 真 GBK 字节兜底 / 落盘与索引同步 / 陈旧 mtime 被拒 / 非文本与超限被拒
@@ -31,7 +35,7 @@
 //     自动降级处理，不用再记参数；根因与实测数据见 main.ts 顶部那段注释。）
 import { app, type BrowserWindow } from 'electron'
 import { spawn } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
@@ -473,6 +477,95 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     const firstName = nameOf(firstId)
     const secondName = nameOf(orderIds[pick + 1])
 
+    // ---- U2 缩略图类型角标：分得清图片 / 视频 / 音频 / 文本 ----
+    // 用户反馈「预览图和预览视频没有标识」：视频缩略图就是某一帧的画面，跟照片一样，
+    // 而原先唯一的线索是右下的**时长**，那玩意儿是异步探测回写的 —— 刚导入、还没探完的视频
+    // 连时长都没有，整屏就彻底分不出来。所以这里断言角标**由 type 直接渲染**，且不依赖任何异步字段。
+    {
+      interface BadgeProbe {
+        ok: boolean
+        n: number
+        mismatch: string[]
+        labels: string[]
+        pe: string
+        pos: string
+        inside: number
+        overflow: number
+      }
+      const cardIds = await js<number[]>('[...document.querySelectorAll(".card")].map((c) => Number(c.dataset.id))')
+      const wantType: Record<number, string> = {}
+      for (const id of cardIds) wantType[id] = typeOf(id)
+      const b = await js<BadgeProbe>(
+        '(async () => {' +
+        ' const empty = { ok: false, n: 0, mismatch: [], labels: [], pe: "", pos: "", inside: 0, overflow: 0 };' +
+        ' const cards = [...document.querySelectorAll(".card")];' +
+        ' if (!cards.length) return empty;' +
+        ' const want = ' + JSON.stringify(wantType) + ';' +
+        ' const LBL = { image: "图片", video: "视频", audio: "音频", text: "文本" };' +
+        ' const labels = []; const mismatch = [];' +
+        ' let inside = 0, overflow = 0, pe = "", pos = "";' +
+        ' for (const c of cards) {' +
+        '   const el = c.querySelector(".thumb-type");' +
+        '   if (!el) { mismatch.push(c.dataset.id + ":none"); continue; }' +
+        '   const t = el.dataset.thumbType;' +
+        '   const txt = el.textContent.trim();' +
+        // ⚠️ 必须比**可见文字**，不能只比 data 属性：模板里 label 与 data-thumb-type
+        // 是两处独立的表达式，只比 data 属性的话「标签写错但属性对」会漏过去。
+        '   if (t !== want[c.dataset.id] || txt !== LBL[want[c.dataset.id]]) {' +
+        '     mismatch.push(c.dataset.id + ": " + t + "/" + txt + " 应为 " + want[c.dataset.id]);' +
+        '   }' +
+        '   labels.push(txt);' +
+        '   const st = getComputedStyle(el);' +
+        '   pe = st.pointerEvents; pos = st.position;' +
+        '   const tr = c.querySelector(".thumb").getBoundingClientRect();' +
+        '   const br = el.getBoundingClientRect();' +
+        '   if (br.left >= tr.left - 0.5 && br.right <= tr.right + 0.5 &&' +
+        '       br.top >= tr.top - 0.5 && br.bottom <= tr.bottom + 0.5) inside++; else overflow++;' +
+        ' }' +
+        ' return { ok: true, n: cards.length, mismatch, labels, pe, pos, inside, overflow };' +
+        '})()')
+      const LBL: Record<string, string> = { image: '图片', video: '视频', audio: '音频', text: '文本' }
+      const expect = [...new Set(Object.values(wantType))].map((t) => LBL[t] ?? t).sort()
+      check('U2 每张卡的角标与素材类型一一对应（没有漏标 / 错标）',
+        b.ok && b.n > 0 && b.mismatch.length === 0,
+        'n=' + b.n + ' 不符=' + JSON.stringify(b.mismatch))
+      check('U2 角标文案覆盖本库全部类型',
+        JSON.stringify([...new Set(b.labels)].sort()) === JSON.stringify(expect),
+        '得到=' + JSON.stringify([...new Set(b.labels)].sort()) + ' 期望=' + JSON.stringify(expect))
+      check('U2 角标绝对定位且不拦点击（不撑高卡片、不影响拖拽）',
+        b.ok && b.pos === 'absolute' && b.pe === 'none', 'pos=' + b.pos + ' pe=' + b.pe)
+      check('U2 角标不溢出缩略图', b.ok && b.overflow === 0 && b.inside === b.n,
+        'inside=' + b.inside + '/' + b.n)
+    }
+
+    // ---- U2 缩略图 404 自愈：磁盘上删掉缩略图 → <img> 必然 404 → 渲染层补生成 + 重试 ----
+    // 背景：并发写同一张占位图会失败（见 thumbs.ts），个别素材当时根本没生成缩略图，
+    // 而 onImgErr 原先只隐藏不重试 → 卡片永久灰着，要等下次开库 backfill。
+    // 这条兜底保证「不管什么原因缺文件，都能当场补回来」，所以直接删真文件来验。
+    {
+      const healId = orderIds.find((id) => id !== vanishId) ?? orderIds[0]
+      const healHash = q<{ content_hash: string }>('SELECT content_hash FROM assets WHERE id=?', healId).content_hash
+      const thumbAbs = join(lib.path, '.thumbs', healHash, 'grid.webp')
+      if (existsSync(thumbAbs)) unlinkSync(thumbAbs)
+      const r = await js<{ ok: boolean; srcChanged: boolean; loaded: boolean }>(
+        '(async () => {' +
+        ' const card = document.querySelector(\'.card[data-id="' + healId + '"]\');' +
+        ' const img = card && card.querySelector("img");' +
+        ' if (!img) return { ok: false, srcChanged: false, loaded: false };' +
+        ' const before = img.src;' +
+        ' img.src = before + "&bust=" + Date.now();' + // 指向刚被删掉的那份 → 真的 404
+        ' const t0 = Date.now();' +
+        ' while (Date.now() - t0 < 8000) {' +
+        '   if (img.complete && img.naturalWidth > 0) break;' +
+        '   await new Promise((r) => setTimeout(r, 150));' +
+        ' }' +
+        ' return { ok: true, srcChanged: img.src !== before, loaded: img.naturalWidth > 0 };' +
+        '})()')
+      check('U2 缩略图缺失时渲染层会补生成并自动重试（不再永久灰）',
+        r.ok && r.srcChanged === true && r.loaded === true,
+        JSON.stringify(r) + ' onDisk=' + existsSync(thumbAbs))
+    }
+
     const fire = (id: number, type: string): Promise<unknown> =>
       js('document.querySelector(\'.card[data-id="' + id + '"]\').dispatchEvent(new MouseEvent(\'' + type + '\', { bubbles: true }))')
 
@@ -794,6 +887,139 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       await new Promise((r) => setTimeout(r, 800))
       await capture('shot-preview-video.png')
       check('U 视频预览里有自绘控制条', vOk)
+      await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
+    }
+
+    // ---- U 控制条自动隐藏：静止 / 离开画面就淡出，别长期挡住画面 ----
+    // 读 opacity 而不是「元素在不在」：隐藏走的就是 opacity + pointer-events，DOM 必须一直在。
+    {
+      // 上一段结尾刚派发过 Esc，等浮层真的关干净再开，避免新旧两次打开互相踩
+      await new Promise((r) => setTimeout(r, 500))
+      interface BarAutoHide {
+        ok: boolean
+        opening: string
+        afterIdle: string
+        hitsAtIdle: string
+        afterMove: string
+        afterLeave: string
+      }
+      const r = await js<BarAutoHide>(
+        '(async () => {' +
+        ' const empty = { ok: false, opening: "?", afterIdle: "?", hitsAtIdle: "?", afterMove: "?", afterLeave: "?" };' +
+        ' const card = document.querySelector(\'.card[data-id="' + mp4Id + '"]\');' +
+        ' if (!card) return empty;' +
+        ' card.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));' +
+        ' const t0 = Date.now(); let bar = null;' +
+        ' while (Date.now() - t0 < 15000) {' +
+        '   bar = document.querySelector(".pv-video [data-pp-bar]");' +
+        '   if (bar) break;' +
+        '   await new Promise((r) => setTimeout(r, 120));' +
+        ' }' +
+        ' const stage = document.querySelector(".pv-video [data-pv-video-stage]");' +
+        ' if (!bar || !stage) return empty;' +
+        ' const st = () => getComputedStyle(bar);' +
+        ' const opening = st().opacity;' +
+        // 静止 3.4s（阈值 2.6s + 0.22s 过渡）→ 应该已经淡出，且不再拦点击
+        ' await new Promise((r) => setTimeout(r, 3400));' +
+        ' const afterIdle = st().opacity;' +
+        ' const hitsAtIdle = st().pointerEvents;' +
+        // 指针在**画面**上动一下（不是非摸到控制条那条）→ 立刻回来，等过渡走完再看
+        ' stage.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 7, isPrimary: true }));' +
+        ' await new Promise((r) => setTimeout(r, 500));' +
+        ' const afterMove = st().opacity;' +
+        // 离开画面 → 不等静止计时，直接收起
+        ' stage.dispatchEvent(new MouseEvent("mouseleave", { bubbles: false }));' +
+        ' await new Promise((r) => setTimeout(r, 400));' +
+        ' const afterLeave = st().opacity;' +
+        ' return { ok: true, opening, afterIdle, hitsAtIdle, afterMove, afterLeave };' +
+        '})()')
+      check('U 控制条自动隐藏：一打开是可见的（不是一开始就藏着）',
+        r.ok && r.opening === '1', JSON.stringify(r))
+      check('U 控制条自动隐藏：静止后淡出且不再挡点击',
+        r.ok && r.afterIdle === '0' && r.hitsAtIdle === 'none', JSON.stringify(r))
+      check('U 控制条自动隐藏：指针在画面上动一下立刻回来',
+        r.ok && r.afterMove === '1', JSON.stringify(r))
+      check('U 控制条自动隐藏：指针离开画面立刻收起',
+        r.ok && r.afterLeave === '0', JSON.stringify(r))
+
+      // 此刻浮层还开着、控制条已收起 —— 留一张「干净画面」的图复核（Esc 挪到这里之后发，
+      // 就是为了别把浮层提前关掉）
+      await capture('shot-preview-autohide.png')
+      await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
+    }
+
+    // ---- U 图片底部操作提示：配色必须压在任意图上都读得清 + 静止自动淡出 ----
+    // 用户反馈过「图片和提示重叠，字看不清」：原来是主题暗色字 `var(--text-3)` 配半透明黑底，
+    // 压在亮图上对比度归零。所以这里**直接断言配色**（浅字 + 深底 + 足够不透明），
+    // 而不只是断言元素存在 —— 只断言存在的话这个 bug 照样全绿。
+    {
+      interface HintLook {
+        ok: boolean
+        color: string
+        bg: string
+        visible: string
+      }
+      const look = await js<HintLook>(
+        '(async () => {' +
+        ' const empty = { ok: false, color: "", bg: "", visible: "" };' +
+        ' const card = document.querySelector(\'.card[data-id="' + pngId + '"]\');' +
+        ' if (!card) return empty;' +
+        ' card.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));' +
+        ' const t0 = Date.now(); let hint = null;' +
+        ' while (Date.now() - t0 < 15000) {' +
+        '   hint = document.querySelector(".pv-image [data-pv-hint]");' +
+        '   if (hint) break;' +
+        '   await new Promise((r) => setTimeout(r, 120));' +
+        ' }' +
+        ' if (!hint) return empty;' +
+        ' const st = getComputedStyle(hint);' +
+        ' return { ok: true, color: st.color, bg: st.backgroundColor, visible: st.opacity };' +
+        '})()')
+
+      const px = (s: string): number[] => {
+        const m = /rgba?\(([^)]+)\)/.exec(s)
+        return (m?.[1] ?? '').split(',').map((v) => Number(v.trim()))
+      }
+      const fg = px(look.color)
+      const bg = px(look.bg)
+      const fgMin = Math.min(...fg.slice(0, 3))
+      const bgAlpha = bg.length > 3 ? bg[3] : 1
+      const bgMax = Math.max(...bg.slice(0, 3))
+      check('U 图片提示：出现时可见', look.ok && look.visible === '1', JSON.stringify(look))
+      check('U 图片提示：浅色字 + 深色不透明底（压在亮图上也读得清）',
+        look.ok && fg.slice(0, 3).every((v) => v >= 200) && bgMax <= 90 && bgAlpha >= 0.5,
+        'fg=' + look.color + ' min=' + fgMin + ' bg=' + look.bg + ' max=' + bgMax + ' alpha=' + bgAlpha)
+
+      // 版式这种看得见的东西留一张图（此刻提示还在亮着）
+      await capture('shot-preview-hint.png')
+
+      interface HintIdle {
+        ok: boolean
+        afterIdle: string
+        hitsAtIdle: string
+        afterMove: string
+      }
+      const idle = await js<HintIdle>(
+        '(async () => {' +
+        ' const empty = { ok: false, afterIdle: "?", hitsAtIdle: "?", afterMove: "?" };' +
+        ' const hint = document.querySelector(".pv-image [data-pv-hint]");' +
+        ' const stage = document.querySelector(".pv-image [data-pv-stage]");' +
+        ' if (!hint || !stage) return empty;' +
+        ' const st = () => getComputedStyle(hint);' +
+        ' await new Promise((r) => setTimeout(r, 3400));' +
+        ' const afterIdle = st().opacity;' +
+        ' const hitsAtIdle = st().pointerEvents;' +
+        ' stage.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 9, isPrimary: true }));' +
+        ' await new Promise((r) => setTimeout(r, 500));' +
+        ' const afterMove = st().opacity;' +
+        ' return { ok: true, afterIdle, hitsAtIdle, afterMove };' +
+        '})()')
+      check('U 图片提示：静止后自动淡出（不再压在图上）',
+        idle.ok && idle.afterIdle === '0' && idle.hitsAtIdle === 'none', JSON.stringify(idle))
+      check('U 图片提示：指针动一下立刻回来', idle.ok && idle.afterMove === '1', JSON.stringify(idle))
+
       await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
       await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
     }

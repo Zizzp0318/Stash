@@ -319,16 +319,6 @@ mark {
   font-variant-numeric: tabular-nums;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.card .ai-badge {
-  position: absolute; top: 8px; right: 8px;
-  width: 18px; height: 18px;
-  border-radius: 5px;
-  background: rgba(24,26,28,0.72);
-  border: 1px solid var(--accent-border);
-  display: grid; place-items: center;
-  color: var(--accent);
-}
-.card .ai-badge svg { width: 10px; height: 10px; }
 .card .fav {
   position: absolute; top: 8px; left: 8px;
   width: 18px; height: 18px;
@@ -336,6 +326,23 @@ mark {
   display: grid; place-items: center;
 }
 .card .fav svg { width: 13px; height: 13px; }
+/* 类型角标（图片 / 视频 / 音频 / 文本）：右上角，与左上角的星标、右下的时长错开。
+   视频缩略图就是「某一帧的画面」，跟照片长得一样 —— 没有这个角标只能靠时长认，
+   而时长是异步探测出来的，刚导入的那批根本还没有。
+   ⚠️ 必须 absolute + pointer-events:none：它只是标识，不能撑高卡片、也不能拦住卡片的点击与拖拽。 */
+.card .thumb-type {
+  position: absolute; top: 8px; right: 8px;
+  display: inline-flex; align-items: center; gap: 3px;
+  height: 18px; padding: 0 6px;
+  border-radius: 9px;
+  font-size: 10px; line-height: 1;
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(24, 26, 28, 0.72);
+  pointer-events: none;
+}
+/* ⚠️ 选择器必须比 `.card .thumb svg`（它把 svg 拉成 100% 宽高）更具体 */
+.card .thumb-type .tt-ico { display: block; width: 11px; height: 11px; }
+.card .thumb-type .tt-ico svg { width: 11px; height: 11px; display: block; }
 .card .video-len {
   position: absolute; bottom: 8px; right: 8px;
   font-size: 10px;
