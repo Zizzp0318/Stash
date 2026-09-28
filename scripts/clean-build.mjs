@@ -30,12 +30,15 @@ function removeDir(dir) {
 console.log(`[clean-build] out/          → ${removeDir(OUT)}`)
 console.log(`[clean-build] win-unpacked  → ${removeDir(STAGE)}`)
 
-// 旧安装包/便携包一起清掉，否则用户分不清哪份是刚打的（文件很少，直接 unlink 不会触发守卫）。
-// 顺带兜底 electron-builder 的中间产物：NSIS 的压缩包（*.nsis.7z）与卸载器 stub
-// （*.__uninstaller.exe）—— 它在收尾时本来会自己删，但本机这层守卫会拦掉（同一轮累计超阈值），
-// 于是每次打包都会剩两个几百 MB 的残渣，留着纯占地方。
+// 旧安装包/便携包清理 —— **只在显式传 --with-packages 时才做**。
+//
+// 为什么默认不删：只想清 out/ 重建一次时，把用户刚打好的安装包一起删掉是很糟的体验
+// （本项目真踩过：为了跑一次冒烟而 clean，结果 dist 里的 setup.exe / portable.zip 没了）。
+// 只有 `npm run package:win` 才带这个参数 —— 那一步的目的正是「重新生成一套干净的产物」，
+// 留着上一版反而会让人分不清哪份是刚打的。
+const withPackages = process.argv.includes('--with-packages')
 let pkgs = 0
-if (existsSync(DIST)) {
+if (withPackages && existsSync(DIST)) {
   for (const f of readdirSync(DIST)) {
     if (!/\.(exe|zip|blockmap)$/i.test(f) && !/\.nsis\.7z$/i.test(f)) continue
     try {
@@ -45,5 +48,7 @@ if (existsSync(DIST)) {
       /* 被占用就留着 */
     }
   }
+  console.log(`[clean-build] 旧安装包     → 清理 ${pkgs} 个（含 NSIS 中间产物）`)
+} else {
+  console.log('[clean-build] 旧安装包     → 保留（想一起清就加 --with-packages）')
 }
-console.log(`[clean-build] 旧安装包     → 清理 ${pkgs} 个`)
