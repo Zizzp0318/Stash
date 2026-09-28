@@ -189,7 +189,7 @@
 }
 .pv-btn:hover { background: var(--bg-hover); border-color: var(--accent-border); }
 
-/* ---- 视频 / 音频（media-chrome 只做控制条，解码仍是 Chromium）---- */
+/* ---- 视频 / 音频（控制条是自绘的，解码仍是 Chromium）---- */
 .pv-video {
   position: relative;
   flex: 1;
@@ -197,27 +197,27 @@
   min-height: 0;
   display: flex;
 }
-/* 进度条用应用强调色，其余沿用 media-chrome 的深色默认皮肤 */
-.pv-player {
+.pv-video-stage {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 0;
-  width: 100%;
+  display: flex;
   background: #000;
   border-radius: var(--radius);
   overflow: hidden;
-  --media-range-bar-color: var(--accent);
-  --media-range-thumb-background: var(--accent);
-  /* 隐掉「已缓冲区间」：本地文件是**瞬间就缓冲完**的，这条指示器永远铺满整条，
-     默认色又是 40% 白 —— 看上去就是一根横贯播放器的亮线（实测像素 #8C8D8F）。
-     对本地文件它不承载任何信息，直接透明掉。
-     注意变量名是 `--media-time-range-buffered-color`，不是 `--media-range-buffered-*`。 */
-  --media-time-range-buffered-color: transparent;
 }
-.pv-player video {
+.pv-video-el {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+/* 视频的控制条浮在画面底部 14px 处（Serpent 同款） */
+.pv-bar-floating {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 14px;
 }
 
 .pv-audio {
@@ -245,53 +245,116 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 音频元素本身没有画面，不占位（display:none 不影响播放） */
+.pv-audio-el { display: none; }
+/* 音频的控制条在流内居中 */
+.pv-bar-inline { width: min(560px, 100%); }
 
-/* 胶囊形控制条：把 media-chrome 默认那条「黑底、且只有内容宽」的条子整个换掉。
-   ⚠️ 两条必须覆盖的默认行为（就是「错位」的来源）：
-   ① `media-control-bar` 默认只有内容宽 —— 不撑满的话，右侧会露出一截容器底色；
-   ② 它自带深色底 —— 不清掉的话会看到一条与容器不一致的色块。 */
-.pv-player-audio {
-  flex: 0 0 auto;
-  width: min(560px, 100%);
-  height: auto;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-soft);
-  border-radius: 999px;
-  padding: 4px 16px;
-  overflow: visible;
-  /* 整条控制器的皮肤。不覆盖的话 media-chrome 会用它自己的默认配色：
-     轨道是一条刺眼的白线、图标是纯白 —— 放在这个深色界面里很突兀。 */
-  --media-control-height: 32px;
-  --media-control-background: transparent;
-  --media-control-hover-background: var(--bg-hover);
-  --media-icon-color: var(--text-2);
-  --media-text-color: var(--text-2);
-  /* 轨道压得很淡：它比胶囊底色只亮一点点就够了，否则会变成横贯整条的一根亮线 */
-  --media-range-track-background: rgba(255, 255, 255, 0.09);
-  --media-range-track-height: 3px;
-  --media-range-track-border-radius: 2px;
-  --media-range-bar-color: var(--accent);
-  --media-range-thumb-background: var(--accent);
-  --media-range-thumb-width: 10px;
-  --media-range-thumb-height: 10px;
-}
-
-/* 播放键是这条上唯一的主操作，给它最亮的颜色 */
-.pv-player-audio media-play-button { --media-icon-color: var(--text-1); }
-.pv-player-audio media-control-bar {
+/* ============ 自绘播放控制条（视频 / 音频共用）============
+   手写而不是引库的理由见 PreviewPlayerBar.vue 顶部注释。 */
+.pp-bar {
   display: flex;
   align-items: center;
-  gap: 2px;
-  width: 100%;
-  padding: 0;
-  background: transparent;
+  gap: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  /* 半透明 + 模糊：浮在画面上时既能看清控件，又不挡住内容 */
+  background: color-mix(in srgb, var(--bg-raised) 78%, transparent);
+  backdrop-filter: blur(10px);
+  color: var(--text-1);
+  font-size: 11.5px;
 }
-/* 进度条吃掉中间的剩余宽度，时间与按钮固定在两端 */
-.pv-player-audio media-time-range { flex: 1 1 auto; min-width: 0; }
-.pv-player-audio media-time-display {
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
+.pp-btn {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-1);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.pp-btn svg { width: 16px; height: 16px; }
+.pp-btn:hover { background: var(--accent-soft); }
+.pp-rate {
+  width: auto;
+  padding: 0 6px;
   color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.pp-time {
+  flex: 0 0 auto;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 进度条：可点区域 14px 高（好点），可见轨道只有 4px（好看） */
+.pp-track {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 14px;
+  cursor: pointer;
+  touch-action: none;
+}
+.pp-track::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 0;
+  right: 0;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  transform: translateY(-50%);
+}
+.pp-track-fill {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.pp-track-thumb {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.pp-volume {
+  flex: 0 0 auto;
+  width: 68px;
+  height: 14px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.pp-volume::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+}
+.pp-volume::-webkit-slider-thumb {
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 /* ---- 文本 ---- */
@@ -412,13 +475,13 @@
 /* 音频 / 文本没有宽高比，给个固定高度（视频仍走 aspect-ratio） */
 .detail-preview.is-fixed { height: 210px; }
 
-/* 窄面板下的压缩形态：控制条压扁、封面缩小 */
-.pv-video.compact .pv-player { --media-control-height: 30px; }
+/* 窄面板下的压缩形态 */
 .pv-audio.compact .pv-audio-body { gap: 8px; padding: 0 10px; }
 .pv-audio.compact .pv-audio-glyph svg { width: 26px; height: 26px; }
 .pv-audio.compact .pv-audio-name { font-size: 12px; }
-.pv-audio.compact .pv-player-audio { width: 100%; padding: 2px 8px; --media-control-height: 28px; }
-.pv-audio.compact .pv-player-audio media-time-display { font-size: 11px; }
+.pp-bar.compact { gap: 6px; padding: 3px 8px; font-size: 11px; }
+.pp-bar.compact .pp-btn { width: 22px; height: 22px; }
+.pp-bar.compact .pp-btn svg { width: 14px; height: 14px; }
 .pv-text.compact { gap: 6px; }
 .pv-text.compact .ptext-editor,
 .pv-text.compact .ptext-md,

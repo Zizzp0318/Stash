@@ -1,18 +1,18 @@
 <script setup lang="ts">
-// 音频预览：原生 <audio> + media-chrome 控制条，配一块封面/占位区。
+// 音频预览：原生 <audio> + 自绘控制条（与视频同一套组件）。
 //
 // 与视频同一套约定（见 PreviewVideo.vue）：不用 canPlayType 分支，
 // 只在 `error` 且 code === 4（SRC_NOT_SUPPORTED）时给「用系统播放器打开」的出口；
 // 需要派生（wma / ape 等）时先显示转码进度。
 import { computed, ref, watch, type PropType } from 'vue'
-import './media-chrome'
 import type { StashAssetRow } from '../../env'
 import { useAssetStore } from '../../stores/assets'
+import PreviewPlayerBar from './PreviewPlayerBar.vue'
 import { usePreviewMedia } from './usePreviewMedia'
 
 const props = defineProps({
   asset: { type: Object as PropType<StashAssetRow>, required: true },
-  /** 右侧信息栏用：面板很窄，封面缩小、控制条压扁 */
+  /** 右侧信息栏用：面板很窄，字形缩小、控制条压扁 */
   compact: { type: Boolean, default: false }
 })
 
@@ -68,25 +68,16 @@ async function openExternal(): Promise<void> {
       </div>
       <div class="pv-audio-name" :title="asset.name">{{ asset.name }}</div>
 
-      <!-- 一行搞定：播放 / 进度（撑满剩余宽度）/ 时间 / 静音。
-           刻意不放音量滑杆与单独的时长行 —— 前者在这种「看一眼」的场景里用不上，
-           后者会和右侧的「当前 / 总时长」重复。 -->
-      <media-controller audio class="pv-player pv-player-audio">
-        <audio
-          ref="audioEl"
-          slot="media"
-          :src="url ?? undefined"
-          preload="metadata"
-          data-pv-audio
-          @error="onError"
-        ></audio>
-        <media-control-bar>
-          <media-play-button></media-play-button>
-          <media-time-range></media-time-range>
-          <media-time-display showduration></media-time-display>
-          <media-mute-button></media-mute-button>
-        </media-control-bar>
-      </media-controller>
+      <!-- 音频没有画面，元素本身不需要占位 -->
+      <audio
+        ref="audioEl"
+        class="pv-audio-el"
+        :src="url ?? undefined"
+        preload="metadata"
+        data-pv-audio
+        @error="onError"
+      ></audio>
+      <PreviewPlayerBar class="pv-bar-inline" :el="audioEl" :compact="compact" />
     </div>
   </div>
 </template>

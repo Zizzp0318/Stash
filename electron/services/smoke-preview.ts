@@ -11,6 +11,7 @@
 //
 // P3 覆盖（视频与音频）：
 //   U 真实播放    —— mp4 / mkv 直出可播可 seek；avi 转码后可播可 seek；wav 可播可 seek
+//   U 控制条      —— 自绘播放条（PreviewPlayerBar）的版式与「点进度条 seek」
 //
 // P4 覆盖（文本读写）：
 //   S5 文本读写   —— UTF-8 / 真 GBK 字节兜底 / 落盘与索引同步 / 陈旧 mtime 被拒 / 非文本与超限被拒
@@ -726,50 +727,73 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     const wavPlay = await playCheck(wavId, 'audio')
     check('U 音频 wav 可播且可 seek', wavPlay.ok && wavPlay.seeked === true, JSON.stringify(wavPlay))
 
-    // ---- U 音频播放器版式：控制条要撑满、控件要垂直居中对齐 ----
-    // 用户反馈「播放栏和大小错位」：media-chrome 的 control-bar 默认只有内容宽、
-    // 还自带深色底，于是右侧露出一截容器底色。这两条断言把版式钉住。
+    // ---- U 自绘播放控制条：版式 + 点进度条 seek ----
+    // 用户反馈过「播放栏和大小错位」，所以版式要钉住；进度条拖拽是新写的交互，也要验。
     {
       interface BarLayout {
         ok: boolean
-        playerW: number
         barW: number
+        trackW: number
         spread: number
-        centers: number[]
+        noOverflow: boolean
+        seekedRatio: number
       }
       const m = await js<BarLayout>(
         '(async () => {' +
-        ' const empty = { ok: false, playerW: 0, barW: 0, spread: 0, centers: [] };' +
+        ' const empty = { ok: false, barW: 0, trackW: 0, spread: 0, noOverflow: false, seekedRatio: -1 };' +
         ' const card = document.querySelector(\'.card[data-id="' + wavId + '"]\');' +
         ' if (!card) return empty;' +
         ' card.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));' +
-        ' const t0 = Date.now(); let p = null;' +
+        ' const t0 = Date.now(); let bar = null;' +
         ' while (Date.now() - t0 < 15000) {' +
-        '   p = document.querySelector(".pv-player-audio");' +
-        '   if (p) break;' +
+        '   bar = document.querySelector(".pv-audio [data-pp-bar]");' +
+        '   if (bar) break;' +
         '   await new Promise((r) => setTimeout(r, 120));' +
         ' }' +
-        ' if (!p) return empty;' +
-        ' await new Promise((r) => setTimeout(r, 400));' +
-        ' const bar = p.querySelector("media-control-bar");' +
         ' if (!bar) return empty;' +
-        ' const pr = p.getBoundingClientRect();' +
+        ' const media = document.querySelector(".pv-audio [data-pv-audio]");' +
+        ' const t1 = Date.now();' +
+        ' while (Date.now() - t1 < 15000) {' +
+        '   if (media && media.readyState >= 1 && media.duration > 0) break;' +
+        '   await new Promise((r) => setTimeout(r, 120));' +
+        ' }' +
         ' const br = bar.getBoundingClientRect();' +
-        ' const centers = [...bar.querySelectorAll("media-play-button, media-time-range, media-time-display, media-mute-button")]' +
-        '   .map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0)' +
-        '   .map((r) => r.top + r.height / 2);' +
+        ' const kids = [...bar.children].map((el) => el.getBoundingClientRect());' +
+        ' const centers = kids.filter((r) => r.height > 0).map((r) => r.top + r.height / 2);' +
         ' const spread = centers.length ? Math.max(...centers) - Math.min(...centers) : 0;' +
+        ' const noOverflow = kids.every((r) => r.left >= br.left - 1 && r.right <= br.right + 1);' +
+        ' const track = bar.querySelector("[data-pp-track]");' +
+        ' const tr = track.getBoundingClientRect();' +
+        // 点进度条 60% 处 → currentTime 应该跳到 60% 附近
+        ' const x = tr.left + tr.width * 0.6;' +
+        ' track.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true,' +
+        '   pointerId: 1, isPrimary: true, clientX: x, clientY: tr.top + tr.height / 2 }));' +
+        ' await new Promise((r) => setTimeout(r, 300));' +
+        ' const seekedRatio = media && media.duration > 0 ? +(media.currentTime / media.duration).toFixed(2) : -1;' +
         // 注意：这里**不要**关浮层，下面还要截图留证
-        ' return { ok: true, playerW: Math.round(pr.width), barW: Math.round(br.width),' +
-        '          spread: Math.round(spread), centers: centers.map((c) => Math.round(c)) };' +
+        ' return { ok: true, barW: Math.round(br.width), trackW: Math.round(tr.width),' +
+        '          spread: Math.round(spread), noOverflow, seekedRatio };' +
         '})()')
-      check('U 音频控制条撑满容器（不错位）',
-        m.ok && m.barW >= m.playerW * 0.9 && m.barW <= m.playerW, JSON.stringify(m))
-      check('U 音频控件垂直居中对齐', m.ok && m.spread <= 2,
-        'spread=' + m.spread + 'px centers=' + JSON.stringify(m.centers))
+      check('U 控制条：控件垂直居中对齐', m.ok && m.spread <= 2, JSON.stringify(m))
+      check('U 控制条：内容不溢出（不错位）', m.ok && m.noOverflow, JSON.stringify(m))
+      check('U 控制条：进度条占满中间剩余宽度', m.ok && m.trackW >= m.barW * 0.4,
+        'track=' + m.trackW + ' bar=' + m.barW)
+      check('U 控制条：点进度条可 seek', m.ok && Math.abs(m.seekedRatio - 0.6) <= 0.1,
+        'seekedRatio=' + m.seekedRatio + '（期望 ≈0.6）')
 
       // 版式这种事光靠数字看不全，留一张图（沿用项目里 shot-*.png 的惯例，已 gitignore）
       await capture('shot-preview-audio.png')
+      await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
+    }
+
+    // ---- 视频控制条（浮在画面底部的胶囊）也留一张图 ----
+    {
+      await js('document.querySelector(\'.card[data-id="' + mp4Id + '"]\').dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))')
+      const vOk = await waitFor("document.querySelector('.pv-video [data-pp-bar]')", 15000)
+      await new Promise((r) => setTimeout(r, 800))
+      await capture('shot-preview-video.png')
+      check('U 视频预览里有自绘控制条', vOk)
       await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
       await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
     }
