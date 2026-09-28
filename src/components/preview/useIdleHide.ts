@@ -16,6 +16,7 @@
 // ④ `hold` 是「绝不隐藏」的附加条件（正在拖进度条、指针正停在浮层上…）——
 //    正要点播放键它自己没了最恼人。
 import { onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
+import { useSettingsStore } from '../../stores/settings'
 
 export interface IdleHideOptions {
   /** 是否启用。返回 false 时完全不动（`shown` 恒为 true） */
@@ -24,7 +25,7 @@ export interface IdleHideOptions {
   root: () => HTMLElement | null
   /** 判定区（一般是被覆盖的画面）；不给就用 root 的父级 */
   target?: () => HTMLElement | null
-  /** 静止多久收起，默认 2600ms ≈ 主流播放器的控件淡出节奏 */
+  /** 静止多久收起；不传就用设置里的值（`preview.idleHideMs`，0 = 不自动隐藏） */
   idleMs?: number
   /** 附加的「绝不隐藏」条件 */
   hold?: () => boolean
@@ -42,7 +43,9 @@ export interface IdleHide {
 
 export function useIdleHide(opts: IdleHideOptions): IdleHide {
   const shown = ref(true)
-  const idleMs = opts.idleMs ?? 2600
+  const settings = useSettingsStore()
+  /** 现读：用户在设置里把延迟调了，下一次计时就该按新值走（不做 setup 期快照） */
+  const idleMs = (): number => opts.idleMs ?? settings.settings.preview.idleHideMs
   let timer: number | null = null
 
   function clearTimer(): void {
@@ -54,10 +57,12 @@ export function useIdleHide(opts: IdleHideOptions): IdleHide {
   function reschedule(): void {
     clearTimer()
     if (!opts.enabled() || opts.hold?.()) return
+    const ms = idleMs()
+    if (ms <= 0) return // 0 = 用户明确要求「不自动隐藏」
     timer = window.setTimeout(() => {
       timer = null
       shown.value = false
-    }, idleMs)
+    }, ms)
   }
   function reveal(): void {
     if (!opts.enabled()) return

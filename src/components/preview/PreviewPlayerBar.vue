@@ -11,6 +11,7 @@
 // 边界：这里只做**控制**，不碰播放策略 —— 能不能播由主进程判定 + 原生 `error` 兜底。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useIdleHide } from './useIdleHide'
+import { useSettingsStore } from '../../stores/settings'
 
 const props = defineProps({
   /** 被控制的媒体元素（由父组件持有，src 也由父组件设） */
@@ -25,6 +26,7 @@ const props = defineProps({
   hoverTarget: { type: Object as () => HTMLElement | null, default: null }
 })
 
+const settings = useSettingsStore()
 const playing = ref(false)
 const current = ref(0)
 const duration = ref(0)
@@ -76,6 +78,9 @@ function attach(): void {
   detach = []
   const el = props.el
   if (!el) return
+  // 初始音量按设置来：只在这里设（用户当场拖的音量不落盘，
+  // 换素材时按设置重置 —— 语义就是「初始」，而不是「记住上次」）
+  el.volume = settings.settings.preview.volume
   const events = [
     'play', 'pause', 'ended', 'timeupdate', 'durationchange', 'loadedmetadata',
     'volumechange', 'ratechange', 'seeking', 'seeked', 'progress'

@@ -8,11 +8,22 @@ import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { requireCurrent } from './library'
+import { getSettings } from './config'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
 
-const CONCURRENCY = 4
+/**
+ * 并发数与质量**每次用时现读设置**，不做模块级常量。
+ * 常量会在 import 时求值 —— 那时设置还没读、之后改了也不会变，
+ * 表现就是「设置里改了没反应」。`pump()` 是按次调用的，现读的开销可忽略。
+ */
+function concurrency(): number {
+  return getSettings().thumbs.concurrency
+}
+function quality(): number {
+  return getSettings().thumbs.quality
+}
 
 function thumbFile(hash: string, size: ThumbSize): string {
   return join(requireCurrent().path, '.thumbs', hash, `${size}.webp`)
@@ -40,14 +51,14 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
         // 不是 resize 选项 —— 写在这里既无效果又过不了类型检查，所以不写。
         // 动图在本项目走的是「取首帧」策略（见 preview.ts 的 IMG_NATIVE：gif 直出原文件）。
         .resize({ width: SIZES[size], height: SIZES[size], fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 82 })
+        .webp({ quality: quality() })
         .toFile(tmp)
     } else if (asset.type === 'video') {
       const frame = tmpPath(out, '.frame.png')
       await extractFrame(abs, frame)
       await sharp(frame)
         .resize({ width: SIZES[size], height: SIZES[size], fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 82 })
+        .webp({ quality: quality() })
         .toFile(tmp)
       try { unlinkSync(frame) } catch { /* ignore */ }
     } else {
@@ -172,7 +183,7 @@ async function generatePlaceholder(type: string): Promise<string> {
   const svg = type === 'audio'
     ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="#7FA8D9"><circle cx="140" cy="180" r="14"/><circle cx="190" cy="164" r="14"/><rect x="150" y="100" width="6" height="82" rx="3"/><rect x="200" y="84" width="6" height="82" rx="3"/></g></svg>`
     : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
-  const buf = await sharp(Buffer.from(svg)).webp().toBuffer()
+  const buf = await sharp(Buffer.from(svg)).webp({ quality: quality() }).toBuffer()
   const tmp = tmpPath(out)
   writeFileSync(tmp, buf)
   renameTmp(tmp, out) // 原子替换：失败也只可能留下临时文件，最终路径要么没有、要么是完整的
@@ -241,7 +252,7 @@ function broadcast(channel: string, data: unknown): void {
 }
 
 function pump(): void {
-  while (running < CONCURRENCY && queue.length > 0) {
+  while (running < concurrency() && queue.length > 0) {
     const job = queue.shift()!
     running++
     ensureOne(job.asset, job.size)

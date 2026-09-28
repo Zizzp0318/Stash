@@ -106,5 +106,22 @@ contextBridge.exposeInMainWorld('stash', {
   dialog: {
     pickFolder: () => ipcRenderer.invoke('dialog:pick-folder'),
     pickFiles: () => ipcRenderer.invoke('dialog:pick-files')
+  },
+  settings: {
+    get: () => ipcRenderer.invoke('settings:get'),
+    /** 可选值（质量档位、并发范围）—— 由主进程给，避免 UI 与校验各抄一份 */
+    choices: () => ipcRenderer.invoke('settings:choices'),
+    patch: (patch: unknown) => ipcRenderer.invoke('settings:patch', patch),
+    /** 偏好被（别的窗口/主进程）改动时通知过来 */
+    onChanged: (cb: (s: unknown) => void) => subscribe('settings:changed', cb)
+  },
+  cache: {
+    stats: () => ipcRenderer.invoke('cache:stats'),
+    clear: (kind: 'thumbs' | 'derived' | 'all') => ipcRenderer.invoke('cache:clear', { kind }),
+    reveal: () => ipcRenderer.invoke('cache:reveal')
+  },
+  app: {
+    info: () => ipcRenderer.invoke('app:info'),
+    openUserData: () => ipcRenderer.invoke('app:open-user-data')
   }
 })

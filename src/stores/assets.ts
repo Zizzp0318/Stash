@@ -1,12 +1,17 @@
 // 素材列表/筛选/选中/详情 + 导入进度状态
 import { defineStore } from 'pinia'
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { useLibraryStore } from './library'
-import type { StashAssetRow, StashAssetDetail, StashPrunedTag } from '../env'
+import { useSettingsStore, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from './settings'
+import type { StashAssetRow, StashAssetDetail, StashPrunedTag, StashCardFields } from '../env'
 
 const PAGE = 200
 
-/** 卡片下方常驻显示的字段开关 */
+/**
+ * 工具栏上「显示字段」的快捷开关。
+ * 注意它**不是** `settings.cardFields` 的全部：缩略图类型角标（typeBadge）也在偏好里，
+ * 但它属于浮层装饰而不是卡片下方那行信息，所以只在设置面板里给 —— 工具栏留 4 个高频的。
+ */
 export type CardField = 'name' | 'dims' | 'size' | 'time'
 export const CARD_FIELDS: Array<{ key: CardField; label: string }> = [
   { key: 'name', label: '文件名' },
@@ -15,53 +20,11 @@ export const CARD_FIELDS: Array<{ key: CardField; label: string }> = [
   { key: 'time', label: '导入时间' }
 ]
 
-const FIELD_STORE_KEY = 'stash.cardFields'
-
-/** 右侧信息栏是否收起（布局偏好，全局一份，不按库隔离） */
-const DETAIL_COLLAPSED_KEY = 'stash.detailCollapsed'
-
-/**
- * 瀑布视图缩放：滑块值 = 目标列宽（px），实际卡片宽度按容器撑满。
- * 上限刻意压低，避免放大到只剩一两列的大图。
- */
-export const VIEW_ZOOM_MIN = 140
-export const VIEW_ZOOM_MAX = 280
-export const VIEW_ZOOM_DEFAULT = 170
-const ZOOM_STORE_KEY = 'stash.viewZoom'
-
-function readViewZoom(): number {
-  try {
-    const n = Number(localStorage.getItem(ZOOM_STORE_KEY))
-    if (Number.isFinite(n) && n >= VIEW_ZOOM_MIN && n <= VIEW_ZOOM_MAX) return Math.round(n)
-  } catch {
-    /* 读取失败用默认值 */
-  }
-  return VIEW_ZOOM_DEFAULT
-}
-
-/** 右侧信息栏的收起状态（默认展开；只有明确存过 '1' 才收起） */
-function readDetailCollapsed(): boolean {
-  try {
-    return localStorage.getItem(DETAIL_COLLAPSED_KEY) === '1'
-  } catch {
-    return false
-  }
-}
-
-function readCardFields(): Record<CardField, boolean> {
-  const def: Record<CardField, boolean> = { name: true, dims: true, size: true, time: true }
-  try {
-    const raw = localStorage.getItem(FIELD_STORE_KEY)
-    if (!raw) return def
-    const saved = JSON.parse(raw) as Partial<Record<CardField, boolean>>
-    for (const { key } of CARD_FIELDS) if (typeof saved[key] === 'boolean') def[key] = saved[key] as boolean
-  } catch {
-    /* 读取失败用默认值 */
-  }
-  return def
-}
+// 视图缩放的上下限定义在 stores/settings.ts（滑块、设置面板、钳制同源），这里只做转出
+export { VIEW_ZOOM_MIN, VIEW_ZOOM_MAX }
 
 export const useAssetStore = defineStore('assets', () => {
+  const settings = useSettingsStore()
   const query = reactive({
     folderId: null as number | null,
     tagId: null as number | null,
@@ -123,25 +86,18 @@ export const useAssetStore = defineStore('assets', () => {
     noticeTimer = setTimeout(() => (importNotice.value = null), kind === 'error' ? 10000 : 5000)
   }
 
-  // 卡片下方常驻显示哪些字段（偏好持久化到 localStorage）
-  const cardFields = reactive(readCardFields())
+  // 卡片下方常驻显示哪些字段（偏好统一存在全局设置里，见 stores/settings.ts）
+  const cardFields = computed(() => settings.settings.cardFields)
   function toggleCardField(key: CardField): void {
-    cardFields[key] = !cardFields[key]
-    try {
-      localStorage.setItem(FIELD_STORE_KEY, JSON.stringify(cardFields))
-    } catch {
-      /* 写入失败忽略，仅本次会话生效 */
-    }
+    const next: Partial<StashCardFields> = {}
+    next[key] = !cardFields.value[key]
+    void settings.patch({ cardFields: next })
   }
 
-  // 瀑布视图缩放（目标列宽 px），
-  const viewZoom = ref(readViewZoom())
-  watch(viewZoom, (v) => {
-    try {
-      localStorage.setItem(ZOOM_STORE_KEY, String(v))
-    } catch {
-      /* 写入失败忽略 */
-    }
+  // 瀑布视图缩放（目标列宽 px）。可写 computed：滑块 v-model 直接写它，落盘交给设置
+  const viewZoom = computed({
+    get: () => settings.settings.viewZoom,
+    set: (v: number) => void settings.patch({ viewZoom: v })
   })
 
   /**
@@ -151,13 +107,9 @@ export const useAssetStore = defineStore('assets', () => {
    * 所以收起之后点素材也不会把它拉回来（渲染只看这个标志）。
    * 收起时整个面板不渲染：既省掉 detail 缩略图的预生成，也让中栏顺势占满宽度。
    */
-  const detailCollapsed = ref(readDetailCollapsed())
-  watch(detailCollapsed, (v) => {
-    try {
-      localStorage.setItem(DETAIL_COLLAPSED_KEY, v ? '1' : '0')
-    } catch {
-      /* 写入失败忽略，仅本次会话生效 */
-    }
+  const detailCollapsed = computed({
+    get: () => settings.settings.detailCollapsed,
+    set: (v: boolean) => void settings.patch({ detailCollapsed: v })
   })
   function toggleDetail(): void {
     detailCollapsed.value = !detailCollapsed.value

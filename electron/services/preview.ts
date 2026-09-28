@@ -28,6 +28,7 @@ import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
+import { getSettings } from './config'
 import { contentHash } from './importer'
 import { requireCurrent } from './library'
 import { ensureBatch } from './thumbs'
@@ -46,9 +47,18 @@ export interface PreviewRow {
 }
 
 /** 派生大图的最长边。2560 够 4K 屏全屏看，又不至于把上亿像素的 TIFF 撑爆内存 */
-export const PREVIEW_IMG_PX = 2560
+/**
+ * 图片派生的长边上限、文本预览上限：**每次用时现读设置**，不做模块级常量 ——
+ * 常量在 import 时就求值了，改设置永远不生效（`preview.ts` 是被 main 与多个服务 import 的，
+ * 那份快照会比用户改设置早得多）。
+ */
+export function maxImagePx(): number {
+  return getSettings().preview.maxImagePx
+}
 /** 文本预览/编辑的大小上限：超过就只读（避免把几百 MB 的日志读进渲染层）。P4 用 */
-export const TEXT_MAX_BYTES = 2 * 1024 * 1024
+export function textMaxBytes(): number {
+  return getSettings().preview.textMaxBytes
+}
 
 /** 浏览器能直接解码的图片格式（其余交给 sharp 派生） */
 const IMG_NATIVE = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg', 'ico'])
@@ -106,9 +116,22 @@ export function rowOf(id: number): PreviewRow {
   return row
 }
 
-/** 派生文件路径：与缩略图同住 `.thumbs/{hash}/`，按内容哈希天然共享 */
-export function derivedAbs(hash: string, ext: string): string {
-  return join(libPath(), '.thumbs', hash, `preview.${ext}`)
+/**
+ * 派生文件路径：与缩略图同住 `.thumbs/{hash}/`，按内容哈希天然共享。
+ * `tag` 是**把设置算进文件名**用的：图片派生的上限尺寸变了就该生成新文件，
+ * 否则会命中旧尺寸的缓存、用户看着像「改了没生效」。
+ */
+export function derivedAbs(hash: string, ext: string, tag = ''): string {
+  return join(libPath(), '.thumbs', hash, `preview${tag ? `-${tag}` : ''}.${ext}`)
+}
+
+/**
+ * 按「这次要哪种派生」算最终路径。
+ * serve / analyze(ready) / derive 三处**必须**走这一个函数，否则会各认一个文件名。
+ * 冒烟也用它（别自己拼路径，否则改了命名规则就会假红）。
+ */
+export function derivedPathFor(derive: DeriveKind | null, hash: string): string {
+  return derivedAbs(hash, derivedExtOf(derive), derive === 'image' ? String(maxImagePx()) : '')
 }
 
 /** 单张素材的原文件绝对路径（「用系统播放器打开」「在文件夹中显示」用） */
@@ -202,7 +225,7 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
   const size = statSync(abs).size
 
   if (row.type === 'text') {
-    return { ...base, kind: 'text', mime: mimeOf(ext), bytes: size, editable: size <= TEXT_MAX_BYTES }
+    return { ...base, kind: 'text', mime: mimeOf(ext), bytes: size, editable: size <= textMaxBytes() }
   }
 
   if (row.type === 'image') {
@@ -214,7 +237,7 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
     if (!hash) {
       return { ...base, kind: 'image', strategy: 'unsupported', mime: null, reason: '该素材没有内容哈希，无法生成预览' }
     }
-    const out = derivedAbs(hash, 'webp')
+    const out = derivedPathFor('image', hash)
     const ready = existsSync(out)
     return {
       ...base, kind: 'image', strategy: 'derived', derive: 'image', ready,
@@ -229,7 +252,7 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
     if (!hash) {
       return { ...base, kind: 'audio', strategy: 'unsupported', mime: null, reason: '该素材没有内容哈希，无法生成预览' }
     }
-    const out = derivedAbs(hash, 'mp3')
+    const out = derivedPathFor('audio', hash)
     const ready = existsSync(out)
     return {
       ...base, kind: 'audio', strategy: 'derived', derive: 'audio', ready,
@@ -253,7 +276,7 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
     // 编码本身 mp4 装得下 → remux（秒级）；装不下才转码
     const canRemux = !!probe.vcodec && COPYABLE_V.has(probe.vcodec) &&
       (!probe.acodec || COPYABLE_A.has(probe.acodec))
-    const out = derivedAbs(hash, 'mp4')
+    const out = derivedPathFor(canRemux ? 'remux' : 'transcode', hash)
     const ready = existsSync(out)
     return {
       ...base, kind: 'video', strategy: 'derived', derive: canRemux ? 'remux' : 'transcode', ready,
@@ -321,7 +344,7 @@ async function deriveImage(abs: string, out: string): Promise<void> {
     await sharp(abs)
       .rotate()
       .toColourspace('srgb')
-      .resize({ width: PREVIEW_IMG_PX, height: PREVIEW_IMG_PX, fit: 'inside', withoutEnlargement: true })
+      .resize({ width: maxImagePx(), height: maxImagePx(), fit: 'inside', withoutEnlargement: true })
       .webp({ quality: 88 })
       .toFile(tmp)
     renameOverwrite(tmp, out)
@@ -405,15 +428,15 @@ export async function deriveFor(id: number, onProgress?: (ratio: number) => void
   onProgress?.(0)
 
   if (info.derive === 'image') {
-    await deriveImage(abs, derivedAbs(hash, 'webp'))
+    await deriveImage(abs, derivedPathFor('image', hash))
   } else if (info.derive === 'audio') {
     // 探不到时长就只报不确定进度（0），不假装知道
     let totalMs = 0
     try { totalMs = (await probeMedia(abs)).durationMs } catch { /* ignore */ }
-    await deriveAudio(abs, derivedAbs(hash, 'mp3'), (r, t) => onProgress?.(t ? r : 0))
+    await deriveAudio(abs, derivedPathFor('audio', hash), (r, t) => onProgress?.(t ? r : 0))
   } else {
     const probe = await probeMedia(abs)
-    await deriveVideo(abs, derivedAbs(hash, 'mp4'), info.derive ?? 'transcode', probe, (r) => onProgress?.(r))
+    await deriveVideo(abs, derivedPathFor(info.derive, hash), info.derive ?? 'transcode', probe, (r) => onProgress?.(r))
   }
   return info.derive
 }
@@ -490,7 +513,7 @@ export function readText(id: number): TextReadResult {
     }
   }
 
-  const tooBig = st.size > TEXT_MAX_BYTES
+  const tooBig = st.size > textMaxBytes()
   return {
     text,
     encoding,
@@ -498,7 +521,7 @@ export function readText(id: number): TextReadResult {
     mtime: Math.floor(st.mtimeMs),
     readOnly: tooBig,
     readOnlyReason: tooBig
-      ? `文件超过 ${Math.round(TEXT_MAX_BYTES / 1024 / 1024)}MB，为避免卡顿只读`
+      ? `文件超过 ${Math.round(textMaxBytes() / 1024 / 1024)}MB，为避免卡顿只读`
       : null
   }
 }
@@ -528,7 +551,7 @@ export function writeText(id: number, text: string, baseMtime?: number): TextWri
   if (!existsSync(abs)) throw new Error('ERR_ASSET_MISSING')
 
   const buf = Buffer.from(text, 'utf8')
-  if (buf.byteLength > TEXT_MAX_BYTES) throw new Error('ERR_TOO_LARGE')
+  if (buf.byteLength > textMaxBytes()) throw new Error('ERR_TOO_LARGE')
 
   const stBefore = statSync(abs)
   if (baseMtime != null && Math.floor(stBefore.mtimeMs) !== Math.floor(baseMtime)) {
@@ -647,7 +670,7 @@ export async function serveMedia(req: Request, idRaw: string): Promise<Response>
       return new Response(info.reason ?? 'unsupported', { status: 415 })
     }
     if (info.strategy === 'derived') {
-      abs = derivedAbs(row.content_hash ?? '', derivedExtOf(info.derive))
+      abs = derivedPathFor(info.derive, row.content_hash ?? '')
       mime = info.mime
       if (!existsSync(abs)) return new Response('derived-not-ready', { status: 404 })
     } else {

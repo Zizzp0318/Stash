@@ -3,10 +3,12 @@ import { ref, computed, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { folderIcon } from '@/data/mock'
 import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
+import { useSettingsStore } from '../stores/settings'
 import { fmtCount } from '../utils/format'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
+const settings = useSettingsStore()
 
 // —— 文件夹树（按路径深度缩进）——
 /** 有子级的文件夹 path 集合（决定是否显示折叠箭头） */const parentPaths = computed(() => {
@@ -619,7 +621,15 @@ onBeforeUnmount(() => {
     </div>
 
     <div class="side-footer">
-      <div class="side-item">
+      <div
+        class="side-item"
+        role="button"
+        tabindex="0"
+        data-open-settings
+        title="设置"
+        @click="settings.openPanel()"
+        @keydown.enter="settings.openPanel()"
+      >
         <svg viewBox="0 0 14 14" fill="none">
           <circle cx="7" cy="7" r="2.1" stroke="currentColor" stroke-width="1.2" />
           <path d="M7 1.4v1.7M7 10.9v1.7M1.4 7h1.7M10.9 7h1.7M3.2 3.2l1.2 1.2M9.6 9.6l1.2 1.2M10.8 3.2L9.6 4.4M4.4 9.6l-1.2 1.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />

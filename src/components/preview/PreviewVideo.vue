@@ -11,6 +11,7 @@
 import { computed, ref, watch, type PropType } from 'vue'
 import type { StashAssetRow } from '../../env'
 import { useAssetStore } from '../../stores/assets'
+import { useSettingsStore } from '../../stores/settings'
 import PreviewPlayerBar from './PreviewPlayerBar.vue'
 import { usePreviewMedia } from './usePreviewMedia'
 
@@ -21,6 +22,7 @@ const props = defineProps({
 })
 
 const assets = useAssetStore()
+const settings = useSettingsStore()
 const { info, status, url, progress, error } = usePreviewMedia(computed(() => props.asset))
 
 const stageEl = ref<HTMLElement | null>(null)
@@ -29,7 +31,24 @@ const videoEl = ref<HTMLVideoElement | null>(null)
 const unsupported = ref(false)
 
 // 换素材（换 url）时把失败态清掉，否则上一张的回退会留在新素材上
-watch(() => url.value, () => { unsupported.value = false })
+watch(() => url.value, () => { unsupported.value = false; autoTried.value = false })
+
+/** 自动播放只尝试一次（见 maybeAutoPlay） */
+const autoTried = ref(false)
+
+/**
+ * 打开浮层时自动播放（设置里开，默认关）。
+ * **只在中栏浮层生效**：右侧信息栏是点一张换一张的浏览节奏，自动播会一路响到底。
+ * `autoTried` 保证每个素材只尝试一次（`play()` 失败/成功后又有 loadedmetadata 不会重复触发）。
+ */
+function maybeAutoPlay(): void {
+  const el = videoEl.value
+  if (!el || autoTried.value || props.compact) return
+  autoTried.value = true
+  if (!settings.settings.preview.autoPlay) return
+  void el.play().catch(() => { /* 被自动播放策略拦住就算了，不打扰用户 */ })
+}
+
 
 function onError(): void {
   if ((videoEl.value?.error?.code ?? null) === 4) unsupported.value = true
@@ -86,6 +105,7 @@ async function openExternal(): Promise<void> {
         preload="metadata"
         data-pv-video
         @error="onError"
+        @loadedmetadata="maybeAutoPlay"
       ></video>
       <!-- 控制条只在中栏浮层里给：右侧信息栏（compact）那条面板太窄，控件挤在一起反而难用，
            双击卡片到中栏才是完整播放器。但**点画面播放/暂停**两处都保留。

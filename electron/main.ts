@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, protocol } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
 import { spawn } from 'child_process'
 import { join } from 'path'
 import { existsSync, readFileSync } from 'fs'
@@ -8,6 +8,8 @@ import * as importerSvc from './services/importer'
 import * as clipboardSvc from './services/clipboard'
 import * as previewSvc from './services/preview'
 import { unwatchLibrary, watchLibrary } from './services/watcher'
+import * as configSvc from './services/config'
+import * as cacheSvc from './services/cache'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
@@ -17,6 +19,7 @@ import { runSmokeSearch } from './services/smoke-search'
 import { runSmokeTag } from './services/smoke-tag'
 import { runSmokeEdit } from './services/smoke-edit'
 import { runSmokePreview } from './services/smoke-preview'
+import { runSmokeSettings } from './services/smoke-settings'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -315,6 +318,53 @@ function bootstrap(): void {
     ipcMain.handle('clipboard:read-files', () => wrap(() => clipboardSvc.readFiles()))
     ipcMain.handle('clipboard:write-text', (_e, text) => wrap(() => clipboardSvc.writeText(String(text ?? ''))))
 
+    // 全局偏好（跨库一份，存在 userData/config.json）。
+    // 改完向所有窗口广播：偏好是全局状态，别的窗口也得跟着变（现在只有一个窗口，
+    // 但「谁改了谁广播」这条不能省 —— 否则以后加第二个窗口就是静默不一致）。
+    ipcMain.handle('settings:get', () => wrap(() => configSvc.getSettings()))
+    ipcMain.handle('settings:choices', () => wrap(() => configSvc.settingsChoices()))
+    ipcMain.handle('settings:patch', (_e, patch) =>
+      wrap(() => {
+        const next = configSvc.patchSettings((patch ?? {}) as Partial<configSvc.Settings>)
+        for (const w of BrowserWindow.getAllWindows()) w.webContents.send('settings:changed', next)
+        return next
+      })
+    )
+
+    // 缓存占用与清理（缩略图 / 派生预览分开算、分开清）
+    ipcMain.handle('cache:stats', () => wrap(() => cacheSvc.cacheStats()))
+    ipcMain.handle('cache:clear', (_e, { kind }) =>
+      wrap(() => cacheSvc.clearCache(kind === 'derived' || kind === 'thumbs' || kind === 'all' ? kind : 'thumbs'))
+    )
+    // 在资源管理器里打开 .thumbs（清理前想自己看一眼时用）
+    ipcMain.handle('cache:reveal', () =>
+      wrap(async () => {
+        const lib = librarySvc.getLibrary()
+        if (!lib) throw new Error('ERR_NO_LIBRARY')
+        const dir = join(lib.path, '.thumbs')
+        if (!existsSync(dir)) throw new Error('ERR_NO_CACHE')
+        const err = await shell.openPath(dir)
+        return { opened: !err, error: err || null }
+      })
+    )
+
+    // 关于页要用的运行环境信息 + 打开配置目录
+    ipcMain.handle('app:info', () =>
+      wrap(() => ({
+        version: app.getVersion(),
+        electron: process.versions.electron,
+        chrome: process.versions.chrome,
+        node: process.versions.node,
+        userData: app.getPath('userData')
+      }))
+    )
+    ipcMain.handle('app:open-user-data', () =>
+      wrap(async () => {
+        const err = await shell.openPath(app.getPath('userData'))
+        return { opened: !err, error: err || null }
+      })
+    )
+
     // 系统对话框
     ipcMain.handle('dialog:pick-folder', async () => {
       const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })
@@ -375,6 +425,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-m4')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeM4(win)
+      })
+    }
+
+    // 设置面板冒烟：入口 / 逐项生效（DOM + config 落盘）/ reload 持久化 / 旧偏好迁移 / 恢复默认
+    if (process.argv.includes('--smoke-settings')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeSettings(win)
       })
     }
 

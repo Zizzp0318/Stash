@@ -1305,3 +1305,229 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .dh-inner svg { width: 20px; height: 20px; }
 
+
+/* ==================== 设置面板 ====================
+   居中模态：左分组导航 + 右内容区。复用 .modal-mask 的遮罩与层级。
+   刻意只渲染已实现的分组：点不动的菜单项等于骗人。 */
+.settings-panel {
+  display: flex;
+  width: 720px;
+  max-width: calc(100vw - 48px);
+  height: 520px;
+  max-height: calc(100vh - 72px);
+  border-radius: 13px;
+  background: var(--bg-panel, #2C2E31);
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.sp-nav {
+  width: 168px;
+  flex: 0 0 168px;
+  padding: 12px 8px;
+  background: var(--bg-canvas);
+  border-right: 1px solid var(--border-soft);
+  overflow-y: auto;
+}
+.sp-nav-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+  padding: 2px 8px 10px;
+}
+.sp-nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 8px;
+  margin-bottom: 2px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 13px;
+  cursor: pointer;
+}
+.sp-nav-item:hover { background: var(--bg-hover); color: var(--text-1); }
+.sp-nav-item.on { background: var(--accent-soft); color: var(--text-1); }
+
+.sp-body {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  padding: 18px 20px;
+  overflow-y: auto;
+}
+.sp-close { position: absolute; top: 12px; right: 12px; }
+.sp-h { font-size: 14px; font-weight: 500; color: var(--text-1); margin: 0; }
+.sp-sub { font-size: 11.5px; color: var(--text-3); margin: 2px 0 14px; }
+
+/* 一行一项：左说明右控件。底部细分割线，最后一行不要（避免和危险区之间多一条） */
+.sp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.sp-label { min-width: 0; }
+.sp-name { font-size: 13px; color: var(--text-1); }
+.sp-tip { font-size: 11.5px; color: var(--text-3); margin-top: 3px; }
+
+/* 分段控件（默认视图） */
+.sp-seg {
+  flex: 0 0 auto;
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.sp-seg button {
+  padding: 5px 13px;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 12px;
+  cursor: pointer;
+}
+.sp-seg button.on { background: var(--accent-soft); color: var(--text-1); }
+
+.sp-slider { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+.sp-slider input[type='range'] { width: 132px; accent-color: var(--accent); }
+.sp-num {
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  min-width: 48px;
+  text-align: right;
+}
+.sp-tag {
+  font-size: 11px;
+  color: var(--text-3);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.sp-chips { flex: 0 1 auto; display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+.sp-chip {
+  font-size: 12px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-family: var(--font);
+  cursor: pointer;
+}
+.sp-chip.on { background: var(--accent-soft); border-color: var(--accent-border); color: var(--text-1); }
+
+/* 开关：纯 CSS 滑块，别用原生 checkbox —— 各平台外观差太多，和面板其它控件不是一个体系 */
+.sp-sw {
+  flex: 0 0 auto;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+.sp-sw i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition: transform 0.16s ease, background 0.16s ease;
+}
+.sp-sw.on { background: var(--accent); }
+.sp-sw.on i { transform: translateX(16px); background: #fff; }
+
+.sp-danger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+.sp-danger .sp-name { color: var(--text-1); }
+
+.sp-btn {
+  flex: 0 0 auto;
+  padding: 5px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--font);
+  font-size: 12px;
+  cursor: pointer;
+}
+.sp-btn:hover { background: var(--bg-hover); color: var(--text-1); }
+.sp-btn.danger { color: #E4826A; border-color: rgba(228, 130, 106, 0.4); }
+.sp-btn.danger.armed { background: rgba(228, 130, 106, 0.15); color: #F0997B; }
+
+/* 关于：键值表 + 说明块 + 底部按钮 */
+.sp-kv {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 8px 12px;
+  align-items: center;
+  font-size: 12.5px;
+  margin-bottom: 16px;
+}
+.sp-kv span { color: var(--text-3); }
+.sp-kv b { color: var(--text-1); font-weight: 400; }
+.sp-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+}
+.sp-note {
+  font-size: 11.5px;
+  line-height: 1.75;
+  color: var(--text-3);
+  background: var(--bg-hover);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
+}
+.sp-note b { color: var(--text-2); font-weight: 400; }
+.sp-actions { display: flex; gap: 8px; }
+
+/* 设置面板 · 缓存占用卡片（三个数字并排） */
+.sp-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.sp-card {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: var(--bg-hover);
+}
+.sp-card-label { font-size: 11.5px; color: var(--text-3); }
+.sp-card-num {
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--text-1);
+  font-variant-numeric: tabular-nums;
+}
+.sp-card-sub { font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.sp-btn:disabled { opacity: 0.45; cursor: default; }

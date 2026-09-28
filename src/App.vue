@@ -5,11 +5,14 @@ import SideBar from './components/SideBar.vue'
 import GalleryGrid from './components/GalleryGrid.vue'
 import DetailPanel from './components/DetailPanel.vue'
 import Welcome from './components/Welcome.vue'
+import SettingsPanel from './components/SettingsPanel.vue'
 import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
+import { useSettingsStore } from './stores/settings'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
+const settings = useSettingsStore()
 
 let noticeTimer: ReturnType<typeof setTimeout> | null = null
 function setNotice(n: { kind: 'error' | 'info'; text: string }): void {
@@ -19,6 +22,8 @@ function setNotice(n: { kind: 'error' | 'info'; text: string }): void {
 }
 
 onMounted(async () => {
+  // 偏好先读：网格首帧就该是用户选的视图与卡片大小，否则会先按默认排一遍再跳一下
+  await settings.init()
   await lib.bootstrap()
   if (lib.info) {
     await assets.refresh()
@@ -85,5 +90,8 @@ onMounted(async () => {
     </div>
     <!-- 轻提示条（导入结果 / 批量操作回执）实际渲染在 GalleryGrid 的工具栏标题行里，
          浮在「所有素材 … 导入」那一行的中段 —— 详见该组件里的 .notice-toast -->
+
+    <!-- 设置面板：全局单例，只渲染已实现的分组；入口在侧栏底部 -->
+    <SettingsPanel v-if="settings.panelOpen" />
   </div>
 </template>

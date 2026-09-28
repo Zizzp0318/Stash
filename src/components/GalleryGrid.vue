@@ -3,6 +3,7 @@ import { ref, computed, reactive, watch, nextTick, onMounted, onBeforeUnmount } 
 import { heart, folderIcon } from '@/data/mock'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../stores/assets'
+import { useSettingsStore } from '../stores/settings'
 import { fmtSize, fmtDate, fmtCount, fmtDuration } from '../utils/format'
 import type { StashAssetRow } from '../env'
 import BatchBar from './BatchBar.vue'
@@ -10,8 +11,17 @@ import PreviewStage from './preview/PreviewStage.vue'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
+const settings = useSettingsStore()
 
-const view = ref<'masonry' | 'list'>('masonry')
+/**
+ * 当前视图（瀑布 / 列表）。
+ * 可写 computed 直接架在全局偏好上：视图模式**以前根本没持久化**，
+ * 每次启动都回到瀑布；现在写进设置，并且设置面板里也能改（同一个真相）。
+ */
+const view = computed({
+  get: () => settings.settings.defaultView,
+  set: (v: 'masonry' | 'list') => void settings.patch({ defaultView: v })
+})
 
 // 上下文标题
 const title = computed(() => {
@@ -1092,8 +1102,9 @@ function onWindowMouseDown(e: MouseEvent): void {
             />
             <span v-if="!p.it.content_hash" class="thumb-fallback">{{ TYPE_ICON[p.it.type] }}</span>
             <span v-if="p.it.is_fav" class="fav" v-html="heart"></span>
-            <!-- 类型角标：绝对定位，不参与瀑布流的高度计算（卡片高 = padding + 缩略图 + 信息区） -->
-            <span class="thumb-type" :data-thumb-type="p.it.type">
+            <!-- 类型角标：绝对定位，不参与瀑布流的高度计算（卡片高 = padding + 缩略图 + 信息区）。
+                 开关在设置面板的「外观与浏览」里 -->
+            <span v-if="assets.cardFields.typeBadge" class="thumb-type" :data-thumb-type="p.it.type">
               <span class="tt-ico" v-html="(TYPE_BADGE[p.it.type] ?? TYPE_BADGE.text).icon"></span>
               <span class="tt-label">{{ (TYPE_BADGE[p.it.type] ?? TYPE_BADGE.text).label }}</span>
             </span>

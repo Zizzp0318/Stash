@@ -7,6 +7,7 @@
 import { computed, ref, watch, type PropType } from 'vue'
 import type { StashAssetRow } from '../../env'
 import { useAssetStore } from '../../stores/assets'
+import { useSettingsStore } from '../../stores/settings'
 import PreviewPlayerBar from './PreviewPlayerBar.vue'
 import { usePreviewMedia } from './usePreviewMedia'
 
@@ -17,12 +18,30 @@ const props = defineProps({
 })
 
 const assets = useAssetStore()
+const settings = useSettingsStore()
 const { info, status, url, progress, error } = usePreviewMedia(computed(() => props.asset))
 
 const audioEl = ref<HTMLAudioElement | null>(null)
 const unsupported = ref(false)
 
-watch(() => url.value, () => { unsupported.value = false })
+watch(() => url.value, () => { unsupported.value = false; autoTried.value = false })
+
+/** 自动播放只尝试一次（见 maybeAutoPlay） */
+const autoTried = ref(false)
+
+/**
+ * 打开浮层时自动播放（设置里开，默认关）。
+ * **只在中栏浮层生效**：右侧信息栏是点一张换一张的浏览节奏，自动播会一路响到底。
+ * `autoTried` 保证每个素材只尝试一次（`play()` 失败/成功后又有 loadedmetadata 不会重复触发）。
+ */
+function maybeAutoPlay(): void {
+  const el = audioEl.value
+  if (!el || autoTried.value || props.compact) return
+  autoTried.value = true
+  if (!settings.settings.preview.autoPlay) return
+  void el.play().catch(() => { /* 被自动播放策略拦住就算了，不打扰用户 */ })
+}
+
 
 function onError(): void {
   if ((audioEl.value?.error?.code ?? null) === 4) unsupported.value = true
@@ -84,6 +103,7 @@ async function openExternal(): Promise<void> {
         preload="metadata"
         data-pv-audio
         @error="onError"
+        @loadedmetadata="maybeAutoPlay"
       ></audio>
       <!-- 控制条只在中栏浮层里给；右侧信息栏（compact）太窄，双击卡片到中栏才是完整播放器。
            但**点画面播放/暂停**两处都保留。 -->

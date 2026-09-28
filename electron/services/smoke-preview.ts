@@ -42,9 +42,10 @@ import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
+import { patchSettings } from './config'
 import {
-  analyze, previewInfo, deriveFor, serveMedia, derivedAbs, rowOf, readText, writeText,
-  TEXT_MAX_BYTES, type PreviewInfo
+  analyze, previewInfo, deriveFor, serveMedia, derivedPathFor, rowOf, readText, writeText,
+  textMaxBytes, type PreviewInfo
 } from './preview'
 
 interface Check {
@@ -288,8 +289,12 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       check('S3 tiff 派生方式为 image', derive === 'image', String(derive))
 
       const tiffRow = rowOf(tiffId)
-      const out = derivedAbs(tiffRow.content_hash ?? '', 'webp')
+      const out = derivedPathFor(derive, tiffRow.content_hash ?? '')
       check('S3 派生文件已落盘（与缩略图同住 .thumbs）', existsSync(out), out.replace(lib.path, '<lib>'))
+      // 文件名必须带上限尺寸：改了「高清预览上限」就该生成新文件。
+      // 不带 tag 的话会命中旧尺寸的缓存，用户看着就是「改了设置没生效」。
+      check('S3 派生图文件名带上限尺寸 tag（改设置不会命中旧文件）',
+        out.includes('preview-2560.webp'), out.replace(lib.path, '<lib>'))
 
       // 「能解码」而不是「文件存在」：让 sharp 真读一遍
       const meta = await sharp(out).metadata()
@@ -317,7 +322,7 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       check('S4 avi 派生方式为 transcode', derive === 'transcode', String(derive))
 
       const aviRow = rowOf(aviId)
-      const out = derivedAbs(aviRow.content_hash ?? '', 'mp4')
+      const out = derivedPathFor(derive, aviRow.content_hash ?? '')
       check('S4 派生 mp4 已落盘', existsSync(out), out.replace(lib.path, '<lib>'))
 
       // 原文件必须还在（派生是「另存一份」，不能动源文件）
@@ -408,7 +413,7 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       let notText = ''
       try { writeText(pngId, 'x') } catch (e) { notText = String((e as Error).message) }
       let tooLarge = ''
-      try { writeText(noteId, 'x'.repeat(TEXT_MAX_BYTES + 1)) } catch (e) { tooLarge = String((e as Error).message) }
+      try { writeText(noteId, 'x'.repeat(textMaxBytes() + 1)) } catch (e) { tooLarge = String((e as Error).message) }
       check('S5 非文本写入被拒 / 超限被拒',
         notText === 'ERR_NOT_TEXT' && tooLarge === 'ERR_TOO_LARGE', `${notText} | ${tooLarge}`)
     }
@@ -439,7 +444,9 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     await js('window.stash.library.open(' + JSON.stringify(lib.path) + ')')
     // 确保右侧信息栏是**展开**的：它是一个显式布局状态、存在 localStorage 里，
     // 上一轮冒烟若把它收起了，这一轮就找不到 .detail（D 段要验的就是它）。
-    await js("try { localStorage.removeItem('stash.detailCollapsed') } catch (e) {}")
+    // 右侧信息栏的收起状态现在是**全局偏好**（userData/config.json），不再是 localStorage ——
+    // 上一轮崩在「收起」状态会把这里的 D 段整片带红，所以开跑前必须按新位置复位。
+    patchSettings({ detailCollapsed: false })
     const loaded = new Promise<void>((resolve) => win.webContents.once('did-finish-load', () => resolve()))
     win.webContents.reload()
     await loaded

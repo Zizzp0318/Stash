@@ -239,6 +239,96 @@ export interface StashDialogApi {
   pickFiles: () => Promise<string[]>
 }
 
+/** 卡片下方常驻显示的字段开关（typeBadge = 缩略图右上角的类型角标） */
+export interface StashCardFields {
+  name: boolean
+  dims: boolean
+  size: boolean
+  time: boolean
+  typeBadge: boolean
+}
+
+/** 缩略图管线偏好 */
+export interface StashThumbSettings {
+  concurrency: number
+  quality: number
+}
+
+/** 预览与播放偏好 */
+export interface StashPreviewSettings {
+  idleHideMs: number
+  maxImagePx: number
+  textMaxBytes: number
+  volume: number
+  autoPlay: boolean
+}
+
+/** 全局偏好（存在 userData/config.json，跨库一份） */
+export interface StashSettings {
+  defaultView: 'masonry' | 'list'
+  viewZoom: number
+  cardFields: StashCardFields
+  detailCollapsed: boolean
+  thumbs: StashThumbSettings
+  preview: StashPreviewSettings
+}
+
+/** 深可选补丁：Partial<StashSettings> 只让顶层可选，嵌套对象得单独放开 */
+export type StashSettingsPatch = Partial<Omit<StashSettings, 'cardFields' | 'thumbs' | 'preview'>> & {
+  cardFields?: Partial<StashCardFields>
+  thumbs?: Partial<StashThumbSettings>
+  preview?: Partial<StashPreviewSettings>
+}
+
+export interface StashSettingsChoices {
+  quality: number[]
+  concurrency: { min: number; max: number }
+  idleHideMs: number[]
+  maxImagePx: number[]
+  textMaxMb: number[]
+}
+
+export interface StashSettingsApi {
+  get: () => Promise<{ ok: boolean; data?: StashSettings; error?: string }>
+  choices: () => Promise<{ ok: boolean; data?: StashSettingsChoices; error?: string }>
+  /** 只覆盖传进来的字段 */
+  patch: (patch: StashSettingsPatch) => Promise<{ ok: boolean; data?: StashSettings; error?: string }>
+  onChanged: (cb: (s: StashSettings) => void) => Unsub
+}
+
+export interface StashAppInfo {
+  version: string
+  electron: string
+  chrome: string
+  node: string
+  userData: string
+}
+
+export interface StashCacheBucket {
+  files: number
+  bytes: number
+}
+
+export interface StashCacheStats {
+  dir: string
+  total: StashCacheBucket
+  thumbs: StashCacheBucket
+  derived: StashCacheBucket
+  other: StashCacheBucket
+}
+
+export interface StashCacheApi {
+  stats: () => Promise<{ ok: boolean; data?: StashCacheStats; error?: string }>
+  /** kind=thumbs 只清缩略图（可秒级重建）；derived 清派生预览（下次打开要重新转码） */
+  clear: (kind: 'thumbs' | 'derived' | 'all') => Promise<{ ok: boolean; data?: { removed: number; freed: number }; error?: string }>
+  reveal: () => Promise<{ ok: boolean; data?: { opened: boolean; error: string | null }; error?: string }>
+}
+
+export interface StashAppApi {
+  info: () => Promise<{ ok: boolean; data?: StashAppInfo; error?: string }>
+  openUserData: () => Promise<{ ok: boolean; data?: { opened: boolean; error: string | null }; error?: string }>
+}
+
 export interface StashApi {
   win: StashWinApi
   library: StashLibraryApi
@@ -253,6 +343,9 @@ export interface StashApi {
   pathForFile: (file: File) => string
   tag: StashTagApi
   dialog: StashDialogApi
+  settings: StashSettingsApi
+  cache: StashCacheApi
+  app: StashAppApi
 }
 
 declare global {

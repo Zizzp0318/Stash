@@ -20,6 +20,7 @@ import { closeCurrent, createLibrary, deleteLibrary, mkdirRel, openLibrary, requ
 import { readFiles, writeFiles } from './clipboard'
 import { copyAssets, createTag, pastePaths, renameAsset, renameTag, updateAsset } from './assets'
 import { importFiles, type ImportResult } from './importer'
+import { getSettings, patchSettings } from './config'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -398,10 +399,12 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
 
     // ==================== U. UI 段 ====================
     step('U-UI')
-    // 前置状态隔离：右侧信息栏的收起状态存在 localStorage 里，跨冒烟共享同一份 userData ——
+    // 前置状态隔离：右侧信息栏的收起状态是**全局偏好**（userData/config.json），跨冒烟共享同一份 ——
     // 上一轮万一在「收起」之后崩掉，别的套件（m4 要读 .detail 里的星标）会莫名其妙全红。
     // 开跑前先复位，收尾再复一次（见 finally）。
-    await js(`(() => { try { localStorage.removeItem('stash.detailCollapsed') } catch (e) {} return true })()`)
+    // ⚠️ 它以前存在 localStorage，现在搬进了 config —— 复位/读取都必须走 config，
+    // 否则复位是个空操作、断言永远读到 null（这个坑在改动当期就踩到过）。
+    patchSettings({ detailCollapsed: false })
     await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
     await onceLoaded(win)
     await sleep(2800)
@@ -706,7 +709,7 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     await sleep(450)
     R.u7_collapsed = {
       detailGone: (await js(`!!document.querySelector('.detail')`)) === false,
-      flag: (await js(`localStorage.getItem('stash.detailCollapsed')`)) as string | null,
+      flag: getSettings().detailCollapsed ? '1' : '0', // 读数从 localStorage 改到 config（同上）
       title: (await js(`document.querySelector('.wc-btn[data-wc="detail"]')?.getAttribute('title') ?? null`)) as
         | string
         | null
@@ -727,7 +730,7 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     await sleep(700)
     R.u7_expanded = {
       detailBack: (await js(`!!document.querySelector('.detail')`)) === true,
-      flag: (await js(`localStorage.getItem('stash.detailCollapsed')`)) as string | null
+      flag: getSettings().detailCollapsed ? '1' : '0'
     }
     await capture('shot-edit-detail-expanded.png')
 
@@ -1262,11 +1265,9 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
   } finally {
     // 复位右侧信息栏的折叠标记（理由见 U 段开头），别把状态留给下一个冒烟套件
     try {
-      await win.webContents.executeJavaScript(
-        `(() => { try { localStorage.removeItem('stash.detailCollapsed') } catch (e) {} return true })()`
-      )
+      patchSettings({ detailCollapsed: false })
     } catch {
-      /* 窗口已关就无所谓了 */
+      /* 还原失败不挡住退出 */
     }
     try {
       if (libPath) {
