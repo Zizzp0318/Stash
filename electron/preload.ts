@@ -131,6 +131,8 @@ contextBridge.exposeInMainWorld('stash', {
   /** AI 生成参数的提取结果（提示词/模型/采样器等与 AI 来源标识） */
   meta: {
     backfill: () => ipcRenderer.invoke('meta:backfill'),
+    /** 清掉「已扫过」状态位后全库重扫：解析器升级后让存量素材也能提出来 */
+    rescan: () => ipcRenderer.invoke('meta:rescan'),
     /** 来源标识 id → 中文名（由主进程统一下发） */
     labels: () => ipcRenderer.invoke('meta:labels'),
     onDone: (cb: (d: unknown) => void) => subscribe('meta:done', cb)

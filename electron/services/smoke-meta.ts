@@ -21,7 +21,7 @@ import sharp from 'sharp'
 import { closeCurrent, createLibrary, mkdirRel, requireCurrent } from './library'
 import { importFiles } from './importer'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
-import { scanBuffers, type GenMeta } from './genmeta'
+import { backfillMeta, rescanAllMeta, scanBuffers, type GenMeta } from './genmeta'
 
 interface Check { name: string; pass: boolean; detail?: string }
 
@@ -114,8 +114,11 @@ const CN_NEGATIVE = '模糊，低质量，多余手指'
 
 /**
  * FLUX 系 ComfyUI 工作流（照用户库里真实的那批抄的：没有 KSampler）。
- * 刻意把负面提示词接在 `ConditioningZeroOut` 后面 —— 中间夹一层不改文本的节点，
+ * 负面提示词与引导器之间刻意夹一层**不改语义**的 `ConditioningSetArea` ——
  * 只往上看一层的解析器会漏掉它（这是真实工作流里最常见的样子）。
+ *
+ * ⚠️ 中间节点**不能**用 `ConditioningZeroOut`：它的语义是「把条件清零」，
+ * 解析器遇到它必须剪枝（负面判空）。那是另一个断言（见下方 krea2 样本）。
  */
 function fluxGraph(): string {
   return JSON.stringify({
@@ -123,7 +126,7 @@ function fluxGraph(): string {
     '4': { class_type: 'CLIPLoader', inputs: { clip_name: 't5xxl_fp16.safetensors', type: 'flux' } },
     '199': { class_type: 'CLIPTextEncode', inputs: { text: CN_PROMPT, clip: ['4', 0] } },
     '200': { class_type: 'CLIPTextEncode', inputs: { text: CN_NEGATIVE, clip: ['4', 0] } },
-    '201': { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['200', 0] } },
+    '201': { class_type: 'ConditioningSetArea', inputs: { conditioning: ['200', 0], width: 1024, height: 1024, x: 0, y: 0, strength: 1 } },
     '202': { class_type: 'CFGGuider', inputs: { model: ['3', 0], positive: ['199', 0], negative: ['201', 0], cfg: 1.5 } },
     '203': { class_type: 'RandomNoise', inputs: { noise_seed: 123456789012345 } },
     '204': { class_type: 'Flux2Scheduler', inputs: { steps: 20, width: 1024, height: 1024 } },
@@ -156,6 +159,81 @@ const INVOKE_META = JSON.stringify({
 })
 
 const MJ_DESC = 'a cat sitting on a windowsill, cinematic --ar 16:9 --v 6.1 --seed 42'
+
+// —— Krea2 风格工作流（照用户 2026-09 报回来的真实那两张图抄的）——
+// 提示词文本 + 一个含 "NaN" 字样的反例（验证「词法级替换」不会改坏用户内容）
+const KREA_PROMPT = '示例角色, 韩服, NaN art 摄影'
+const KREA_WILDCARD = '__SFW15000QwenZImage15000_porV301000015000__'
+
+/**
+ * 一个样本同时踩四个坑（全是用户真实图里有的）：
+ *  ① `prompt` 块是 **Python json.dumps 的产物，带裸 `NaN`** —— JS 的 `JSON.parse` 直接抛异常，
+ *     被上层 catch 成 meta=null，表现是「有 prompt 块却一个字都提不出来」；
+ *  ② 提示词**不挂在 text 上**：`PrimitiveString.value`（rgthree）+ `DPRandomGenerator.text`（通配符模板），
+ *     中间夹 `PreviewAny` / `MK_PromptConcat`（**中文键名** `提示词_01`）;
+ *  ③ `easy simpleMath.value = "(a*b + (96 * 2))/2"` 是分辨率算式，混进提示词就是脏数据；
+ *  ④ `KSampler.negative` 指向同一条正面链路再 `ConditioningZeroOut`（= 不要负面），负面必须判空。
+ */
+function krea2Graph(): string {
+  const g = {
+    '508:504': { class_type: 'PrimitiveString', inputs: { value: KREA_PROMPT } },
+    '508:562': { class_type: 'DPRandomGenerator', inputs: { text: KREA_WILDCARD } },
+    '508:510': { class_type: 'Any Switch (rgthree)', inputs: { on_true: ['508:562', 0], on_false: ['508:504', 0] } },
+    '508:515': {
+      class_type: 'MK_PromptConcat',
+      inputs: { 提示词_01: ['508:504', 0], 提示词_02: ['508:510', 0], 分隔符: '' }
+    },
+    '506': { class_type: 'PreviewAny', inputs: { source: ['508:515', 0] } },
+    '527:517': { class_type: 'CLIPLoader', inputs: { clip_name: 'Krea2\\qwen3vl_4b_fp8_scaled.safetensors', type: 'krea2' } },
+    '527:521': { class_type: 'CLIPTextEncode', inputs: { text: ['506', 0], clip: ['527:517', 0] } },
+    '527:522': { class_type: 'ConditioningZeroOut', inputs: { conditioning: ['527:521', 0] } },
+    '523': {
+      class_type: 'KSampler',
+      inputs: {
+        model: ['527:517', 0], positive: ['527:521', 0], negative: ['527:522', 0],
+        seed: 477869056732574, steps: 8, cfg: 1, sampler_name: 'euler_ancestral', scheduler: 'beta'
+      }
+    },
+    '555:547': { class_type: 'easy simpleMath', inputs: { a: 96, b: 96, value: '(a*b + (96 * 2))/2' } },
+    '600': { class_type: 'UNETLoader', inputs: { unet_name: 'Krea2\\Krea2-Moody-Mix-V5_FP8.safetensors' } },
+    '601': { class_type: 'MK_SaveImage', inputs: { images: ['523', 0] } }
+  }
+  // JSON.stringify 会把 NaN 写成 null，所以这里手工还原成 Python 的裸 NaN 形态
+  return JSON.stringify(g).replace('"b":96', '"b":NaN')
+}
+
+/** 展开后的完整提示词（UI workflow 里存的那份；真实图里是 674 字，这里截短够测判据） */
+const KREA_FULL =
+  '示例角色,一位年轻女性坐在铺满白色丝绸质感布料的地面，她身穿一件设计精巧的白色透视薄纱连衣裙，' +
+  '肩部和袖子部分采用层层叠叠的荷叶边与扇形褶皱结构，形成类似蝴蝶翅膀般的轮廓，画面静谧而高贵'
+/** 子图**定义**里的 LLM 系统提示词（反推分支用的角色设定）——绝不能被当成提示词 */
+const KREA_SYS =
+  '你是一名专业的图像反推提示词专家，根据用户提供的参考图片，准确反推出适用于 Krea 2 的中文生图提示词，不要输出多余解释'
+const KREA_URL = '/api/view?filename=rgthree.compare._temp_lrqjx_00001_.png&type=temp&subfolder='
+
+/**
+ * UI 版 workflow（第二块）。照用户真实那两张图的结构：
+ * 顶层节点里是**子图实例**，它的「提示词」端口上存着展开后的完整文本（键名 `value_1`）。
+ * ⚠️ 系统提示词刻意放在 `definitions.subgraphs[*]`（子图定义）里 —— 那是模板不是这次的取值，
+ * 解析器只扫顶层 nodes 才不会把它捡走。
+ */
+function krea2Workflow(): string {
+  return JSON.stringify({
+    nodes: [
+      {
+        id: 508,
+        type: '0341227c-0193-4a9d-b3df-4fffb7f9f840',
+        widgets_values: ['示例角色,', KREA_FULL],
+        widgets_values_named: { value: '示例角色,', value_1: KREA_FULL }
+      },
+      { id: 509, type: 'LoadImage', widgets_values: ['3b8f7832-8494-483d-b579-98f7b57aa8.png', 'image'] },
+      { id: 584, type: 'Image Comparer (rgthree)', widgets_values_named: { rgthree_comparer: { images: [{ url: KREA_URL }] } } },
+      { id: 577, type: 'MK_SaveImage', widgets_values: ['示例输出\\示例角色', 'PNG', 100, true, false] }
+    ],
+    definitions: { subgraphs: [{ nodes: [{ id: 5, type: 'CLIPTextEncode', widgets_values: [KREA_SYS, 'default'] }] }] }
+  })
+}
+
 
 /** 国内《AI 生成合成内容标识办法》的隐式标识块（照用户库里的真样抄） */
 const AIGC_CHUNK = JSON.stringify({
@@ -316,6 +394,61 @@ export async function runSmokeMeta(win: BrowserWindow): Promise<void> {
         r10.meta?.hasWorkflow === true,
       JSON.stringify(r10.meta?.prompt))
     void camExif
+
+    // —— Krea2 风格（照用户真实那两张图抄的）：四个坑一起过 ——
+    const rk = scanBuffers({
+      comments: [{ keyword: 'prompt', text: krea2Graph() }, { keyword: 'workflow', text: FLUX_WORKFLOW }]
+    })
+    const k = rk.meta
+    check(
+      'M1k 裸 NaN 不再让整块解析失败（Python 的 json.dumps 会写 NaN，JS 的 JSON.parse 会抛）',
+      k?.steps === 8 && k?.sampler === 'euler_ancestral' && k?.seed === '477869056732574',
+      JSON.stringify({ steps: k?.steps, sampler: k?.sampler, seed: k?.seed })
+    )
+    check(
+      'M1k 提示词寄居在 PrimitiveString.value 上也取得到（只认 inputs.text 会断在这）',
+      k?.prompt.includes(KREA_PROMPT) === true,
+      JSON.stringify(k?.prompt)
+    )
+    check(
+      'M1k 通配符模板（DPRandomGenerator.text）一并取出',
+      k?.prompt.includes(KREA_WILDCARD) === true,
+      JSON.stringify(k?.prompt)
+    )
+    check('M1k 分辨率算式（easy simpleMath.value）不会被当成提示词', k?.prompt.includes('(a*b') === false, JSON.stringify(k?.prompt))
+    check(
+      'M1k 提示词里的 "NaN" 字样原样保留（替换必须是词法级，不能整串 replace）',
+      k?.prompt.includes('NaN art') === true,
+      JSON.stringify(k?.prompt)
+    )
+    check('M1k 负面走 ConditioningZeroOut → 判为空，不把正面抄一遍', k?.negativePrompt === '', JSON.stringify(k?.negativePrompt))
+    check('M1k 来源标为 comfyui、且认得出带了 workflow 块', rk.ai?.id === 'comfyui' && k?.hasWorkflow === true)
+
+    // —— UI workflow 里那份「展开后的完整提示词」——
+    // 用户实测：动态提示词（`__分类名__`）在 API 块里只有模板，展开结果只存在 UI workflow 里。
+    // 只读 API 块的话，拿到的就是"随机提示词节点的模板"而不是 CLIPTextEncode 真正吃到的文本。
+    const rw = scanBuffers({
+      comments: [{ keyword: 'prompt', text: krea2Graph() }, { keyword: 'workflow', text: krea2Workflow() }]
+    })
+    const wk = rw.meta
+    check(
+      'M1w 提示词升级成 UI workflow 里的完整文本（API 块里只有动态模板）',
+      wk?.prompt === KREA_FULL,
+      JSON.stringify((wk?.prompt ?? '').slice(0, 40))
+    )
+    check('M1w 标出「这份提示词来自 workflow」（排错时要看的东西）', wk?.promptFromWorkflow === true)
+    check(
+      'M1w 反例：子图定义里的 LLM 系统提示词不会被当成提示词',
+      wk?.prompt.includes('反推提示词专家') === false && (wk?.prompt ?? '').includes('你是一名') === false
+    )
+    check(
+      'M1w 反例：URL / 模型路径 / 不含标点的长串都不会被当成提示词',
+      (wk?.prompt ?? '').includes('/api/view') === false && (wk?.prompt ?? '').includes('示例输出') === false
+    )
+    check(
+      'M1w 没有 workflow 块时保持原样（退回 API 解析结果 + 模板）',
+      scanBuffers({ comments: [{ keyword: 'prompt', text: krea2Graph() }] }).meta?.prompt.includes(KREA_WILDCARD) === true
+    )
   }
 
   // ==================== 准备测试库 ====================
@@ -538,6 +671,63 @@ export async function runSmokeMeta(win: BrowserWindow): Promise<void> {
     await capture('shot-meta-settings.png')
     await clickEl('[data-sp-close]')
     await new Promise((r) => setTimeout(r, 250))
+
+    // ==================== M4 重新提取（解析器升级后存量素材的唯一入口） ====================
+    {
+      // 「已扫过」是位标记：位一置上 backfill 就不再碰这张图（不然「本来就没元数据」的图会被无限重扫）。
+      // 代价是解析器升级后存量素材不会自动重扫 —— 所以必须有 rescan 这个显式入口。
+      const pick = q<{ id: number; name: string }>(
+        "SELECT id, name FROM assets WHERE type='image' AND gen_meta IS NOT NULL LIMIT 1"
+      )
+      const hand = q<{ id: number; name: string }>(
+        `SELECT id, name FROM assets WHERE type='image' AND id<>${pick?.id ?? -1} LIMIT 1`
+      )
+      check(
+        'M4 前置：库里能找到「已提取过」和「备用」两个素材',
+        !!pick?.name && !!hand?.name,
+        JSON.stringify([pick?.name, hand?.name])
+      )
+
+      // 伪造两种状态：① 扫过但没结果（等价于「解析器还没修好时扫过的老素材」）
+      //              ② 用户手写过提示词（重扫绝不能覆盖）
+      requireCurrent().db
+        .prepare('UPDATE assets SET gen_state=3, note=NULL, gen_meta=NULL, ai_source=NULL WHERE id=?')
+        .run(pick.id)
+      requireCurrent().db
+        .prepare("UPDATE assets SET gen_state=3, note='我手写的提示词' WHERE id=?")
+        .run(hand.id)
+
+      const q0 = backfillMeta()
+      await new Promise((r) => setTimeout(r, 900))
+      check(
+        'M4 位标记按预期工作：backfill 不会重扫「已扫过」的素材（这正是需要 rescan 的原因）',
+        !rowOf(pick.name)?.note,
+        `queued=${q0.queued} note=${JSON.stringify(rowOf(pick.name)?.note)}`
+      )
+
+      const q1 = rescanAllMeta()
+      check('M4 rescan 把全库图片重新排队', q1.queued > 0, String(q1.queued))
+
+      const back = await waitScanned(pick.name)
+      check(
+        'M4 重扫后提示词被补进「提示词」字段（老素材终于吃得上新解析器）',
+        back && (rowOf(pick.name)?.note ?? '').length > 0,
+        `note=${(rowOf(pick.name)?.note ?? '').slice(0, 30)}`
+      )
+      check(
+        'M4 重扫绝不覆盖用户手写过的提示词',
+        rowOf(hand.name)?.note === '我手写的提示词',
+        JSON.stringify(rowOf(hand.name)?.note)
+      )
+
+      // —— UI 入口 ——
+      await openPanel()
+      await clickEl('[data-sp-group="importing"]')
+      const hasBtn = await waitFor("!!document.querySelector('[data-sp-reextract]')")
+      check('M4 设置面板「导入」组里有「重新提取生成参数」按钮', hasBtn)
+      await clickEl('[data-sp-close]')
+      await new Promise((r) => setTimeout(r, 250))
+    }
 
     // 运行期错误
     const errs = (await js<string[]>('window.__smErrors || []')) ?? []

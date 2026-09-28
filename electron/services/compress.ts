@@ -15,8 +15,7 @@
 //    不依赖 `awaitWriteFinish` 的 800ms 时间窗 —— 那 800ms 里我们还要哈希大文件 + 写 sqlite，
 //    慢机器 / 网络盘上完全可能超时。
 import { BrowserWindow } from 'electron'
-import { existsSync, renameSync, rmSync, statSync } from 'fs'
-import { unlinkSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync } from 'fs'
 import { basename, dirname, extname, join } from 'path'
 import sharp, { type Metadata } from 'sharp'
 import { requireCurrent } from './library'
@@ -24,6 +23,7 @@ import { contentHash, EXT_TYPE } from './importer'
 import { uniqueName } from './naming'
 import { ensureBatch } from './thumbs'
 import { suppressRel } from './watcher'
+import { scanAssetIfNeeded } from './genmeta'
 
 export type CompressFormat = 'jpeg' | 'webp'
 
@@ -86,6 +86,41 @@ function tmpPathFor(abs: string): string {
   return join(dirname(abs), `.stash-compress-${process.pid}-${++tmpSeq}.tmp`)
 }
 
+const TMP_PREFIX = '.stash-compress-'
+const TMP_STALE_MS = 60 * 60 * 1000
+
+/**
+ * 清扫同目录里**本模块自己**留下的残留临时文件（上一次因 EBUSY 失败留下的）。
+ *
+ * 三条约束，缺一不可：
+ *   - 只认 `.stash-compress-` 前缀 + `.tmp` 后缀 —— 用户自己的文件一个都不碰；
+ *   - 只删 mtime 超过 1 小时的 —— 另一个实例可能正在写自己的临时文件，
+ *     跨进程没有共享锁，只能靠时间窗区分（绝不能在「刚写下」的时候删别人）；
+ *   - 删不掉就放着 —— 可能仍被占用，下次压缩再试。
+ */
+function sweepStaleTmp(dir: string): number {
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return 0
+  }
+  const cutoff = Date.now() - TMP_STALE_MS
+  let removed = 0
+  for (const n of names) {
+    if (!n.startsWith(TMP_PREFIX) || !n.endsWith('.tmp')) continue
+    const p = join(dir, n)
+    try {
+      if (statSync(p).mtimeMs > cutoff) continue
+      unlinkSync(p)
+      removed++
+    } catch {
+      /* 还被占用，下次再说 */
+    }
+  }
+  return removed
+}
+
 /** 目标扩展名 */
 function targetExt(fmt: CompressFormat): string {
   return fmt === 'jpeg' ? 'jpg' : 'webp'
@@ -128,6 +163,13 @@ export async function compressAssets(ids: number[], opts: CompressOptions = {}):
       .all(...ids) as unknown as CompressRow[]
 
     summary.total = rows.length
+
+    // 开工前先把上次失败留下的临时文件扫掉（只删我们自己的命名，且 mtime > 1h）。
+    // 用户上一次失败后目录里是会留残渣的 —— 不扫的话它们会一直躺在那儿。
+    for (const d of new Set(rows.map((r) => dirname(join(libPath, ...r.rel_path.split('/')))))) {
+      sweepStaleTmp(d)
+    }
+
     let idx = 0
     // 进度里的「已省」必须**边跑边累计**：summary.savedBytes 是循环结束才结算的，
     // 直接广播它的话整个过程中都是 0，用户会以为一点没省
@@ -185,6 +227,16 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
   const before = statSync(abs).size
   const base = { id: row.id, name: row.name, before, after: before }
 
+  // ---- 动文件之前，先把元数据保底提出来 ----
+  // 提示词（ComfyUI 的 prompt/workflow、A1111 的 parameters）都存在 **PNG 文本块**里，
+  // 而转成 JPG/WebP 会把文本块物理剥掉 —— 先压缩后扫描 = 永久丢失。
+  // 已扫过的不重扫；提取出错也不阻断压缩（压缩才是用户点的那个动作）。
+  try {
+    await scanAssetIfNeeded(row.id, row.rel_path)
+  } catch {
+    /* 提取失败不影响压缩 */
+  }
+
   // ---- 先看清楚源文件：动图与不可解码的一律不碰 ----
   let srcMeta: Metadata
   try {
@@ -239,9 +291,17 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
   }
 
   // ---- 校验：能解码、格式对、尺寸对 —— 三道都过了才敢往原文件上动手 ----
+  //
+  // ⚠️ 校验**必须从内存里解，不能写 `sharp(tmp)`**：libvips 按文件名打开后会**持有文件句柄**
+  // （`destroy()` 也不放，实测），紧接着的 `renameSync(tmp, target)` 在 Windows 上必现
+  // `EBUSY: resource busy or locked`，而 `safeUnlink(tmp)` 同样删不掉
+  // → 目录里留下一堆 `.stash-compress-*.tmp`。同目录、同一张 PNG 转 WebP 的对照实测：
+  //     sharp(tmp).metadata() → rename 失败 EBUSY     |  之后 destroy() 再试 → 仍然失败
+  //     readFileSync + sharp(buffer).metadata() → rename 成功
+  //     不校验 / 只 statSync → rename 成功（证明干扰项就是那个文件句柄）
   let outMeta: Probe
   try {
-    const m = await sharp(tmp).metadata()
+    const m = await sharp(readFileSync(tmp)).metadata()
     outMeta = { width: m.width ?? 0, height: m.height ?? 0, format: m.format }
   } catch {
     safeUnlink(tmp)
@@ -304,8 +364,12 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
       renameSync(tmp, targetAbs)
     }
   } catch (e) {
-    safeUnlink(tmp)
-    return { ...base, status: 'failed', reason: `替换失败：${String((e as Error)?.message ?? e).slice(0, 90)}` }
+    const left = !safeUnlink(tmp) // false = 临时文件还占着，删不掉
+    return {
+      ...base,
+      status: 'failed',
+      reason: failText(e, '替换失败', left ? '（临时文件也被占用，未能清理）' : '')
+    }
   }
 
   // 索引先更新：此后 watcher 收到 add(newRel) 会查到自己这行而 return
@@ -350,12 +414,28 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
   return { ...base, status: 'done', reason: '', after, newName: targetName }
 }
 
-function safeUnlink(p: string): void {
+function safeUnlink(p: string): boolean {
   try {
     unlinkSync(p)
+    return true
   } catch {
-    /* 临时文件可能已经被移走 */
+    // 删不掉通常是句柄还开着（EBUSY）—— 上层据此在提示里说清楚，别静默留垃圾
+    return false
   }
+}
+
+/**
+ * 失败原因文案：把 Windows 的 EBUSY/EPERM/EACCES 翻成用户能动手的中文。
+ * 探针实测过本模块自己的句柄问题已修（见「校验必须从内存解」那段），
+ * 剩下的同类错误基本是**别的程序正开着这张图**（看图软件、资源管理器预览、杀软扫描）。
+ */
+function failText(e: unknown, what: string, extra = ''): string {
+  const code = (e as { code?: string })?.code
+  const msg = String((e as Error)?.message ?? e)
+  if (code === 'EBUSY' || code === 'EPERM' || code === 'EACCES') {
+    return `${what}：文件被占用或没有权限（关掉正在打开这张图的程序再试）${extra}`.slice(0, 140)
+  }
+  return `${what}：${msg}${extra}`.slice(0, 120)
 }
 
 function fmtSize(n: number): string {

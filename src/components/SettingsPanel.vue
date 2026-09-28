@@ -79,6 +79,8 @@ const resetArmed = ref(false)
 const libStats = ref<StashLibraryStats | null>(null)
 const scan = ref<StashScanResult | null>(null)
 const scanning = ref(false)
+/** 重新提取生成参数：排队请求发出后按钮先禁用，避免连点导致重复入队 */
+const metaBusy = ref(false)
 const libBusy = ref(false)
 const cleanArmed = ref(false)
 const deleteLibArmed = ref(false)
@@ -312,6 +314,31 @@ function toggleAiBadge(): void {
 }
 function toggleExtractMeta(): void {
   void settings.patch({ importing: { extractMeta: !s.value.importing.extractMeta } })
+}
+
+/**
+ * 重新提取全部素材的生成参数。
+ *
+ * 为什么需要这个按钮：「已扫过」是**位标记**，位一旦置上，后台补扫就不会再碰那张图
+ * （不这样设计的话，「本来就没元数据」的图会被无限重扫）。代价是解析器升级后
+ * **存量素材不会自动重扫** —— 用户会以为「更新了还是提不出来」。所以给一个显式入口。
+ */
+async function rescanMeta(): Promise<void> {
+  metaBusy.value = true
+  const r = await window.stash.meta.rescan()
+  metaBusy.value = false
+  if (!r.ok || !r.data) {
+    assets.notify('error', `重新提取失败：${r.error ?? '未知原因'}`)
+    return
+  }
+  await assets.refresh()
+  await assets.reloadDetail()
+  assets.notify(
+    'info',
+    r.data.queued
+      ? `已重新排队 ${r.data.queued} 个素材，提完会自动刷新列表与详情`
+      : '没有需要重扫的素材，或「提取提示词 / 识别 AI 来源」两个开关都关着'
+  )
 }
 function toggleDetectAi(): void {
   void settings.patch({ importing: { detectAi: !s.value.importing.detectAi } })
@@ -870,6 +897,20 @@ async function copyDiagnostics(): Promise<void> {
                 @click="toggleExtractMeta"
               >
                 <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">重新提取生成参数</div>
+                <div class="sp-tip">
+                  已扫过的素材不会自动重扫（否则「本来就没元数据」的图会被无限重扫）。
+                  升级解析器、或想整体重来一遍时点这里；
+                  <b>你手写过的提示词不会被覆盖</b>
+                </div>
+              </div>
+              <button class="sp-btn" type="button" data-sp-reextract :disabled="metaBusy" @click="rescanMeta">
+                {{ metaBusy ? '排队中…' : '重新提取' }}
               </button>
             </div>
 

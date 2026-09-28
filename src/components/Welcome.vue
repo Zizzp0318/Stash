@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
+import WinControls from './WinControls.vue'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -43,6 +44,10 @@ async function createNew(): Promise<void> {
 
 <template>
   <div class="welcome">
+    <!-- 无边框窗口：欢迎页没有 TitleBar，控制按钮必须在这里自己挂一份，
+         否则新建库/未开库时窗口既不能最小化也不能关闭 -->
+    <WinControls class="welcome-controls" />
+
     <div class="w-card">
       <div class="w-logo">
         <svg viewBox="0 0 12 12" fill="none">

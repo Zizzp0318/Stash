@@ -11,10 +11,11 @@
 //
 // ⚠️ 会写真实的 userData/config.json（压缩档位存在那儿），开头快照、finally 原样还原。
 import { app, BrowserWindow } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
 import { execFileSync } from 'child_process'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import zlib from 'node:zlib'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { closeCurrent, createLibrary, mkdirRel, requireCurrent } from './library'
@@ -71,6 +72,25 @@ async function makeBigPng(w: number, h: number, hue: number): Promise<Buffer> {
 }
 
 const fmtSize = (n: number): string => (n < 1024 ? n + ' B' : (n / 1024).toFixed(0) + ' KB')
+
+/** PNG 块：长度(4) + 类型(4) + 数据 + CRC32(4) */
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length)
+  const t = Buffer.from(type, 'latin1')
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(zlib.crc32(Buffer.concat([t, data])) >>> 0)
+  return Buffer.concat([len, t, data, crc])
+}
+
+/** 给 PNG 塞一个 tEXt 文本块（插在 IHDR 之后 —— 8 字节签名 + 25 字节 IHDR） */
+function withTextChunk(png: Buffer, keyword: string, text: string): Buffer {
+  const chunk = pngChunk(
+    'tEXt',
+    Buffer.concat([Buffer.from(keyword, 'latin1'), Buffer.from([0]), Buffer.from(text, 'utf8')])
+  )
+  return Buffer.concat([png.subarray(0, 33), chunk, png.subarray(33)])
+}
 
 export async function runSmokeCompress(win: BrowserWindow): Promise<void> {
   const checks: Check[] = []
@@ -431,6 +451,123 @@ export async function runSmokeCompress(win: BrowserWindow): Promise<void> {
       const errs = await js<string[]>('window.__scErrors || []')
       if (Array.isArray(errs)) jsErrors.push(...errs)
       check('C6 全流程渲染层无运行期错误', jsErrors.length === 0, jsErrors.slice(0, 3).join(' | '))
+    }
+
+    // ==================== C7 替换偶发 EBUSY + 压缩前保底提词 ====================
+    // 这一段来自用户实测报回来的 bug：
+    //   批量压缩时报 `EBUSY: resource busy or locked, rename '...\.stash-compress-<pid>-3.tmp'`，
+    //   同一批里 1、3 失败、2 成功，目录里还留下两个 .tmp 残渣。
+    // 根因：校验写的是 `sharp(tmp).metadata()` —— libvips 打开临时文件后**持有句柄**，
+    //   释放时机取决于 V8 的 GC，所以**偶发**：GC 恰好回收了就成功、没回收就 EBUSY，
+    //   而 `safeUnlink(tmp)` 同样删不掉 → 残渣留在用户目录里。
+    //   改成从内存（Buffer）解就没有那个句柄，与 GC 时机无关。
+    // 顺带补一条产品级保护：提示词只存在于 PNG 文本块，转 JPG/WebP 会被**物理剥离**，
+    //   所以压缩前必须先把它提出来落库 —— 否则「先批量压缩、后台还没扫到」的素材提示词永久丢失。
+    {
+      const A1111 = [
+        '1girl, cat ears, hanfu, best quality, masterpiece',
+        'Negative prompt: lowres, bad anatomy, watermark',
+        'Steps: 20, Sampler: Euler a, CFG scale: 4.5, Seed: 4242, Size: 1800x2400, Model: smoke_model'
+      ].join('\n')
+
+      writeFileSync(join(src, 'meta.png'), withTextChunk(await makeBigPng(1800, 2400, 45), 'parameters', A1111))
+      writeFileSync(join(src, 'swap1.png'), await makeBigPng(1500, 2100, 120))
+      writeFileSync(join(src, 'swap2.png'), await makeBigPng(1500, 2100, 210))
+      writeFileSync(
+        join(src, 'cover.jpg'),
+        await sharp(await makeBigPng(1200, 1600, 300)).jpeg({ quality: 98 }).toBuffer()
+      )
+      const c7names = ['meta.png', 'swap1.png', 'swap2.png', 'cover.jpg']
+
+      await new Promise<void>((resolve) => {
+        importFiles({
+          paths: c7names.map((n) => join(src, n)),
+          folderId: folder.id,
+          mode: 'copy',
+          onDone: () => resolve()
+        })
+      })
+
+      // —— 隔离：让「提词」这件事只剩压缩流程能做 ——
+      // 导入完成后后台队列会自己扫一遍（产品正常行为），先等它彻底静默：
+      // 连续两轮读出来的行记录一模一样才算跑完。
+      // ⚠️ 别用「改设置开关」来做隔离：`patchSettings` 会广播 settings:changed，
+      //    补扫链立刻把未扫的素材扫掉 —— 那是**压缩前**就写好的 note，断言会假绿
+      //    （实测踩过：把保底提取整个摘掉，C7 的提词断言居然还是绿的）。
+      let lastSnap = ''
+      for (let i = 0; i < 16; i++) {
+        await new Promise((r) => setTimeout(r, 400))
+        const snap = JSON.stringify([rowOf('meta.png'), rowOf('swap1.png')])
+        if (snap === lastSnap) break
+        lastSnap = snap
+      }
+      const metaRow = rowOf('meta.png') as Row
+      check(
+        'C7 前置：后台已经扫过这张（说明队列跑完了，接着才能做隔离）',
+        (metaRow.gen_state ?? 0) === 3,
+        `state=${metaRow.gen_state}`
+      )
+      requireCurrent().db
+        .prepare('UPDATE assets SET note=NULL, gen_meta=NULL, ai_source=NULL, gen_state=0 WHERE id=?')
+        .run(metaRow.id)
+      await new Promise((r) => setTimeout(r, 300))
+      const preRow = rowOf('meta.png') as Row
+      check(
+        'C7 前置：清回未扫状态后没人抢写（此时唯一会写的只剩压缩流程自己）',
+        !preRow.note && (preRow.gen_state ?? 0) === 0,
+        `state=${preRow.gen_state} note=${preRow.note}`
+      )
+
+      // 两个手工造的临时文件：2 小时前的该被清扫，刚写的绝不能被误删（另一个实例可能正在写）
+      const staleTmp = join(libPath(), '素材', '.stash-compress-99999-1.tmp')
+      const freshTmp = join(libPath(), '素材', '.stash-compress-99999-2.tmp')
+      writeFileSync(staleTmp, 'stale')
+      writeFileSync(freshTmp, 'fresh')
+      const old2h = new Date(Date.now() - 2 * 60 * 60 * 1000)
+      utimesSync(staleTmp, old2h, old2h)
+
+      // 三张改格式（png → webp）：连压多张，把「偶发」的暴露概率放大
+      const swapIds = ['meta.png', 'swap1.png', 'swap2.png'].map((n) => (rowOf(n) as Row).id)
+      const sw = await compressAssets(swapIds, { format: 'webp', quality: 82, maxEdge: 0 })
+      check(
+        'C7 改格式压缩三张全部成功（EBUSY 不再随 GC 时机偶发）',
+        sw.items.length === 3 && sw.items.every((i) => i.status === 'done'),
+        JSON.stringify(sw.items.map((i) => [i.name, i.status, i.reason]))
+      )
+      check(
+        'C7 三张都真的换成 webp 了',
+        ['meta.webp', 'swap1.webp', 'swap2.webp'].every((n) => existsSync(relAbs('素材/' + n))),
+        c7names.join(',')
+      )
+
+      // 同名覆盖（jpg → jpg，用户打开「也压 JPG」开关时走的就是这条）
+      const coverId = (rowOf('cover.jpg') as Row).id
+      const sc = await compressAssets([coverId], { format: 'jpeg', quality: 70, alsoJpeg: true })
+      check('C7 同名覆盖（jpg→jpg 覆盖自己）也成功', sc.items[0]?.status === 'done', JSON.stringify(sc.items[0]))
+      check(
+        'C7 覆盖后仍是原名（没被唯一化成 cover (1).jpg）',
+        rowOf('cover.jpg') !== undefined && !existsSync(relAbs('素材/cover (1).jpg'))
+      )
+
+      // —— 保底提词：状态位是我们刚清空的，所以 note 只可能是压缩流程写的 ——
+      const mrow = rowOf('meta.webp')
+      check(
+        'C7 压缩前先把提示词提出来了（先压缩后扫描不会再丢）',
+        (mrow?.note ?? '').includes('cat ears') && mrow?.ai_source === 'a1111',
+        `note=${(mrow?.note ?? '').slice(0, 40)} ai=${mrow?.ai_source}`
+      )
+      check(
+        'C7 提取内容与状态位在同一条更新里（读不到半成品）',
+        ((mrow?.gen_state ?? 0) & 3) === 3,
+        String(mrow?.gen_state)
+      )
+
+      // —— 残渣清扫 ——
+      check('C7 2 小时前的残留临时文件被清掉', !existsSync(staleTmp))
+      check('C7 刚写的临时文件绝不误删（跨实例只能靠时间窗区分）', existsSync(freshTmp))
+      rmSync(freshTmp, { force: true })
+      const strays2 = strayTmp()
+      check('C7 收尾无自身残留', strays2.length === 0, strays2.join(' | ').replace(libPath(), '<lib>'))
     }
   } catch (e) {
     check('套件执行未抛异常', false, String((e as Error)?.message ?? e))

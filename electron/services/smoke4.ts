@@ -317,7 +317,10 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
         rowGone: !after.some((r) => r.id === target.id),
         remaining: after.length,
         trashDirCreated: existsSync(join(libPath, '.trash')),
-        notice: await notice()
+        notice: await notice(),
+        // 素材都删没了，右键菜单必须一起收掉 —— 否则它留在原地写着「删除选中的 N 项？」
+        // （N 已归零），只能点空白处才消失。菜单里其它动作都收过，唯独删除这条漏过。
+        menuGone: !(await js(`!!document.querySelector('.ctx-menu')`))
       }
 
       // ⑩附加诊断：绕开 UI 直接调服务层，拿到真实错误
@@ -514,7 +517,7 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
     const s5 = R.step5_bulkRate as { allOk: boolean }
     const s6 = R.step6_bulkFav as { allOk: boolean }
     const s7 = R.step7_bulkMove as { relAllInTarget: boolean; filesInTarget: number; selectionCleared: boolean }
-    const s10 = R.step10_delete as { fileGone: boolean; rowGone: boolean; trashDirCreated: boolean }
+    const s10 = R.step10_delete as { fileGone: boolean; rowGone: boolean; trashDirCreated: boolean; menuGone: boolean }
     const s11 = R.step11_blankClear as { selectedAfter: number; batchbarGone: boolean }
     const s12 = R.step12_detail as {
       ratingAfterStarClick: number
@@ -550,8 +553,9 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       offStarColorMatchesDetail:
         !!s4p && !!s8p && s4p.color === s8p.color &&
         (s8p.detailOffColor == null || s8p.color === s8p.detailOffColor),
-      // 删除即物理删除：文件没了、索引行没了，且绝不产生 .trash 回收站目录
-      hardDelete: !!s10?.fileGone && !!s10?.rowGone && s10?.trashDirCreated === false,
+      // 删除即物理删除：文件没了、索引行没了，且绝不产生 .trash 回收站目录；
+      // 菜单也必须一起收掉（素材都没了，菜单留在原地写着「删除选中的 0 项」）
+      hardDelete: !!s10?.fileGone && !!s10?.rowGone && s10?.trashDirCreated === false && s10?.menuGone === true,
       blankClears: s11?.selectedAfter === 0 && !!s11?.batchbarGone,
       // 详情页评分：DB 值 + DOM 点亮星数都要对
       detailStar: s12?.ratingAfterStarClick === 3 && !!s12?.starDomFollowsDb,

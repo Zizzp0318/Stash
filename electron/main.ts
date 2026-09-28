@@ -1,7 +1,8 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
 import { spawn } from 'child_process'
 import { join } from 'path'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync, readFileSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
 import * as librarySvc from './services/library'
 import * as assetsSvc from './services/assets'
 import * as importerSvc from './services/importer'
@@ -25,6 +26,7 @@ import { runSmokePreview } from './services/smoke-preview'
 import { runSmokeSettings } from './services/smoke-settings'
 import { runSmokeMeta } from './services/smoke-meta'
 import { runSmokeCompress } from './services/smoke-compress'
+import { runSmokeWelcome } from './services/smoke-welcome'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -49,6 +51,19 @@ const GPU_FALLBACK_FLAG = '--gpu-fallback'
 /** 冒烟/自动化跑在受限环境里，而且本来就不需要渲染 —— 直接预先降级，省掉一次自救重启 */
 const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke-'))
 if (isSmokeRun) app.commandLine.appendSwitch('disable-gpu-sandbox')
+
+// 欢迎页冒烟：渲染层启动会自动恢复「最近打开的库」，只有库列表为空才会落在欢迎页 ——
+// 所以先把 userData 换成一次性目录（config.json 不存在 → 无历史库），跑完连同目录一起丢弃，
+// 绝不碰用户真实的 config.json（recentLibraries / settings 都在里面）。
+if (process.argv.includes('--smoke-welcome')) {
+  const ud = join(tmpdir(), 'stash-smoke-welcome-ud')
+  try {
+    rmSync(ud, { recursive: true, force: true })
+  } catch {
+    /* 清不掉就复用，config 里没库同样能进欢迎页 */
+  }
+  app.setPath('userData', ud)
+}
 
 /**
  * 正常启动时的兜底：GPU 进程连续崩溃就自己拉起一个带降级开关的新实例。
@@ -365,6 +380,9 @@ function bootstrap(): void {
 
     // 生成参数：手动补扫
     ipcMain.handle('meta:backfill', () => wrap(() => genmetaSvc.backfillMeta()))
+    // 重扫：清「已扫过」位后全库重来。状态位一旦置位 backfill 就不会再碰这张图，
+    // 所以解析器升级后**必须**有这么一个显式入口，否则存量素材永远拿不到新解析结果
+    ipcMain.handle('meta:rescan', () => wrap(() => genmetaSvc.rescanAllMeta()))
     // 来源标识的中文名由主进程给：渲染层再抄一张表迟早和上面分叉
     ipcMain.handle('meta:labels', () => wrap(() => genmetaSvc.AI_SOURCE_LABELS))
 
@@ -516,6 +534,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-preview')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokePreview(win)
+      })
+    }
+
+    // 欢迎页冒烟：未开库视图（无 TitleBar）也必须能最小化/最大化/关闭 —— 无边框窗口的唯一出口
+    if (process.argv.includes('--smoke-welcome')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeWelcome(win)
       })
     }
 

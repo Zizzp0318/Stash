@@ -55,6 +55,14 @@ export interface GenMeta {
   loras: string[]
   /** ComfyUI：`workflow` 块是否也在（在的话这张图能拖回 ComfyUI 复原工作流） */
   hasWorkflow: boolean
+  /**
+   * 提示词取自 **UI 版 workflow** 而不是 API 块。
+   *
+   * API 块（`prompt`）是**执行前**的图结构，动态提示词只留模板（`__分类名__`）；
+   * UI 版（`workflow`）保存的是界面上的当前值，实测用户那张图里子图实例的「提示词」端口上
+   * 存着展开后的 674 字完整文本 —— 那才是 CLIPTextEncode 真正吃到的。
+   */
+  promptFromWorkflow?: boolean
   /** 命中的原始块名，排错时用（用户说「这张读不出来」时第一眼要看的东西） */
   rawKeys: string[]
 }
@@ -296,7 +304,7 @@ function parseA1111(params: string, generator: GenGenerator): Partial<GenMeta> {
 
 /** NovelAI 的 `Comment` JSON */
 function parseNovelAI(json: string): Partial<GenMeta> {
-  const j = JSON.parse(json) as Record<string, unknown>
+  const j = parseJsonLoose(json) as Record<string, unknown>
   const v4 = j.v4_prompt as { caption?: { base_caption?: string; char_captions?: Array<{ char_caption?: string }> } } | undefined
   const base = v4?.caption?.base_caption
   const chars = (v4?.caption?.char_captions ?? []).map((c) => c.char_caption).filter((x): x is string => !!x)
@@ -320,7 +328,7 @@ function parseNovelAI(json: string): Partial<GenMeta> {
 
 /** InvokeAI 的 `invokeai_metadata` JSON */
 function parseInvoke(json: string): Partial<GenMeta> {
-  const j = JSON.parse(json) as Record<string, unknown>
+  const j = parseJsonLoose(json) as Record<string, unknown>
   const model = j.model as { model_name?: string } | undefined
   return {
     generator: 'invokeai',
@@ -380,12 +388,107 @@ const COMFY_SAMPLER_KEYS = ['sampler_name', 'sampler']
 const COMFY_SCHED_KEYS = ['scheduler', 'scheduler_name']
 const COMFY_LORA_KEYS = ['lora_name']
 
+/**
+ * 「纯字符串载体」节点里可能放提示词的键名。
+ * ⚠️ 只有在类名像字符串载体时才认这些键（`PrimitiveString` 是，`easy simpleMath` 不是 ——
+ * 后者的 `value` 是 `(a*b + (96 * 2))/2` 这种分辨率算式，收进来就会混进用户的提示词）。
+ */
+const COMFY_VALUE_KEYS = ['value', 'string', '文本', '内容']
+/** 类名像「字符串载体」才认 `value` 之类的键 */
+const COMFY_STRING_NODE = /String|Text|Primitive/i
+
+/**
+ * 解析「Python 产出的 JSON」。
+ *
+ * ⚠️ **这是 ComfyUI 提不出提示词的真凶**（2026-09 用户实测）：
+ * ComfyUI 存进 `prompt` 块的 JSON 是 **Python `json.dumps` 的输出**，而 Python 默认允许
+ * `NaN` / `Infinity` / `-Infinity` 三个**裸字面量** —— JS 的 `JSON.parse` 认为它们非法，
+ * 直接抛 `Unexpected token 'N'`。实测用户图里是节点的状态字段：
+ * `{"506": {"inputs": {..., "changed": [NaN]}}, ...}`。
+ * 抛出去被上层 catch 成 `meta = null` → 表现就是「明明有 prompt 块，却一个字提示词都读不出来」，
+ * 而且**不报错、不提示**（比报错更难查）。
+ *
+ * 替换必须是**词法级**的：不能整串 `replace(/NaN/g, 'null')` ——
+ * 提示词里完全可能出现这三个字母（例如 `NaN art`），整串替换会把用户的内容改坏
+ * （冒烟里有专门的反例断言盯着这条）。所以手写一遍扫描：字符串内部（含 `\\` 转义）原样保留，
+ * 只在字符串之外替换。换成 `null` 而不是 0：它不是个数，别让它混进 `[nodeId, slot]` 连线判据。
+ */
+function parseJsonLoose(text: string): unknown {
+  let out = ''
+  let i = 0
+  let inStr = false
+  while (i < text.length) {
+    const ch = text[i]
+    if (inStr) {
+      out += ch
+      if (ch === '\\') {
+        out += text[i + 1] ?? ''
+        i += 2
+        continue
+      }
+      if (ch === '"') inStr = false
+      i++
+      continue
+    }
+    if (ch === '"') {
+      inStr = true
+      out += ch
+      i++
+      continue
+    }
+    // 字符串外：只认边界完整的裸字面量（后面不是标识符字符，避免动到 NaNx 这种名字）
+    const isBare = (word: string, len: number): boolean =>
+      text.startsWith(word, i) && !/[A-Za-z0-9_$]/.test(text[i + len] ?? '')
+    let lit = 0
+    if (isBare('-Infinity', 9)) lit = 9
+    else if (isBare('Infinity', 8)) lit = 8
+    else if (isBare('NaN', 3)) lit = 3
+    if (lit) {
+      out += 'null'
+      i += lit
+      continue
+    }
+    out += ch
+    i++
+  }
+  return JSON.parse(out)
+}
+
+
 type ComfyGraph = Record<string, { class_type?: string; inputs?: Record<string, unknown> }>
 
-/** 判断是不是「文本节点」：类名带 CLIPTextEncode，或就是几种通用的纯文本节点 */
-function isComfyTextNode(classType: string, inputs: Record<string, unknown>): boolean {
-  if (typeof inputs.text !== 'string' || !inputs.text.trim()) return false
-  return /CLIPTextEncode|Text\s*Encode|^Text$|^Text Multiline$|^ttN text$/i.test(classType)
+/**
+ * 从一个节点里取出「提示词文本」，取不到返回 null。
+ *
+ * 判据 = **键名白名单**里的非空字符串（见 `COMFY_VALUE_KEYS` + `text`）。
+ *
+ * 为什么不按「类名必须是文本节点」枚举：用户 2026-09 实测的工作流
+ * （Krea2 + rgthree + MK_PromptConcat + DPRandomGenerator）里，提示词是**分散**的：
+ * ```
+ * KSampler.positive → CLIPTextEncode.text → PreviewAny.source → MK_PromptConcat.提示词_01
+ *                        → PrimitiveString.value = "示例角色,"      ← 值挂在 value 上
+ *                    MK_PromptConcat.提示词_02 → Any Switch → DPRandomGenerator.text
+ *                        = "__SFW15000QwenZImage15000_porV30…"     ← 通配符模板，键名是 text
+ * ```
+ * 只看 `inputs.text` 会在 `PrimitiveString` 断掉；只认 `CLIPTextEncode` 则整条链路都取不到。
+ * 两种漏法的共同表现是 **参数全对（steps/cfg/seed/sampler 都对）、唯独提示词空**，最难查。
+ *
+ * 两条边界：
+ *   - `text` 键**不限类名**（`DPRandomGenerator.text` 是通配符模板，就是要收）；
+ *   - `value` / `string` 等键**只在类名像字符串载体时**才收，否则会把
+ *     `easy simpleMath.value = "(a*b + (96 * 2))/2"`（分辨率算式）写进提示词；
+ *   - 白名单本身不能省：链路会顺着 `CLIPTextEncode.clip` 走到 `CLIPLoader`，
+ *     放开成「任何字符串输入都算」会把 `clip_name = "xxx.safetensors"` 写进用户的备注。
+ */
+function comfyTextOf(node: { class_type?: string; inputs?: Record<string, unknown> }): string | null {
+  const inputs = node.inputs ?? {}
+  if (typeof inputs.text === 'string' && inputs.text.trim()) return inputs.text
+  if (!COMFY_STRING_NODE.test(String(node.class_type ?? ''))) return null
+  for (const k of COMFY_VALUE_KEYS) {
+    const v = inputs[k]
+    if (typeof v === 'string' && v.trim()) return v
+  }
+  return null
 }
 
 /** 引用可能是字面值，也可能是 `[nodeId, slot]` 连线 */
@@ -411,16 +514,82 @@ function resolveComfyTexts(
   seen.add(`${id}:${depth}`)
   const node = graph[id]
   if (!node) return
-  const inputs = node.inputs ?? {}
-  if (isComfyTextNode(String(node.class_type ?? ''), inputs)) {
-    out.push(String(inputs.text))
+  // `ConditioningZeroOut` = 「把条件清零」，语义就是**空**。
+  // 实测用户工作流把同一条正面链路挂到 KSampler.negative 再 ZeroOut 一次（表示「不要负面提示词」），
+  // 不在这里剪枝的话，负面会把整段正面提示词原样抄一遍，写进备注就是错的。
+  if (/^ConditioningZeroOut$/i.test(String(node.class_type ?? ''))) return
+  const text = comfyTextOf(node)
+  if (text !== null) {
+    out.push(text)
     return
   }
-  for (const v of Object.values(inputs)) resolveComfyTexts(graph, v, out, seen, depth + 1)
+  for (const v of Object.values(node.inputs ?? {})) resolveComfyTexts(graph, v, out, seen, depth + 1)
+}
+
+/** UI 版 workflow 里，某个 widget 键「像不像提示词」的权重（0 = 不认） */
+function wfKeyScore(key: string): number {
+  if (/提示词|prompt|positive/i.test(key)) return 3
+  if (/text|value|字符串/i.test(key)) return 2
+  return 0
+}
+
+/** 像不像一段提示词（挡掉 URL / 路径 / 模型文件名 / 太短的参数值） */
+function looksLikePrompt(s: string): boolean {
+  const t = s.trim()
+  if (t.length < 40) return false
+  if (/^(https?:|\/api\/|data:|file:)/i.test(t)) return false
+  if (/\.(safetensors|ckpt|pt|pth|bin|png|jpe?g|webp|gif|mp4|json|txt)$/i.test(t)) return false
+  // 含路径分隔符又没有标点 → 多半是路径/文件名（模型名、临时文件名）
+  if (/[\\/]/.test(t) && !/[,，。；]/.test(t)) return false
+  // 必须像自然语言：有中文，或是有逗号分隔的多段
+  return /[\u4e00-\u9fa5]/.test(t) || /[,，]/.test(t)
+}
+
+/**
+ * 从 ComfyUI 的 **UI 版 workflow**（`workflow` 块）里挖「这次真正喂给 CLIPTextEncode 的文本」。
+ *
+ * 为什么必须看这一块：`prompt` 块（API 格式）是**执行前**的图结构 ——
+ * 动态提示词节点只会留下模板 `__SFW15000QwenZImage15000_porV30…__`，
+ * 运行时的展开结果不在里面。而 UI 版保存的是**界面上各 widget 的当前值**：
+ * 实测用户那张图（Krea2 + 子图 + rgthree）里，子图实例的「提示词」端口上就存着
+ * **展开后的 674 字完整文本** —— 那才是 CLIPTextEncode 真正收到的。
+ *
+ * ⚠️ **只扫顶层 `nodes`，绝不进 `definitions.subgraphs[*]`**：
+ * 子图定义里放的是模板与默认值（实测那里有 651 字的「反推提示词专家」LLM 系统提示词），
+ * 混进来就会把「角色设定」当成提示词写进用户的备注。
+ */
+function comfyTextFromWorkflow(workflowJson: string): string | null {
+  let w: { nodes?: Array<{ widgets_values?: unknown; widgets_values_named?: Record<string, unknown> }> }
+  try {
+    w = parseJsonLoose(workflowJson) as typeof w
+  } catch {
+    return null
+  }
+  const nodes = Array.isArray(w?.nodes) ? w.nodes : []
+  let best: { text: string; score: number } | null = null
+  for (const n of nodes) {
+    const named = n.widgets_values_named ?? {}
+    // 新版工作流带 widgets_values_named（键就是端口名，判据最准）；
+    // 老工作流只有按顺序的 widgets_values，只能按位置猜，给个基础分
+    const entries: Array<[string, unknown]> = Object.keys(named).length
+      ? Object.entries(named)
+      : Array.isArray(n.widgets_values)
+        ? n.widgets_values.map((v, i) => [String(i), v])
+        : []
+    for (const [k, v] of entries) {
+      if (typeof v !== 'string' || !looksLikePrompt(v)) continue
+      const score = wfKeyScore(k)
+      if (score <= 0) continue
+      if (!best || score > best.score || (score === best.score && v.length > best.text.length)) {
+        best = { text: v, score }
+      }
+    }
+  }
+  return best?.text ?? null
 }
 
 function parseComfyUI(promptJson: string, hasWorkflow: boolean): Partial<GenMeta> {
-  const graph = JSON.parse(promptJson) as ComfyGraph
+  const graph = parseJsonLoose(promptJson) as ComfyGraph
   const nodes = Object.entries(graph)
 
   const positive: string[] = []
@@ -443,11 +612,8 @@ function parseComfyUI(promptJson: string, hasWorkflow: boolean): Partial<GenMeta
   }
   // 没被标成负面的文本节点都算正面（有些工作流把负面提示词直接接在 ConditioningZeroOut 上）
   for (const [, n] of nodes) {
-    const inputs = n.inputs ?? {}
-    if (isComfyTextNode(String(n.class_type ?? ''), inputs)) {
-      const t = String(inputs.text)
-      if (!negativeIds.has(t) && !positive.includes(t)) positive.push(t)
-    }
+    const t = comfyTextOf(n)
+    if (t !== null && !negativeIds.has(t) && !positive.includes(t)) positive.push(t)
   }
   for (const t of negativeIds) negative.push(t)
 
@@ -573,7 +739,16 @@ export function scanBuffers(input: ScanInput): ScanOutput {
   const comfyPrompt = byKey.get('prompt')
   if (comfyPrompt && /^\s*\{/.test(comfyPrompt)) {
     try {
-      finish(parseComfyUI(comfyPrompt, byKey.has('workflow')))
+      const partial = parseComfyUI(comfyPrompt, byKey.has('workflow'))
+      // UI 版 workflow 里有「界面上实际的提示词取值」——动态提示词（`__分类名__`）在 API 块里
+      // 只有模板，展开结果只存在这里。**更长的那份才算数**（短的那份多半是模板/片段）。
+      const wfRaw = byKey.get('workflow')
+      const fromWf = wfRaw ? comfyTextFromWorkflow(wfRaw) : null
+      if (fromWf && fromWf.length > (partial.prompt ?? '').length) {
+        partial.prompt = fromWf
+        partial.promptFromWorkflow = true
+      }
+      finish(partial)
     } catch {
       meta = null // prompt 块存在但不是合法 JSON → 不是 ComfyUI，交给后面的解析器
     }
@@ -777,4 +952,51 @@ export function backfillMeta(): { queued: number } {
   metaQueue.push(...fresh)
   metaPump()
   return { queued: fresh.length }
+}
+
+/**
+ * 「压缩前保底提取」——把这一张的元数据先提出来落库，再让调用方去改文件。
+ *
+ * 为什么必须有这一步：压缩（PNG → JPG/WebP）会把 **PNG 文本块物理剥离**。
+ * ComfyUI 的 `prompt`/`workflow`、A1111/Forge 的 `parameters` 全都在文本块里，
+ * 而 JPEG/WebP 根本装不下文本块（实测；只有 ICC/EXIF 能带过去）。
+ * 所以如果用户「先批量压缩、后台还没扫到这张」→ 提示词就**永久消失**，再扫也扫不回来。
+ *
+ * 已扫过的那一类不重扫 —— 判据与 `backfillMeta` 共用同一份状态位（铁律：状态用位标记）。
+ * 返回是否真的扫了（冒烟断言用）。
+ */
+export async function scanAssetIfNeeded(id: number, relPath: string): Promise<boolean> {
+  const s = getSettings()
+  let mask = 0
+  if (s.importing.extractMeta) mask |= STATE_META
+  if (s.importing.detectAi) mask |= STATE_AI
+  if (!mask) return false // 两个开关都关着 → 尊重用户设置，什么都不做
+
+  const { db } = requireCurrent()
+  const row = db.prepare('SELECT gen_state FROM assets WHERE id=?').get(id) as
+    | { gen_state: number | null }
+    | undefined
+  if (!row) return false
+  if (((row.gen_state ?? 0) & mask) === mask) return false
+
+  await scanAsset({ id, rel_path: relPath })
+  return true
+}
+
+/**
+ * 「重新提取全部素材的生成参数」——**解析器修好/加功能之后，让存量素材能吃上**。
+ *
+ * 为什么必须有这个入口：`gen_state` 是**位标记**，位一旦置上 backfill 就不再碰这张图
+ * （那是为了避免「本来就没元数据的图被无限重扫」，见上面 backfillMeta 的注释）。
+ * 代价是：解析器升级后，**已经扫过的图不会自动重扫** —— 用户会觉得「更新了软件还是提不出来」。
+ * 所以必须给一个显式入口把位清零再入队。
+ *
+ * 只清状态位，不动 `gen_meta` 与 `note`：重扫会覆盖 gen_meta；而 note 仍然**只填空的**，
+ * 用户手写过的提示词一个字都不会被改。
+ * 两个开关都关着时 backfill 返回 0（尊重设置），此时位保持为 0，以后打开开关会自动补扫。
+ */
+export function rescanAllMeta(): { queued: number } {
+  const { db } = requireCurrent()
+  db.prepare("UPDATE assets SET gen_state=0 WHERE type='image'").run()
+  return backfillMeta()
 }

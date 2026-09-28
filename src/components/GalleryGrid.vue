@@ -816,8 +816,17 @@ async function confirmMove(): Promise<void> {
   await assets.bulkMove(t)
 }
 
+/**
+ * 删除确认 —— 右键菜单的「删除」与底部批量条的确认共用这一个入口。
+ *
+ * ⚠️ `closeMenu()` 不能省：素材删掉之后行已经不存在了，菜单却会**留在原地**，
+ * 上面还写着「删除选中的 N 项？」（此时 N 已经归零），只能点空白处才消失 ——
+ * 这就是用户截图报的那个 bug。菜单里其它动作（评分/喜欢/复制/粘贴/重命名/压缩/移动）
+ * 都在各自入口收过菜单，唯独这条漏了。
+ */
 async function confirmDelete(): Promise<void> {
   deleteOpen.value = false
+  closeMenu()
   await assets.bulkDelete()
 }
 

@@ -430,6 +430,8 @@ export interface StashCompressApi {
 export interface StashMetaApi {
   /** 把「该扫但还没扫」的图片入队（开库与导入后都会自动跑） */
   backfill: () => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
+  /** 清掉「已扫过」状态位后全库重扫（解析器升级后用，用户显式触发） */
+  rescan: () => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
   /** 来源标识 id → 中文名（卡片角标的悬停说明用） */
   labels: () => Promise<{ ok: boolean; data?: Record<string, string>; error?: string }>
   onDone: (cb: (d: unknown) => void) => Unsub

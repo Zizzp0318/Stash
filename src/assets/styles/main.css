@@ -729,12 +729,24 @@ mark {
 
 /* 欢迎页 */
 .welcome {
+  position: relative;
   height: 100vh;
   display: flex; align-items: center; justify-content: center;
   background: var(--bg-base, #242629);
   -webkit-app-region: drag;
 }
 .welcome button, .welcome input { -webkit-app-region: no-drag; }
+/* 欢迎页右上角的窗口控制条：整页是拖拽区，只有这块是可点的按钮。
+   无边框窗口没有系统标题栏，这里漏了就等于「窗口关不掉」—— 必须在最上层 */
+.welcome .win-controls {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  margin: 0;
+  padding: 0;
+  z-index: 2;
+  -webkit-app-region: no-drag;
+}
 .w-card {
   width: 380px;
   padding: 36px 32px 28px;
