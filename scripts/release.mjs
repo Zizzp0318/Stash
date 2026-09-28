@@ -180,6 +180,50 @@ function fail(step, res) {
 
 const fmt = (n) => (n / 1024 / 1024).toFixed(0) + ' MB'
 
+/**
+ * 相比上一个 tag 的变更摘要（Release 页面的「本版更新」段）。
+ * 列表就是 commit 首行 —— 本项目提交信息首行都是结论式中文长句，直接放上来信息量足够。
+ */
+function changelogFor(tag) {
+  // ⚠️ 本机安全软件会**间歇性**盯上 git.exe：spawnSync 偶发 `EBUSY`（实测撞过一次）——
+  //    而 changelog 的异常被 catch 静默吞成空串，结果 Release 里悄悄少了一段「本版更新」，
+  //    事后只能手动 PATCH 补。所以这里对 EBUSY 做同步退避重试；其它异常照旧吞掉
+  //    （宁缺毋滥，别让整次发布失败）。
+  const git = (args: string[]): string => {
+    let last: Error | null = null
+    for (let i = 0; i < 4; i++) {
+      try {
+        return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' })
+      } catch (e) {
+        last = e as Error
+        if (!String(e).includes('EBUSY')) break
+        const until = Date.now() + 300 * (i + 1)
+        while (Date.now() < until) {
+          /* 同步退避（照 rmWithRetry 的样式，冒烟脚本里不值得引入异步） */
+        }
+      }
+    }
+    throw last as Error
+  }
+  try {
+    const tags = git(['tag', '--sort=creatordate'])
+      .split('\n')
+      .filter(Boolean)
+    const idx = tags.indexOf(tag)
+    const prev = idx > 0 ? tags[idx - 1] : null
+    const range = prev ? `${prev}..${tag}` : tag
+    const lines = git(['log', range, '--oneline', '--no-decorate'])
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .slice(0, 20)
+    if (!lines.length) return ''
+    return '### 本版更新\n\n' + lines.map((l) => `- ${l}`).join('\n') + '\n'
+  } catch {
+    return '' // git 出问题时宁缺毋滥，别让整次发布失败
+  }
+}
+
 // `--check`：只验凭据 + 代理连通性，不碰远端任何东西（排错用）
 if (process.argv.includes('--check')) {
   const r = await call({ path: '/user' })
@@ -274,6 +318,8 @@ InvokeAI / NovelAI / Midjourney**，并识别 C2PA 与国内 AIGC 标识。
 
 打包产物跑过完整自检：\`--smoke-preview\` 90 项断言全过（\`failed: []\`），覆盖 ffmpeg 转码与派生、
 sharp 图片处理、Range 流式、真实播放与图片预览 —— 等于把「原生依赖在 asar 里解包对不对」实测了一遍。
+
+${changelogFor(TAG)}
 
 ---
 
