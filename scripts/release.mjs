@@ -189,13 +189,15 @@ function changelogFor(tag) {
   //    而 changelog 的异常被 catch 静默吞成空串，结果 Release 里悄悄少了一段「本版更新」，
   //    事后只能手动 PATCH 补。所以这里对 EBUSY 做同步退避重试；其它异常照旧吞掉
   //    （宁缺毋滥，别让整次发布失败）。
-  const git = (args: string[]): string => {
-    let last: Error | null = null
+  // 本文件是 .mjs（纯 JS），不能写 TS 类型注解 —— 上一版在这里写了 `(args: string[]): string`
+  // 直接把整个脚本变成 SyntaxError（node --check 抓到过，但当时命令链用的分号，推送照旧执行了）
+  const git = (args) => {
+    let last = null
     for (let i = 0; i < 4; i++) {
       try {
         return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' })
       } catch (e) {
-        last = e as Error
+        last = e
         if (!String(e).includes('EBUSY')) break
         const until = Date.now() + 300 * (i + 1)
         while (Date.now() < until) {
@@ -203,7 +205,7 @@ function changelogFor(tag) {
         }
       }
     }
-    throw last as Error
+    throw last
   }
   try {
     const tags = git(['tag', '--sort=creatordate'])
