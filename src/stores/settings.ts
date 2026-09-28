@@ -34,11 +34,11 @@ export type SettingsPatch = StashSettingsPatch
 const FALLBACK: StashSettings = {
   defaultView: 'masonry',
   viewZoom: VIEW_ZOOM_DEFAULT,
-  cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true },
+  cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
-  importing: { mode: 'copy', dedupe: true, palette: true }
+  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true }
 }
 
 /** 老键（搬家前的位置） */
@@ -100,10 +100,12 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
     },
     importing: {
       mode: im.mode === 'move' ? 'move' : 'copy',
-      // 判据写成 `!== false`：这两项默认都是「开」，只有明确 false 才关，
+      // 判据写成 `!== false`：这几项默认都是「开」，只有明确 false 才关，
       // 否则老配置里缺键会被判成关 → 升级后行为悄悄变了
       dedupe: im.dedupe !== false,
-      palette: im.palette !== false
+      palette: im.palette !== false,
+      extractMeta: im.extractMeta !== false,
+      detectAi: im.detectAi !== false
     }
   }
 }

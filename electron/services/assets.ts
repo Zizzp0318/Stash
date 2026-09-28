@@ -335,7 +335,9 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; re
 /** 库内复制时要一起带过去的列（内容属性 + 用户标注），别漏 —— 漏了 note 就会出现「副本没有备注」 */
 const COPY_COLS = [
   'type', 'ext', 'size', 'width', 'height', 'duration_ms', 'content_hash',
-  'rating', 'is_fav', 'palette', 'exif', 'note'
+  'rating', 'is_fav', 'palette', 'exif', 'note',
+  // 副本与原件内容一致（同一个 content_hash），生成参数当然也一样 —— 漏了就会「副本没有提示词」
+  'gen_meta', 'gen_state', 'ai_source'
 ] as const
 
 /**

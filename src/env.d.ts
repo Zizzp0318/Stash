@@ -72,6 +72,12 @@ export interface StashAssetRow {
   palette: string | null
   /** 提示词 / 备注（详情栏色板下方那块，双击编辑） */
   note: string | null
+  /** 从图片里提取到的生成参数（JSON 字符串；null = 没有或还没扫） */
+  gen_meta: string | null
+  /** 已扫过的类别位标记：1=生成参数 2=AI 来源。0 = 还没扫 */
+  gen_state: number | null
+  /** AI 来源标识（comfyui / c2aa:openai / aigc-cn …），卡片角标用 */
+  ai_source: string | null
   file_mtime: number
   imported_at: number
   missing: number
@@ -248,6 +254,8 @@ export interface StashCardFields {
   size: boolean
   time: boolean
   typeBadge: boolean
+  /** 缩略图左下角的「AI 生成」角标 */
+  aiBadge: boolean
 }
 
 /** 缩略图管线偏好 */
@@ -271,6 +279,28 @@ export interface StashImportSettings {
   mode: 'copy' | 'move'
   dedupe: boolean
   palette: boolean
+  /** 提取 AI 生成参数（提示词/模型/采样器/种子） */
+  extractMeta: boolean
+  /** 识别 AI 来源标识（C2PA / 国内 AIGC 标识 / EXIF·XMP） */
+  detectAi: boolean
+}
+
+/** 生成参数（services/genmeta.ts 的解析结果，存在 assets.gen_meta） */
+export interface StashGenMeta {
+  generator: string
+  prompt: string
+  negativePrompt: string
+  model: string
+  sampler: string
+  scheduler: string
+  steps: number | null
+  cfg: number | null
+  seed: string | null
+  width: number | null
+  height: number | null
+  loras: string[]
+  hasWorkflow: boolean
+  rawKeys: string[]
 }
 
 /** 全局偏好（存在 userData/config.json，跨库一份） */
@@ -352,6 +382,14 @@ export interface StashCleanMissingResult {
   pruned: Array<{ id: number; name: string }>
 }
 
+export interface StashMetaApi {
+  /** 把「该扫但还没扫」的图片入队（开库与导入后都会自动跑） */
+  backfill: () => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
+  /** 来源标识 id → 中文名（卡片角标的悬停说明用） */
+  labels: () => Promise<{ ok: boolean; data?: Record<string, string>; error?: string }>
+  onDone: (cb: (d: unknown) => void) => Unsub
+}
+
 export interface StashHealthApi {
   stats: () => Promise<{ ok: boolean; data?: StashLibraryStats; error?: string }>
   /** 逐个核对磁盘（慢，用户显式点才跑） */
@@ -389,6 +427,7 @@ export interface StashApi {
   settings: StashSettingsApi
   cache: StashCacheApi
   health: StashHealthApi
+  meta: StashMetaApi
   app: StashAppApi
 }
 

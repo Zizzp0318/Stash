@@ -24,6 +24,7 @@ function setNotice(n: { kind: 'error' | 'info'; text: string }): void {
 onMounted(async () => {
   // 偏好先读：网格首帧就该是用户选的视图与卡片大小，否则会先按默认排一遍再跳一下
   await settings.init()
+  await assets.loadAiLabels()
   await lib.bootstrap()
   if (lib.info) {
     await assets.refresh()
@@ -33,6 +34,13 @@ onMounted(async () => {
 
   // 缩略图批量生成完成 → bump 版本号，让所有 <img> 重新加载
   window.stash.thumb.onDone(() => assets.bumpThumbs())
+
+  // 生成参数是**后台异步**扫的（导入后/开库时补扫）。扫完必须把列表与详情重拉一次，
+  // 否则卡片角标与详情栏会一直停在「没有 AI 信息」那一版 —— 用户会以为功能没生效。
+  window.stash.meta.onDone(async () => {
+    await assets.refresh()
+    await assets.reloadDetail()
+  })
 
   // 导入进度事件（全局一份）
   window.stash.import.onProgress((d) => {

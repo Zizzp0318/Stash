@@ -121,6 +121,28 @@ export const useAssetStore = defineStore('assets', () => {
     thumbV.value++
   }
 
+  // —— AI 来源标识的中文名（主进程下发，渲染层不自己抄一份）——
+  const aiLabels = ref<Record<string, string>>({})
+  async function loadAiLabels(): Promise<void> {
+    const r = await window.stash.meta.labels()
+    if (r.ok && r.data) aiLabels.value = r.data
+  }
+  function aiSourceLabel(id: string | null | undefined): string {
+    if (!id) return ''
+    return aiLabels.value[id] ?? id
+  }
+
+  /**
+   * 重新拉一次当前选中的素材详情。
+   * 后台补扫生成参数是异步的（导入后/开库时才跑），扫完要是不重拉，
+   * 详情栏会一直停在「没有生成参数」那一版 —— 用户以为功能没生效。
+   */
+  async function reloadDetail(): Promise<void> {
+    if (selectedId.value == null) return
+    const r = await window.stash.asset.get(selectedId.value)
+    if (r.ok && r.data) detail.value = r.data
+  }
+
   function thumbUrl(hash: string | null, size: 'grid' | 'detail' = 'grid'): string {
     if (!hash) return ''
     const lib = useLibraryStore()
@@ -553,6 +575,7 @@ export const useAssetStore = defineStore('assets', () => {
     selectedIds, selectedCount, selectedAllFav, selectedRating, selectedRatingMixed, isSelected,
     importing, importNotice, notify,
     thumbV, bumpThumbs, thumbUrl,
+    aiLabels, loadAiLabels, aiSourceLabel, reloadDetail,
     cardFields, toggleCardField, viewZoom,
     detailCollapsed, toggleDetail,
     previewId, previewDirty, openPreview, closePreview, stepPreview,

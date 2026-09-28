@@ -1567,3 +1567,29 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 
 /* 库与存储：路径可能很长，键值表里要能截断 */
 .sp-kv .sp-path { max-width: 100%; }
+
+/* AI 来源角标（缩略图左下角）。
+   位置：左上星标 / 右上类型 / 右下时长都已占用，只剩左下。
+   ⚠️ 与其他浮标同规矩：absolute + pointer-events:none（否则卡片高算歪、点击与拖拽被吃）；
+   ⚠️ 配色与主题无关 —— 它压在**用户图片**上，主题文字色在亮图上会直接看不见（铁律 17）。 */
+.card .thumb-ai {
+  position: absolute; bottom: 8px; left: 8px;
+  height: 15px; padding: 0 5px;
+  display: inline-flex; align-items: center;
+  border-radius: 4px;
+  font-size: 10px; line-height: 1; letter-spacing: 0.3px;
+  color: #FFFFFF;
+  background: rgba(24, 26, 28, 0.8);
+  box-shadow: inset 0 0 0 1px rgba(159, 225, 203, 0.55);
+  pointer-events: none;
+}
+/* 列表视图里没有缩略图，角标无处可放，退化成一行小字 */
+.list-ai {
+  flex: 0 0 auto;
+  font-size: 10px; line-height: 1;
+  color: #9FE1CB;
+  border: 1px solid rgba(159, 225, 203, 0.4);
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-right: 8px;
+}

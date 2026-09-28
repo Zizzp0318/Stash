@@ -122,6 +122,13 @@ contextBridge.exposeInMainWorld('stash', {
     clear: (kind: 'thumbs' | 'derived' | 'all') => ipcRenderer.invoke('cache:clear', { kind }),
     reveal: () => ipcRenderer.invoke('cache:reveal')
   },
+  /** AI 生成参数的提取结果（提示词/模型/采样器等与 AI 来源标识） */
+  meta: {
+    backfill: () => ipcRenderer.invoke('meta:backfill'),
+    /** 来源标识 id → 中文名（由主进程统一下发） */
+    labels: () => ipcRenderer.invoke('meta:labels'),
+    onDone: (cb: (d: unknown) => void) => subscribe('meta:done', cb)
+  },
   /** 库体检：失效素材（索引还在、文件没了）的统计 / 核对 / 清理 */
   health: {
     stats: () => ipcRenderer.invoke('health:stats'),

@@ -11,6 +11,7 @@ import { unwatchLibrary, watchLibrary } from './services/watcher'
 import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
 import * as healthSvc from './services/health'
+import * as genmetaSvc from './services/genmeta'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
@@ -21,6 +22,7 @@ import { runSmokeTag } from './services/smoke-tag'
 import { runSmokeEdit } from './services/smoke-edit'
 import { runSmokePreview } from './services/smoke-preview'
 import { runSmokeSettings } from './services/smoke-settings'
+import { runSmokeMeta } from './services/smoke-meta'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -275,6 +277,10 @@ function bootstrap(): void {
           .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE missing=0')
           .all() as Array<never>
         ensureBatch(rows, s)
+        // 顺带补扫「该扫还没扫」的生成参数。挂在 backfill 上而不是缩略图队列内部，
+        // 是因为队列会按「缩略图是否已存在」过滤掉缓存命中的素材 —— 那些素材永远进不了队列，
+        // 于是「先关着用、后来才打开提取」的用户永远补不上（见 genmeta.ts 的位标记设计）。
+        genmetaSvc.backfillMeta()
         return { queued: rows.length }
       })
     )
@@ -348,6 +354,11 @@ function bootstrap(): void {
         return { opened: !err, error: err || null }
       })
     )
+
+    // 生成参数：手动补扫
+    ipcMain.handle('meta:backfill', () => wrap(() => genmetaSvc.backfillMeta()))
+    // 来源标识的中文名由主进程给：渲染层再抄一张表迟早和上面分叉
+    ipcMain.handle('meta:labels', () => wrap(() => genmetaSvc.AI_SOURCE_LABELS))
 
     // 库体检：找「索引还在、文件没了」的失效素材
     ipcMain.handle('health:stats', () => wrap(() => healthSvc.libraryStats()))
@@ -441,6 +452,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-m4')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeM4(win)
+      })
+    }
+
+    // 生成参数冒烟：六家解析器（纯解析）+ 导入后台扫到落库 + 卡片角标与详情栏 + 设置开关
+    if (process.argv.includes('--smoke-meta')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeMeta(win)
       })
     }
 

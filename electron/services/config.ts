@@ -16,8 +16,8 @@ export interface Settings {
   defaultView: 'masonry' | 'list'
   /** 瀑布卡片的目标列宽（px）。范围校验在渲染层（滑块与它同一处定义） */
   viewZoom: number
-  /** 卡片下方显示哪些字段；typeBadge 是缩略图右上角的类型角标 */
-  cardFields: { name: boolean; dims: boolean; size: boolean; time: boolean; typeBadge: boolean }
+  /** 卡片下方显示哪些字段；typeBadge=右上角类型角标，aiBadge=左下角「AI 生成」角标 */
+  cardFields: { name: boolean; dims: boolean; size: boolean; time: boolean; typeBadge: boolean; aiBadge: boolean }
   /** 右侧信息栏默认收起 */
   detailCollapsed: boolean
   /** 缩略图管线 */
@@ -52,17 +52,25 @@ export interface Settings {
     dedupe: boolean
     /** 生成缩略图时顺带算主色板。关掉可省一点 CPU，代价是详情栏没有色板可看 */
     palette: boolean
+    /**
+     * 从图片里提取 AI 生成参数（提示词 / 模型 / 采样器 / 种子…）。
+     * 只认「图片自己带着数据」的格式（ComfyUI、A1111/Forge、Fooocus、InvokeAI、NovelAI、Midjourney）。
+     * ⚠️ GPT-image / DALL·E / Gemini 这类**图里根本没有提示词**，开了也提不出来。
+     */
+    extractMeta: boolean
+    /** 识别 AI 来源（C2PA 内容凭据 / 国内 AIGC 隐式标识 / EXIF·XMP 痕迹），只标来源、不做验签 */
+    detectAi: boolean
   }
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   defaultView: 'masonry',
   viewZoom: 170,
-  cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true },
+  cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
-  importing: { mode: 'copy', dedupe: true, palette: true }
+  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true }
 }
 
 /** 可选的 webp 质量档位（面板上给三档，别让用户随便填个 1） */
@@ -130,10 +138,12 @@ export function sanitizeSettings(raw: unknown): Settings {
     },
     importing: {
       mode: im.mode === 'move' ? 'move' : 'copy',
-      // 这三项默认都是「开」，所以判据写成 `!== false`：只有明确写了 false 才关掉。
-      // 写成 `=== true` 的话，老配置文件里没这个键会被判成关 → 升级后行为悄悄变了。
+      // 这几个默认都是「开」，所以判据写成 `!== false`：只有明确写了 false 才关掉。
+      // 写成 `=== true` 的话，老配置文件里没这些键会被判成关 → 升级后行为悄悄变了。
       dedupe: im.dedupe !== false,
-      palette: im.palette !== false
+      palette: im.palette !== false,
+      extractMeta: im.extractMeta !== false,
+      detectAi: im.detectAi !== false
     }
   }
 }
@@ -229,8 +239,19 @@ export function getSettings(): Settings {
   return load().settings
 }
 
+/**
+ * 深可选补丁：`Partial<Settings>` 只让**顶层**可选，嵌套对象仍是必填 ——
+ * 而调用方（含冒烟）常常只想改一个开关。和渲染层 `StashSettingsPatch` 同一个形状。
+ */
+export type SettingsPatch = Partial<Omit<Settings, 'cardFields' | 'thumbs' | 'preview' | 'importing'>> & {
+  cardFields?: Partial<Settings['cardFields']>
+  thumbs?: Partial<Settings['thumbs']>
+  preview?: Partial<Settings['preview']>
+  importing?: Partial<Settings['importing']>
+}
+
 /** 只覆盖传进来的字段（浅合并；**每个**嵌套对象单独深合并一层，否则会把没传的项抹成 undefined） */
-export function patchSettings(patch: Partial<Settings>): Settings {
+export function patchSettings(patch: SettingsPatch): Settings {
   const c = load()
   c.settings = sanitizeSettings({
     ...c.settings,

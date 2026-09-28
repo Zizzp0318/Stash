@@ -34,7 +34,14 @@ CREATE TABLE IF NOT EXISTS assets (
   note TEXT,
   file_mtime INTEGER NOT NULL,
   imported_at INTEGER NOT NULL,
-  missing INTEGER DEFAULT 0
+  missing INTEGER DEFAULT 0,
+  -- 生成参数（AI 出图的提示词/模型/采样器等，JSON）。见 services/genmeta.ts
+  gen_meta TEXT,
+  -- 已扫过的类别位标记：1=生成参数 2=AI 来源。用位而不是「有没有值」，
+  -- 否则「本来就没元数据」的图会被无限重扫
+  gen_state INTEGER DEFAULT 0,
+  -- AI 来源标识（comfyui / a1111 / c2pa:openai / aigc-cn …），卡片角标与详情栏用
+  ai_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_assets_type   ON assets(type);
 CREATE INDEX IF NOT EXISTS idx_assets_rating ON assets(rating);
@@ -83,6 +90,9 @@ export function openDatabase(stashFile: string): DB {
  */
 function migrate(db: DB): void {
   ensureColumn(db, 'assets', 'note', 'TEXT')
+  ensureColumn(db, 'assets', 'gen_meta', 'TEXT')
+  ensureColumn(db, 'assets', 'gen_state', 'INTEGER DEFAULT 0')
+  ensureColumn(db, 'assets', 'ai_source', 'TEXT')
 }
 
 function tableColumns(db: DB, table: string): string[] {

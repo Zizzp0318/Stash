@@ -282,6 +282,16 @@ function onZoom(e: Event): void {
 function toggleBadge(): void {
   void settings.patch({ cardFields: { typeBadge: !s.value.cardFields.typeBadge } })
 }
+function toggleAiBadge(): void {
+  void settings.patch({ cardFields: { aiBadge: !s.value.cardFields.aiBadge } })
+}
+function toggleExtractMeta(): void {
+  void settings.patch({ importing: { extractMeta: !s.value.importing.extractMeta } })
+}
+function toggleDetectAi(): void {
+  void settings.patch({ importing: { detectAi: !s.value.importing.detectAi } })
+}
+
 function toggleDetailCollapsed(): void {
   void settings.patch({ detailCollapsed: !s.value.detailCollapsed })
 }
@@ -416,6 +426,24 @@ async function copyDiagnostics(): Promise<void> {
                 data-sp-badge
                 :aria-checked="s.cardFields.typeBadge"
                 @click="toggleBadge"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">AI 来源角标</div>
+                <div class="sp-tip">在缩略图左下角标出「有 AI 生成信息」的图（悬停可看来源）</div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.cardFields.aiBadge }"
+                type="button"
+                role="switch"
+                data-sp-ai-badge
+                :aria-checked="s.cardFields.aiBadge"
+                @click="toggleAiBadge"
               >
                 <i></i>
               </button>
@@ -713,6 +741,48 @@ async function copyDiagnostics(): Promise<void> {
                 data-sp-palette
                 :aria-checked="s.importing.palette"
                 @click="togglePalette"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">提取提示词</div>
+                <div class="sp-tip">
+                  导入时把图片里自带的提示词自动填进「提示词」字段（只填空的，不覆盖你写过的）。
+                  支持 ComfyUI、A1111·Forge、Fooocus、InvokeAI、NovelAI、Midjourney
+                </div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.importing.extractMeta }"
+                type="button"
+                role="switch"
+                data-sp-extract-meta
+                :aria-checked="s.importing.extractMeta"
+                @click="toggleExtractMeta"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">识别 AI 来源</div>
+                <div class="sp-tip">
+                  认 C2PA 内容凭据、国内 AIGC 隐式标识与 EXIF·XMP 痕迹。⚠️ GPT-image / DALL·E
+                  这类图里**只有来源、没有提示词**，开了也提不出提示词
+                </div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.importing.detectAi }"
+                type="button"
+                role="switch"
+                data-sp-detect-ai
+                :aria-checked="s.importing.detectAi"
+                @click="toggleDetectAi"
               >
                 <i></i>
               </button>

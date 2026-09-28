@@ -1112,6 +1112,15 @@ function onWindowMouseDown(e: MouseEvent): void {
               <span class="tt-label">{{ (TYPE_BADGE[p.it.type] ?? TYPE_BADGE.text).label }}</span>
             </span>
             <span v-if="p.it.type === 'video' && p.it.duration_ms" class="video-len">{{ fmtDuration(p.it.duration_ms) }}</span>
+            <!-- AI 来源角标：左下角（左上星标 / 右上类型 / 右下时长都已被占）。
+                 同样必须 absolute + pointer-events:none，且配色与主题无关（压在用户图片上）。 -->
+            <span
+              v-if="assets.cardFields.aiBadge && p.it.ai_source"
+              class="thumb-ai"
+              :data-thumb-ai="p.it.ai_source"
+              :title="`AI 生成 · ${assets.aiSourceLabel(p.it.ai_source)}`"
+              >AI</span
+            >
           </div>
           <div v-if="assets.cardFields.name || metaText(p.it)" class="card-info">
             <div v-if="assets.cardFields.name" class="ci-name" :title="p.it.name" v-html="hlName(p.it.name)"></div>
@@ -1148,6 +1157,7 @@ function onWindowMouseDown(e: MouseEvent): void {
           <span class="list-name" :title="it.name" v-html="hlName(it.name)"></span>
           <span v-if="assets.cardFields.dims" class="list-dim">{{ dimsOnly(it) || '—' }}</span>
           <span v-if="assets.cardFields.size" class="list-size">{{ fmtSize(it.size) }}</span>
+          <span v-if="assets.cardFields.aiBadge && it.ai_source" class="list-ai" :data-list-ai="it.ai_source">AI</span>
           <span v-if="assets.cardFields.time" class="list-date">{{ fmtDate(it.imported_at) }}</span>
         </div>
       </div>
