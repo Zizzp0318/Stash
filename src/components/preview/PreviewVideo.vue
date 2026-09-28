@@ -87,13 +87,15 @@ async function openExternal(): Promise<void> {
         data-pv-video
         @error="onError"
       ></video>
-      <!-- 全屏目标是整个舞台（连控制条一起进全屏），不是 <video> 本身 -->
+      <!-- 控制条只在中栏浮层里给：右侧信息栏（compact）那条面板太窄，控件挤在一起反而难用，
+           双击卡片到中栏才是完整播放器。但**点画面播放/暂停**两处都保留。
+           全屏目标是整个舞台（连控制条一起进全屏），不是 <video> 本身。 -->
       <PreviewPlayerBar
+        v-if="!compact"
         class="pv-bar-floating"
         :el="videoEl"
-        :fullscreen-target="compact ? null : stageEl"
-        :show-rate="!compact"
-        :compact="compact"
+        :fullscreen-target="stageEl"
+        show-rate
       />
     </div>
   </div>

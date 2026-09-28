@@ -85,7 +85,9 @@ async function openExternal(): Promise<void> {
         data-pv-audio
         @error="onError"
       ></audio>
-      <PreviewPlayerBar class="pv-bar-inline" :el="audioEl" :compact="compact" />
+      <!-- 控制条只在中栏浮层里给；右侧信息栏（compact）太窄，双击卡片到中栏才是完整播放器。
+           但**点画面播放/暂停**两处都保留。 -->
+      <PreviewPlayerBar v-if="!compact" class="pv-bar-inline" :el="audioEl" />
     </div>
   </div>
 </template>

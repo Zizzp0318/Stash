@@ -17,9 +17,7 @@ const props = defineProps({
   /** 全屏按钮的目标元素；不给就不渲染全屏按钮 */
   fullscreenTarget: { type: Object as () => HTMLElement | null, default: null },
   /** 倍速按钮：在 1× / 1.5× / 2× 之间循环 */
-  showRate: { type: Boolean, default: false },
-  /** 窄面板（右侧信息栏）：去掉音量滑杆与倍速，只留静音按钮 */
-  compact: { type: Boolean, default: false }
+  showRate: { type: Boolean, default: false }
 })
 
 const playing = ref(false)
@@ -156,7 +154,7 @@ function fmt(sec: number): string {
 <template>
   <!-- @click.stop：控制条浮在画面里（视频那条是绝对定位在舞台上的），
        不拦住冒泡的话，点播放键/进度条会顺带触发外层的「点画面播放/暂停」。 -->
-  <div class="pp-bar" :class="{ compact }" data-pp-bar @click.stop>
+  <div class="pp-bar" data-pp-bar @click.stop>
     <button class="pp-btn" data-pp-play type="button" :title="playing ? '暂停' : '播放'" @click="togglePlay">
       <svg v-if="!playing" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
         <path d="M8 5.4v13.2L19 12z" />
@@ -184,14 +182,7 @@ function fmt(sec: number): string {
 
     <span class="pp-time" data-pp-duration>{{ fmt(duration) }}</span>
 
-    <button
-      v-if="showRate && !compact"
-      class="pp-btn pp-rate"
-      data-pp-rate
-      type="button"
-      title="播放速度"
-      @click="cycleRate"
-    >
+    <button v-if="showRate" class="pp-btn pp-rate" data-pp-rate type="button" title="播放速度" @click="cycleRate">
       {{ rate }}×
     </button>
 
@@ -206,7 +197,6 @@ function fmt(sec: number): string {
       </svg>
     </button>
     <input
-      v-if="!compact"
       class="pp-volume"
       data-pp-volume
       type="range"

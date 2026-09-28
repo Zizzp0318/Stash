@@ -877,6 +877,56 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     check('D 文本在信息栏里是只读（唯一编辑入口是中栏浮层）',
       dText.present && dText.absent, JSON.stringify(dText))
 
+    // ---- D 详情页刻意不给控制条，但「点画面播放/暂停」要保留 ----
+    // 面板太窄，控制条挤在一起反而难用；双击到中栏才是完整播放器。
+    {
+      interface DetailMedia {
+        ok: boolean
+        audioBar: boolean
+        videoBar: boolean
+        played: boolean
+        paused: boolean
+      }
+      const r = await js<DetailMedia>(
+        '(async () => {' +
+        ' const empty = { ok: false, audioBar: true, videoBar: true, played: false, paused: false };' +
+        ' const openDetail = async (id, sel) => {' +
+        '   const card = document.querySelector(\'.card[data-id="\' + id + \'"]\');' +
+        '   if (!card) return null;' +
+        '   card.dispatchEvent(new MouseEvent("click", { bubbles: true }));' +
+        '   const t = Date.now();' +
+        '   while (Date.now() - t < 15000) {' +
+        '     const el = document.querySelector(".detail-preview " + sel);' +
+        '     if (el && el.readyState >= 1) return el;' +
+        '     await new Promise((r) => setTimeout(r, 120));' +
+        '   }' +
+        '   return null;' +
+        ' };' +
+        ' const a = await openDetail(' + wavId + ', "[data-pv-audio]");' +
+        ' const audioBar = !!document.querySelector(".detail-preview [data-pp-bar]");' +
+        ' if (!a) return empty;' +
+        ' const v = await openDetail(' + mp4Id + ', "[data-pv-video]");' +
+        ' if (!v) return { ...empty, audioBar };' +
+        ' const videoBar = !!document.querySelector(".detail-preview [data-pp-bar]");' +
+        ' v.currentTime = 0;' +
+        ' const stage = document.querySelector(".detail-preview [data-pv-video-stage]");' +
+        ' const click = () => stage.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));' +
+        ' click();' +
+        ' await new Promise((r) => setTimeout(r, 400));' +
+        ' const played = !v.paused;' +
+        ' click();' +
+        ' await new Promise((r) => setTimeout(r, 300));' +
+        ' const paused = !v.paused;' +
+        ' return { ok: true, audioBar, videoBar, played, paused };' +
+        '})()')
+      check('D 详情页音频预览没有控制条', r.ok && r.audioBar === false, JSON.stringify(r))
+      check('D 详情页视频预览没有控制条', r.ok && r.videoBar === false, JSON.stringify(r))
+      check('D 详情页点画面仍可播放/暂停', r.ok && r.played === true && r.paused === false, JSON.stringify(r))
+
+      // 详情页是这次改动的门面，留一张图复核（此刻右侧信息栏正显示视频）
+      await capture('shot-preview-detail.png')
+    }
+
     result.checks = checks
     result.failed = checks.filter((c) => !c.pass)
     result.ok = checks.every((c) => c.pass)

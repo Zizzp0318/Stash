@@ -483,9 +483,6 @@
 .pv-audio.compact .pv-audio-body { gap: 8px; padding: 0 10px; }
 .pv-audio.compact .pv-audio-glyph svg { width: 26px; height: 26px; }
 .pv-audio.compact .pv-audio-name { font-size: 12px; }
-.pp-bar.compact { gap: 6px; padding: 3px 8px; font-size: 11px; }
-.pp-bar.compact .pp-btn { width: 22px; height: 22px; }
-.pp-bar.compact .pp-btn svg { width: 14px; height: 14px; }
 .pv-text.compact { gap: 6px; }
 .pv-text.compact .ptext-editor,
 .pv-text.compact .ptext-md,
