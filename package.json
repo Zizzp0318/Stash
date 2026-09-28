@@ -13,7 +13,8 @@
     "start": "electron-vite preview",
     "icon": "node scripts/make-icon.mjs",
     "clean:build": "node scripts/clean-build.mjs",
-    "package:win": "npm run clean:build -- --with-packages && npm run build && electron-builder --win --x64 --publish never"
+    "package:win": "npm run clean:build -- --with-packages && npm run build && electron-builder --win --x64 --publish never",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "@panzoom/panzoom": "^4.6.2",
