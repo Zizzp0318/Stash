@@ -10,86 +10,192 @@
  *   （每次发版都会让 clone 体积翻倍）。Release 附件上限 2GB，是这类产物的正路。
  *
  * 设计要点：
- *   - token 只从环境变量读，**绝不写进任何文件**，也不出现在仓库里；
+ *   - token 只从环境变量读，**绝不写进任何文件**，也不进仓库；
  *   - 幂等：tag 已存在则复用，Release 已存在则复用，同名附件先删再传；
- *   - 发什么由 package.json 的 version 决定，不做手工拼文件名。
+ *   - 发什么由 package.json 的 version 决定，不做手工拼文件名；
+ *   - 网络层用 node 内置 https 手写代理 CONNECT 隧道 —— 不 spawn curl。
+ *     本机 `execFileSync('curl')` 会报 `spawnSync curl EBUSY`（那个 exe 被安全软件盯着），
+ *     而 `execFileSync('git')` 正常；顺带也免掉了 token 出现在子进程命令行里的暴露面。
  */
-import { readFileSync, existsSync, statSync } from 'fs'
-import { execFileSync } from 'child_process'
-import { join, dirname, basename } from 'path'
-import { fileURLToPath } from 'url'
+import { readFileSync, existsSync, statSync, createReadStream } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { join, dirname, basename } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import https from 'node:https'
+import tls from 'node:tls'
+import net from 'node:net'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const TOKEN = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
 const REPO = process.env.GITHUB_REPO || 'Zizzp0318/Stash'
 const PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:7897'
-const API = 'https://api.github.com'
-const UPLOADS = 'https://uploads.github.com'
+const API_HOST = 'api.github.com'
+const UPLOAD_HOST = 'uploads.github.com'
 
 if (!TOKEN) {
   console.error('缺少 GITHUB_TOKEN 环境变量。用法：GITHUB_TOKEN=xxx npm run release')
   process.exit(1)
 }
 
-const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
-const VERSION = pkg.version
-const TAG = `v${VERSION}`
+// ---------- 网络层：经 HTTP 代理的 CONNECT 隧道 ----------
 
-/** 一次 curl 调用；返回解析后的 JSON。token 通过 header 传，不落任何文件 */
-function api(method, url, { json, binary, out } = {}) {
-  const args = ['-sS', '-x', PROXY, '-X', method, '-H', `Authorization: Bearer ${TOKEN}`,
-    '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28']
-  if (json !== undefined) {
-    args.push('-H', 'Content-Type: application/json; charset=utf-8', '--data-binary', '@-')
-  } else if (binary) {
-    args.push('-H', 'Content-Type: application/octet-stream', '--data-binary', `@${binary}`)
-  }
-  args.push(url)
+/** 与代理建立到 host:443 的隧道，返回裸 socket */
+function tunnel(host) {
+  return new Promise((resolve, reject) => {
+    const p = new URL(PROXY)
+    const sock = net.connect(Number(p.port) || 80, p.hostname)
+    let acc = Buffer.alloc(0)
+    const onData = (d) => {
+      acc = Buffer.concat([acc, d])
+      const i = acc.indexOf('\r\n\r\n')
+      if (i < 0) return
+      sock.removeListener('data', onData)
+      const head = acc.subarray(0, i).toString('latin1')
+      if (!/^HTTP\/1\.[01] 200/.test(head)) {
+        return reject(new Error('代理 CONNECT 被拒绝：' + head.split('\r\n')[0]))
+      }
+      const rest = acc.subarray(i + 4)
+      if (rest.length) sock.unshift(rest) // CONNECT 响应后面可能已经跟着数据了
+      resolve(sock)
+    }
+    sock.on('data', onData)
+    sock.once('error', reject)
+    sock.once('connect', () =>
+      sock.write(`CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\nProxy-Connection: Keep-Alive\r\n\r\n`)
+    )
+  })
+}
 
-  let stdout
-  try {
-    stdout = execFileSync('curl', args, {
-      input: json !== undefined ? Buffer.from(JSON.stringify(json), 'utf8') : undefined,
-      maxBuffer: 32 * 1024 * 1024,
-      encoding: out ? 'utf8' : 'utf8'
-    })
-  } catch (e) {
-    throw new Error(`curl 失败（${method} ${url}）：${e.message}`)
+class TunnelAgent extends https.Agent {
+  constructor(host) {
+    super({ keepAlive: false })
+    this.targetHost = host
   }
-  if (out) return stdout
-  try {
-    return JSON.parse(stdout)
-  } catch {
-    throw new Error(`返回不是 JSON：${stdout.slice(0, 300)}`)
+  createConnection(_options, cb) {
+    tunnel(this.targetHost)
+      .then((sock) => {
+        const t = tls.connect({ socket: sock, servername: this.targetHost }, () => cb(null, t))
+        t.once('error', cb)
+      })
+      .catch(cb)
   }
 }
 
+/** 一次 GitHub API 调用；json → JSON body，file → 流式上传该文件 */
+function gh({ host = API_HOST, method = 'GET', path, json, file, label }) {
+  return new Promise((resolve, reject) => {
+    const headers = {
+      Authorization: `Bearer ${TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'stash-release-script',
+      'X-GitHub-Api-Version': '2022-11-28'
+    }
+    let payload = null
+    let stream = null
+    if (json !== undefined) {
+      payload = Buffer.from(JSON.stringify(json), 'utf8')
+      headers['Content-Type'] = 'application/json; charset=utf-8'
+      headers['Content-Length'] = payload.length
+    } else if (file) {
+      headers['Content-Type'] = 'application/octet-stream'
+      headers['Content-Length'] = statSync(file).size
+      stream = createReadStream(file)
+    }
+
+    const req = https.request(
+      { hostname: host, port: 443, method, path, headers, agent: new TunnelAgent(host) },
+      (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8')
+          let body
+          try {
+            body = JSON.parse(text)
+          } catch {
+            body = { message: text.slice(0, 200) || `HTTP ${res.statusCode}` }
+          }
+          resolve({ status: res.statusCode, body })
+        })
+      }
+    )
+    req.on('error', reject)
+    req.setTimeout(0) // 大文件上传不设超时
+
+    if (payload) req.end(payload)
+    else if (stream) {
+      const total = Number(headers['Content-Length'])
+      let sent = 0
+      let mark = 0
+      stream.on('data', (c) => {
+        sent += c.length
+        const pct = Math.floor((sent / total) * 100)
+        if (pct >= mark + 10) {
+          mark = pct - (pct % 10)
+          process.stdout.write(`${mark}% `)
+        }
+      })
+      stream.on('error', reject)
+      stream.pipe(req)
+    } else req.end()
+  })
+}
+
+/**
+ * 带重试的调用。
+ * 本机走代理访问 GitHub 偶尔会 ECONNRESET（实测撞过一次，白跑一趟 320MB 之前的上传）；
+ * **大文件上传不重试** —— 传一半失败时服务端可能已建了同名 asset，
+ * 盲重试会撞 422，交给「重跑脚本（先删同名再传）」更可控。
+ */
+async function call(opts) {
+  const tries = opts.file ? 1 : 3
+  let last
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await gh(opts)
+    } catch (e) {
+      last = e
+      if (i < tries - 1) {
+        const wait = 1000 * (i + 1)
+        console.log(`      · 网络抖动（${e.code || e.message}），${wait}ms 后重试 …`)
+        await new Promise((r) => setTimeout(r, wait))
+      }
+    }
+  }
+  throw last
+}
+
 function fail(step, res) {
-  console.error(`✗ ${step} 失败：${res?.message || JSON.stringify(res).slice(0, 200)}`)
+  console.error(`\n✗ ${step} 失败（HTTP ${res?.status}）：${res?.body?.message || ''}`)
   const hints = {
     'Bad credentials': 'token 无效或已被撤销 —— 去 GitHub → Settings → Developer settings 重新生成',
-    'Not Found': '仓库不存在，或 token 没有该仓库的权限（classic token 要勾 repo 范围）',
-    'Resource not accessible by personal access token': 'token 权限不足：classic token 需要 repo 范围'
+    'Not Found': '仓库不存在，或 token 没有该仓库权限（classic token 要勾 repo 范围）',
+    'Resource not accessible by personal access token': 'token 权限不足：classic token 需要 repo 范围',
+    'already_exists': '同名附件已存在（脚本本应先删旧的，若反复出现就手工删一次）'
   }
-  if (hints[res?.message]) console.error(`  → ${hints[res.message]}`)
+  const key = Object.keys(hints).find((k) => String(res?.body?.message || '').includes(k))
+  if (key) console.error(`  → ${hints[key]}`)
   process.exit(1)
 }
 
 const fmt = (n) => (n / 1024 / 1024).toFixed(0) + ' MB'
 
-// ---- 待发附件：由版本号推导，不手工拼 ----
-const wanted = [
-  { file: join(ROOT, 'dist', `Stash-${VERSION}-setup.exe`), label: '安装版' },
-  { file: join(ROOT, 'dist', `Stash-${VERSION}-portable.zip`), label: '便携版' }
-]
-const missing = wanted.filter((w) => !existsSync(w.file))
-if (missing.length) {
-  console.error('缺少产物，先跑 `npm run package:win`：')
-  for (const m of missing) console.error('  ✗ ' + m.file)
+// `--check`：只验凭据 + 代理连通性，不碰远端任何东西（排错用）
+if (process.argv.includes('--check')) {
+  const r = await call({ path: '/user' })
+  if (r.body?.login) {
+    console.log(`✓ 凭据可用，账号 = ${r.body.login}（经代理 ${PROXY}）`)
+    process.exit(0)
+  }
+  console.error(`✗ 凭据不可用（HTTP ${r.status}）：${r.body?.message}`)
   process.exit(1)
 }
 
-// ---- 1) tag：把本地 tag 推到远端（Release 依附在 tag 上）----
+// ---------- 1) tag ----------
+const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+const VERSION = pkg.version
+const TAG = `v${VERSION}`
+
 console.log(`[1/4] 推送 tag ${TAG} …`)
 try {
   execFileSync('git', ['push', `https://x-access-token:${TOKEN}@github.com/${REPO}.git`, TAG], {
@@ -108,9 +214,9 @@ try {
   }
 }
 
-// ---- 2) Release：已存在就复用，避免重复创建报 422 ----
+// ---------- 2) Release ----------
 console.log(`[2/4] 创建/复用 Release ${TAG} …`)
-let rel = api('GET', `${API}/repos/${REPO}/releases/tags/${TAG}`)
+let rel = (await call({ path: `/repos/${REPO}/releases/tags/${TAG}` })).body
 if (rel?.id) {
   console.log(`      · 已存在（id=${rel.id}），复用`)
 } else {
@@ -173,40 +279,57 @@ sharp 图片处理、Range 流式、真实播放与图片预览 —— 等于把
 
 完整功能清单与开发说明见 [README](https://github.com/${REPO}#readme)。`
 
-  rel = api('POST', `${API}/repos/${REPO}/releases`, {
+  const created = await call({
+    method: 'POST',
+    path: `/repos/${REPO}/releases`,
     json: { tag_name: TAG, name: `Stash 素材库 ${TAG}`, body, draft: false, prerelease: false }
   })
-  if (!rel?.id) fail('创建 Release', rel)
+  rel = created.body
+  if (!rel?.id) fail('创建 Release', created)
   console.log(`      ✓ 已创建（id=${rel.id}）`)
 }
 
-// ---- 3) 上传附件：同名先删，否则 422 already_exists ----
+// ---------- 3) 上传附件 ----------
+const wanted = [
+  { file: join(ROOT, 'dist', `Stash-${VERSION}-setup.exe`), label: '安装版' },
+  { file: join(ROOT, 'dist', `Stash-${VERSION}-portable.zip`), label: '便携版' }
+]
+const missing = wanted.filter((w) => !existsSync(w.file))
+if (missing.length) {
+  console.error('\n缺少产物，先跑 `npm run package:win`：')
+  for (const m of missing) console.error('  ✗ ' + m.file)
+  process.exit(1)
+}
+
 console.log('[3/4] 上传附件 …')
-const existing = api('GET', `${API}/repos/${REPO}/releases/${rel.id}/assets`) || []
+const existing = (await call({ path: `/repos/${REPO}/releases/${rel.id}/assets` })).body || []
 for (const w of wanted) {
   const name = basename(w.file)
   const size = statSync(w.file).size
-  const dup = existing.find((a) => a.name === name)
+  const dup = Array.isArray(existing) ? existing.find((a) => a.name === name) : null
   if (dup) {
     if (dup.size === size) {
       console.log(`      · ${name} 已在且大小一致，跳过`)
       continue
     }
-    await api('DELETE', `${API}/repos/${REPO}/releases/assets/${dup.id}`)
+    await call({ method: 'DELETE', path: `/repos/${REPO}/releases/assets/${dup.id}` })
     console.log(`      · 删掉旧的 ${name}`)
   }
-  process.stdout.write(`      传 ${name}（${fmt(size)}，${w.label}）… `)
-  const asset = api('POST', `${UPLOADS}/repos/${REPO}/releases/${rel.id}/assets?name=${encodeURIComponent(name)}`, {
-    binary: w.file
+  process.stdout.write(`      ${name}（${fmt(size)}，${w.label}）`)
+  const up = await call({
+    host: UPLOAD_HOST,
+    method: 'POST',
+    path: `/repos/${REPO}/releases/${rel.id}/assets?name=${encodeURIComponent(name)}`,
+    file: w.file
   })
-  if (!asset?.browser_download_url) fail(`上传 ${name}`, asset)
-  console.log('✓')
+  if (!up.body?.browser_download_url) fail(`上传 ${name}`, up)
+  console.log('  ✓')
 }
 
-// ---- 4) 核对 ----
+// ---------- 4) 核对 ----------
 console.log('[4/4] 核对 …')
-const final = api('GET', `${API}/repos/${REPO}/releases/${rel.id}`)
+const final = (await call({ path: `/repos/${REPO}/releases/${rel.id}` })).body
 for (const a of final.assets || []) {
-  console.log(`      ✓ ${a.name}  ${fmt(a.size)}  ${a.download_count} 次下载`)
+  console.log(`      ✓ ${a.name}  ${fmt(a.size)}  ${a.download_count} 次下载  ${a.browser_download_url}`)
 }
 console.log(`\n发布页：${final.html_url}`)
