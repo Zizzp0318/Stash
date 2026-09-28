@@ -1,0 +1,425 @@
+/* ============ 放大预览浮层（中栏）============
+   方案 A：覆盖中栏、压暗网格。
+   挂在 .gallery 上绝对定位 —— 它必须是 .grid-wrap 的**兄弟节点**，
+   放进滚动容器会跟着内容一起滚走，也就盖不住网格了。 */
+
+.pv-wrap {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  /* 纯色，不用半透明：让下面的网格完全看不见，注意力全在素材上 */
+  background: var(--bg-canvas);
+}
+
+/* ---- 顶栏：类型 + 文件名 + 关闭 ---- */
+.pv-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  flex-shrink: 0;
+}
+.pv-kind {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.pv-name {
+  font-size: 13px;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pv-dirty {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.pv-close {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.pv-close svg { width: 16px; height: 16px; }
+.pv-close:hover { background: var(--bg-hover); color: var(--text-1); }
+
+/* ---- 主体：左右切换按钮夹住媒体区 ---- */
+.pv-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 0 14px 14px;
+}
+.pv-side {
+  align-self: center;
+  flex-shrink: 0;
+  width: 40px;
+  height: 72px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.pv-side svg { width: 20px; height: 20px; }
+.pv-side:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-1); }
+.pv-side:disabled { opacity: 0.22; cursor: default; }
+
+.pv-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
+/* ---- 图片 ---- */
+.pv-image {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+/* 大图铺满可用区，contain 不裁剪（两侧留白就是底色） */
+/* 大图等比缩放到完整可见（两侧/上下留白就是底色）
+   ⚠️ 这里**必须用 flex，不能用 grid**：grid 的行是 `auto`，会被内容撑到图片的原始高度，
+   于是下面 `max-height: 100%` 解析成「图片自己的高度」= 等于没约束 ——
+   图片会按原始像素画出来，再被 overflow: hidden 裁成一块方形的中间区域
+   （实测：600x1200 的竖图渲染成 600x1200，而舞台只有 722x716）。
+   flex 容器的百分比才对着容器自身的高度解析。 */
+.pv-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.pv-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  -webkit-user-drag: none;
+}
+/* 缩略图垫底：与大图同一套 contain 规则，位置一致，替换时不跳 */
+.pv-thumb {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  filter: blur(6px);
+  opacity: 0.7;
+  pointer-events: none;
+}
+.pv-hint {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
+  font-size: 11.5px;
+  color: var(--text-3);
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: 999px;
+  padding: 4px 12px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* ---- 等待 / 提示态（派生中、不支持、出错、未接入）---- */
+.pv-wait {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  color: var(--text-2);
+  font-size: 13px;
+  text-align: center;
+}
+.pv-wait-bar {
+  width: 220px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-raised);
+  overflow: hidden;
+}
+.pv-wait-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+.pv-btn {
+  margin-top: 4px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  color: var(--text-1);
+  font-size: 12.5px;
+  font-family: var(--font);
+  cursor: pointer;
+}
+.pv-btn:hover { background: var(--bg-hover); border-color: var(--accent-border); }
+
+/* ---- 视频 / 音频（media-chrome 只做控制条，解码仍是 Chromium）---- */
+.pv-video {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+/* 进度条用应用强调色，其余沿用 media-chrome 的深色默认皮肤 */
+.pv-player {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  background: #000;
+  border-radius: var(--radius);
+  overflow: hidden;
+  --media-range-bar-color: var(--accent);
+  --media-range-thumb-background: var(--accent);
+  /* 隐掉「已缓冲区间」：本地文件是**瞬间就缓冲完**的，这条指示器永远铺满整条，
+     默认色又是 40% 白 —— 看上去就是一根横贯播放器的亮线（实测像素 #8C8D8F）。
+     对本地文件它不承载任何信息，直接透明掉。
+     注意变量名是 `--media-time-range-buffered-color`，不是 `--media-range-buffered-*`。 */
+  --media-time-range-buffered-color: transparent;
+}
+.pv-player video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.pv-audio {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+.pv-audio-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 0 24px;
+}
+.pv-audio-glyph { color: var(--text-3); }
+.pv-audio-glyph svg { width: 40px; height: 40px; display: block; }
+.pv-audio-name {
+  font-size: 13.5px;
+  color: var(--text-1);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 胶囊形控制条：把 media-chrome 默认那条「黑底、且只有内容宽」的条子整个换掉。
+   ⚠️ 两条必须覆盖的默认行为（就是「错位」的来源）：
+   ① `media-control-bar` 默认只有内容宽 —— 不撑满的话，右侧会露出一截容器底色；
+   ② 它自带深色底 —— 不清掉的话会看到一条与容器不一致的色块。 */
+.pv-player-audio {
+  flex: 0 0 auto;
+  width: min(560px, 100%);
+  height: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 4px 16px;
+  overflow: visible;
+  /* 整条控制器的皮肤。不覆盖的话 media-chrome 会用它自己的默认配色：
+     轨道是一条刺眼的白线、图标是纯白 —— 放在这个深色界面里很突兀。 */
+  --media-control-height: 32px;
+  --media-control-background: transparent;
+  --media-control-hover-background: var(--bg-hover);
+  --media-icon-color: var(--text-2);
+  --media-text-color: var(--text-2);
+  /* 轨道压得很淡：它比胶囊底色只亮一点点就够了，否则会变成横贯整条的一根亮线 */
+  --media-range-track-background: rgba(255, 255, 255, 0.09);
+  --media-range-track-height: 3px;
+  --media-range-track-border-radius: 2px;
+  --media-range-bar-color: var(--accent);
+  --media-range-thumb-background: var(--accent);
+  --media-range-thumb-width: 10px;
+  --media-range-thumb-height: 10px;
+}
+
+/* 播放键是这条上唯一的主操作，给它最亮的颜色 */
+.pv-player-audio media-play-button { --media-icon-color: var(--text-1); }
+.pv-player-audio media-control-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+}
+/* 进度条吃掉中间的剩余宽度，时间与按钮固定在两端 */
+.pv-player-audio media-time-range { flex: 1 1 auto; min-width: 0; }
+.pv-player-audio media-time-display {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+/* ---- 文本 ---- */
+.pv-text {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ptext-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.ptext-enc { color: var(--text-3); }
+.ptext-ro {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.ptext-toggle {
+  color: var(--text-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.ptext-toggle:hover { color: var(--text-1); border-color: var(--accent-border); }
+.ptext-dirty { color: var(--text-3); }
+.ptext-dirty.on { color: var(--accent); }
+
+.ptext-conflict {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--accent-border);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--text-1);
+  font-size: 12.5px;
+}
+.ptext-conflict .pv-btn { margin-top: 0; padding: 3px 10px; font-size: 12px; }
+
+/* 文本内容要能选中复制（body 上全局是 user-select: none） */
+.ptext-editor,
+.ptext-md,
+.ptext-plain {
+  user-select: text;
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  color: var(--text-1);
+  font-size: 13px;
+  line-height: 1.7;
+  padding: 14px 16px;
+  overflow: auto;
+}
+.ptext-editor {
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  resize: none;
+  outline: none;
+}
+.ptext-editor:focus { border-color: var(--accent-border); }
+.ptext-plain {
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ptext-md { font-family: var(--font); }
+.ptext-md h1, .ptext-md h2, .ptext-md h3 { margin: 16px 0 8px; font-weight: 600; line-height: 1.4; }
+.ptext-md h1 { font-size: 19px; }
+.ptext-md h2 { font-size: 16px; }
+.ptext-md h3 { font-size: 14px; }
+.ptext-md p { margin: 8px 0; }
+.ptext-md ul, .ptext-md ol { margin: 8px 0; padding-left: 22px; }
+.ptext-md li { margin: 3px 0; }
+.ptext-md code {
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 12px;
+  background: var(--bg-raised);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.ptext-md pre {
+  background: var(--bg-raised);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow: auto;
+}
+.ptext-md pre code { background: none; padding: 0; }
+.ptext-md blockquote {
+  margin: 8px 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-2);
+}
+.ptext-md a { color: var(--accent); }
+.ptext-md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 14px 0; }
+.ptext-md table { border-collapse: collapse; margin: 10px 0; }
+.ptext-md th, .ptext-md td { border: 1px solid var(--border); padding: 4px 10px; }
+
+/* ---- 右侧信息栏（P5）：预览区里嵌真预览 ----
+   .detail-preview 本身是「居中一块固定尺寸的东西」的写法（为图片准备），
+   塞进播放器/编辑器时要改成撑满。 */
+.detail-preview.is-media { align-items: stretch; }
+.detail-preview.is-media > * { flex: 1 1 auto; min-width: 0; min-height: 0; }
+/* 音频 / 文本没有宽高比，给个固定高度（视频仍走 aspect-ratio） */
+.detail-preview.is-fixed { height: 210px; }
+
+/* 窄面板下的压缩形态：控制条压扁、封面缩小 */
+.pv-video.compact .pv-player { --media-control-height: 30px; }
+.pv-audio.compact .pv-audio-body { gap: 8px; padding: 0 10px; }
+.pv-audio.compact .pv-audio-glyph svg { width: 26px; height: 26px; }
+.pv-audio.compact .pv-audio-name { font-size: 12px; }
+.pv-audio.compact .pv-player-audio { width: 100%; padding: 2px 8px; --media-control-height: 28px; }
+.pv-audio.compact .pv-player-audio media-time-display { font-size: 11px; }
+.pv-text.compact { gap: 6px; }
+.pv-text.compact .ptext-editor,
+.pv-text.compact .ptext-md,
+.pv-text.compact .ptext-plain { padding: 10px 12px; font-size: 12.5px; }

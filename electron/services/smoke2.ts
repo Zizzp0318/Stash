@@ -7,7 +7,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
-import ffmpegPath from 'ffmpeg-static'
+import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
@@ -16,7 +16,7 @@ const IMG_N = 30
 
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const p = spawn(ffmpegPath as string, args, { windowsHide: true })
+    const p = spawn(FFMPEG, args, { windowsHide: true })
     p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`))))
     p.on('error', reject)
   })

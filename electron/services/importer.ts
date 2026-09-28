@@ -10,14 +10,18 @@ export type AssetType = 'image' | 'video' | 'audio' | 'text'
 
 export const EXT_TYPE: Record<string, AssetType> = {
   jpg: 'image', jpeg: 'image', png: 'image', webp: 'image', gif: 'image',
-  bmp: 'image', tiff: 'image', svg: 'image', heic: 'image', heif: 'image', hif: 'image',
+  bmp: 'image', tiff: 'image', tif: 'image', svg: 'image', heic: 'image', heif: 'image', hif: 'image',
   mp4: 'video', mov: 'video', mkv: 'video', webm: 'video', avi: 'video',
   mp3: 'audio', wav: 'audio', flac: 'audio', aac: 'audio', ogg: 'audio', m4a: 'audio',
   txt: 'text', md: 'text'
 }
 
-/** 内容哈希：size + 前 64KB 的 sha1 前 20 位（仅用于缓存命名与查重） */
-function contentHash(file: string): string {
+/**
+ * 内容哈希：size + 前 64KB 的 sha1 前 20 位（仅用于缓存命名与查重）。
+ * **导出供 preview.ts 复用** —— 改了内容必须同步哈希，两侧算法绝不能分裂，
+ * 否则派生缓存与缩略图会各认一套 key。
+ */
+export function contentHash(file: string): string {
   const st = statSync(file)
   const fd = openSync(file, 'r')
   try {

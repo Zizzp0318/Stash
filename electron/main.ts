@@ -1,10 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol } from 'electron'
+import { spawn } from 'child_process'
 import { join } from 'path'
 import { existsSync, readFileSync } from 'fs'
 import * as librarySvc from './services/library'
 import * as assetsSvc from './services/assets'
 import * as importerSvc from './services/importer'
 import * as clipboardSvc from './services/clipboard'
+import * as previewSvc from './services/preview'
 import { unwatchLibrary, watchLibrary } from './services/watcher'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
@@ -14,12 +16,59 @@ import { runSmokeFolder } from './services/smoke-folder'
 import { runSmokeSearch } from './services/smoke-search'
 import { runSmokeTag } from './services/smoke-tag'
 import { runSmokeEdit } from './services/smoke-edit'
+import { runSmokePreview } from './services/smoke-preview'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
 protocol.registerSchemesAsPrivileged([
   { scheme: 'stash', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, stream: true } }
 ])
+
+// ==================== GPU 进程起不来时的自救 ====================
+//
+// 背景（实测，别凭印象改）：某些机器上（虚拟机 / 远程会话 / 显卡驱动异常），GPU 进程会以
+// 0xC0000005 反复崩溃，而 Chromium 的策略是**连崩几次就 FATAL 退出整个应用**
+// （`gpu_data_manager_impl_private.cc: GPU process isn't usable. Goodbye.`）。
+// 用户看到的现象是「双击了没反应」，连个错误提示都没有 —— 对一个要分发的桌面应用来说这是硬伤。
+//
+// 实测数据（Electron 44 / 本机）：
+//   · `--disable-gpu` **完全没用**：Chromium 照样起 GPU 进程，照样崩（6 次后 FATAL）
+//   · `--disable-gpu-process-crash-limit` 只是把「放弃」改成「无限重试」：9 秒崩 264 次，更糟
+//   · `--disable-gpu-sandbox` / `--in-process-gpu` 才真正有效（前者 0 崩溃，后者不起独立进程）
+//   · 应用层**收得到** `child-process-gone`：第一次在 +110ms，而 FATAL 在 +500ms —— 来得及自救
+const GPU_FALLBACK_FLAG = '--gpu-fallback'
+
+/** 冒烟/自动化跑在受限环境里，而且本来就不需要渲染 —— 直接预先降级，省掉一次自救重启 */
+const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke-'))
+if (isSmokeRun) app.commandLine.appendSwitch('disable-gpu-sandbox')
+
+/**
+ * 正常启动时的兜底：GPU 进程连续崩溃就自己拉起一个带降级开关的新实例。
+ *
+ * 三条实测出来的细节：
+ * ① **只崩 1 次不动手**：单次崩溃多半是驱动重置，Chromium 自己重启 GPU 进程就好了；
+ *    连续 2 次才说明是真起不来。
+ * ② **用 detached spawn，不要用 `app.relaunch()`**：实测 `app.relaunch()` 拉起的子进程
+ *    在父进程退出后约 90ms 就没了（连 `exit` 事件都不触发，是被硬杀的）；
+ *    换成 `spawn(..., { detached: true, stdio: 'ignore' }).unref()` 后子进程能正常跑完。
+ * ③ **必须一次性**：带上 `--gpu-fallback` 标记，新实例里不再自救，否则会无限重启。
+ */
+if (!isSmokeRun && !process.argv.includes(GPU_FALLBACK_FLAG)) {
+  let gpuCrashes = 0
+  app.on('child-process-gone', (_e, details) => {
+    if (details?.type !== 'GPU') return
+    gpuCrashes++
+    if (gpuCrashes < 2) return
+    console.warn('[gpu] GPU 进程连续崩溃，将以禁用 GPU 沙箱的方式重启一次')
+    const args = process.argv.slice(1).concat([GPU_FALLBACK_FLAG, '--disable-gpu-sandbox'])
+    try {
+      spawn(process.execPath, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref()
+    } catch (e) {
+      console.error('[gpu] 自救重启失败：' + String((e as Error).message ?? e))
+    }
+    app.exit(0)
+  })
+}
 
 // M1 冒烟测试模式：electron . --smoke-m1
 if (process.argv.includes('--smoke-m1')) {
@@ -151,10 +200,15 @@ function bootstrap(): void {
     return w
   }
 
-  function wrap<T>(fn: () => T): Promise<{ ok: true; data: T } | { ok: false; error: string }> {
+  /**
+   * IPC 统一回执包装：`{ ok, data | error }`（项目铁律之一）。
+   * 入参允许返回 Promise —— 服务层现在有 async 函数了（如预览的策略判定要 spawn ffmpeg），
+   * 所以成功分支必须写成 `Awaited<T>`，否则 `data` 会变成一个 Promise 对象穿到渲染层。
+   */
+  function wrap<T>(fn: () => T | Promise<T>): Promise<{ ok: true; data: Awaited<T> } | { ok: false; error: string }> {
     return Promise.resolve()
       .then(fn)
-      .then((data) => ({ ok: true, data }))
+      .then((data): { ok: true; data: Awaited<T> } => ({ ok: true, data: data as Awaited<T> }))
       .catch((e) => ({ ok: false, error: String((e as Error).message ?? e) }))
   }
 
@@ -235,6 +289,22 @@ function bootstrap(): void {
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（分流在服务层） */
     ipcMain.handle('asset:paste', (_e, { paths, folderId }) => wrap(() => assetsSvc.pastePaths(paths ?? [], folderId ?? null)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
+
+    // 放大预览：先问「这张该怎么给」（原文件直出 / 要派生 / 不支持），需要派生时再显式发起生成。
+    // 生成是长任务，IPC 不等它 —— 进度与结果走 preview:progress / preview:done 事件。
+    ipcMain.handle('preview:info', (_e, { id }) => wrap(() => previewSvc.previewInfo(id)))
+    ipcMain.handle('preview:ensure', (_e, { id }) => wrap(() => previewSvc.ensureDerived(id)))
+
+    // 文本素材的读写。走 IPC 而不是协议：需要编码兜底、大小上限、mtime 冲突检测，
+    // 以及「能不能编辑」这类元信息 —— 这些都不是「给一段字节」能表达的。
+    ipcMain.handle('asset:text', (_e, { id }) => wrap(() => previewSvc.readText(id)))
+    ipcMain.handle('asset:writeText', (_e, { id, text, baseMtime }) =>
+      wrap(() => previewSvc.writeText(id, text, baseMtime)))
+
+    // 交给系统：浏览器真解不了的格式（avi 等）的兜底出口，以及「在文件夹中显示」
+    ipcMain.handle('shell:open', (_e, { id }) => wrap(() => assetsSvc.openAsset(id)))
+    ipcMain.handle('shell:reveal', (_e, { id }) => wrap(() => assetsSvc.revealAsset(id)))
+
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))
     ipcMain.handle('tag:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameTag(id, name)))
@@ -264,6 +334,14 @@ function bootstrap(): void {
         const lib = librarySvc.getLibrary()
         if (process.argv.includes('--debug-lib')) {
           console.log('[stash-handler]', req.url, '| lib:', lib?.path ?? 'NULL')
+        }
+        // 原文件 / 派生预览：stash://media/{id}
+        // 走自定义协议而不是 file:// —— dev 下页面起源是 http，Chromium 会拦 file 子资源。
+        // 这里必须**流式 + 支持 Range**（见 preview.serveMedia 的说明），
+        // 所以不能照搬下面缩略图那种 readFileSync 整读。
+        if (url.host === 'media') {
+          if (!lib) return new Response('no library', { status: 404 })
+          return await previewSvc.serveMedia(req, url.pathname.replace(/^\//, ''))
         }
         if (url.host !== 'thumb' || !lib) return new Response('no library', { status: 404 })
         const segs = url.pathname.split('/').filter(Boolean)
@@ -325,6 +403,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-edit')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeEdit(win)
+      })
+    }
+
+    // 预览冒烟：主进程段（策略判定 / Range 流式 / 图片与视频派生）+ 渲染层段（浮层交互）
+    if (process.argv.includes('--smoke-preview')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokePreview(win)
       })
     }
 

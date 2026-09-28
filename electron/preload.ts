@@ -59,7 +59,30 @@ contextBridge.exposeInMainWorld('stash', {
     copy: (ids: number[], folderId?: number | null) => ipcRenderer.invoke('asset:copy', { ids, folderId }),
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线 */
     paste: (paths: string[], folderId?: number | null) => ipcRenderer.invoke('asset:paste', { paths, folderId }),
-    setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds })
+    setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds }),
+    /** 读文本素材内容（主进程负责编码兜底与大小上限，回传 encoding / readOnly） */
+    text: (id: number) => ipcRenderer.invoke('asset:text', { id }),
+    /**
+     * 写文本素材（**写的是库里的真文件**）。
+     * `baseMtime` 是读的时候拿到的 mtime：主进程会拿它比对磁盘现状，
+     * 不一致说明文件在软件外被改过，会抛 ERR_MTIME_CONFLICT 让 UI 去问用户，而不是静默覆盖。
+     */
+    writeText: (id: number, text: string, baseMtime?: number) =>
+      ipcRenderer.invoke('asset:writeText', { id, text, baseMtime })
+  },
+  /** 放大预览：策略查询 + 派生（转码 / 高清大图）生成，进度与结果走事件 */
+  preview: {
+    /** 先问「这张该怎么给」：original 直出 / derived 需派生 / unsupported */
+    info: (id: number) => ipcRenderer.invoke('preview:info', { id }),
+    /** 显式发起派生。长任务，立即返回 previewId，进度看下面两个订阅 */
+    ensure: (id: number) => ipcRenderer.invoke('preview:ensure', { id }),
+    onProgress: (cb: (d: unknown) => void) => subscribe('preview:progress', cb),
+    onDone: (cb: (d: unknown) => void) => subscribe('preview:done', cb)
+  },
+  /** 交给系统处理（Chromium 真解不了的格式的兜底出口 / 在文件夹中显示） */
+  shell: {
+    open: (id: number) => ipcRenderer.invoke('shell:open', { id }),
+    reveal: (id: number) => ipcRenderer.invoke('shell:reveal', { id })
   },
   /** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
   clipboard: {

@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, copyFileSync } from 'fs'
 import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
-import ffmpegPath from 'ffmpeg-static'
+import { FFMPEG } from './ffmpeg'
 import { requireCurrent } from './library'
 
 export const SIZES = { grid: 320, detail: 800 } as const
@@ -36,7 +36,10 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
       await sharp(abs)
         .rotate() // 按 EXIF 方向摆正
         .toColourspace('srgb') // HDR 广色域（HEIC 等）转 sRGB，避免缩略图偏灰
-        .resize({ width: SIZES[size], height: SIZES[size], fit: 'inside', withoutEnlargement: true, animated: false })
+        // 注意：`animated` 是 sharp 的**输入选项**（`sharp(input, { animated })`），
+        // 不是 resize 选项 —— 写在这里既无效果又过不了类型检查，所以不写。
+        // 动图在本项目走的是「取首帧」策略（见 preview.ts 的 IMG_NATIVE：gif 直出原文件）。
+        .resize({ width: SIZES[size], height: SIZES[size], fit: 'inside', withoutEnlargement: true })
         .webp({ quality: 82 })
         .toFile(tmp)
     } else if (asset.type === 'video') {
@@ -83,7 +86,7 @@ function extractFrame(abs: string, outPng: string): Promise<void> {
       .then((info) => {
         const seek = info.durationMs > 2000 ? Math.min(info.durationMs * 0.1 / 1000, 5) : 0
         const args = ['-y', '-ss', String(seek), '-i', abs, '-frames:v', '1', outPng]
-        const p = spawn(ffmpegPath as string, args, { windowsHide: true })
+        const p = spawn(FFMPEG, args, { windowsHide: true })
         p.on('close', (code) => {
           if (code === 0 && existsSync(outPng)) {
             // 元信息回写（首次）
@@ -102,7 +105,7 @@ interface ProbeInfo { durationMs: number; width: number; height: number }
 
 function probe(abs: string): Promise<ProbeInfo> {
   return new Promise((resolve, reject) => {
-    const p = spawn(ffmpegPath as string, ['-i', abs], { windowsHide: true })
+    const p = spawn(FFMPEG, ['-i', abs], { windowsHide: true })
     let stderr = ''
     p.stderr.on('data', (d: Buffer) => { stderr += d.toString() })
     p.on('close', () => {

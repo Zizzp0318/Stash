@@ -6,6 +6,7 @@ import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../sto
 import { fmtSize, fmtDate, fmtCount, fmtDuration } from '../utils/format'
 import type { StashAssetRow } from '../env'
 import BatchBar from './BatchBar.vue'
+import PreviewStage from './preview/PreviewStage.vue'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -568,6 +569,16 @@ function onCardClick(it: StashAssetRow, e: MouseEvent): void {
   else void assets.select(it.id)
 }
 
+/**
+ * 双击 = 中栏浮层放大预览（用户拍板：单击保持「选中 + 右侧详情」不变）。
+ * 双击之前的那两次单击会先把素材选中，所以浮层打开时右侧信息栏显示的就是它 —— 刻意的。
+ * 拖拽刚结束的一小段时间内不响应（suppressClickUntil），避免拖完松手被当成双击。
+ */
+function onCardDblClick(it: StashAssetRow): void {
+  if (Date.now() < suppressClickUntil) return
+  assets.openPreview(it.id)
+}
+
 // ==================== 右键菜单 ====================
 const menu = ref<{ x: number; y: number } | null>(null)
 const menuConfirm = ref(false)
@@ -1018,6 +1029,7 @@ function onWindowMouseDown(e: MouseEvent): void {
           }"
           :style="{ transform: `translate(${p.x}px, ${p.y}px)`, width: `${p.w}px`, height: `${p.h}px` }"
           @click="onCardClick(p.it, $event)"
+          @dblclick="onCardDblClick(p.it)"
           @contextmenu="onCardContext($event, p.it)"
         >
           <div class="thumb" :style="{ height: `${p.thumb}px` }">
@@ -1062,6 +1074,7 @@ function onWindowMouseDown(e: MouseEvent): void {
           :data-id="it.id"
           :class="{ selected: assets.isSelected(it.id), dragging: assets.dragIds.includes(it.id) }"
           @click="onCardClick(it, $event)"
+          @dblclick="onCardDblClick(it)"
           @contextmenu="onCardContext($event, it)"
         >
           <span class="list-icon">{{ TYPE_ICON[it.type] }}</span>
@@ -1117,6 +1130,9 @@ function onWindowMouseDown(e: MouseEvent): void {
         </svg>
       </button>
     </Transition>
+
+    <!-- 中栏放大预览浮层（双击素材打开；方案 A：覆盖中栏、压暗网格） -->
+    <PreviewStage v-if="assets.previewId != null" />
 
     <!-- 底部悬浮条 -->
     <BatchBar @move="openMoveDialog" @remove="openDeleteDialog" />

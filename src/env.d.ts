@@ -151,6 +151,69 @@ export interface StashAssetApi {
     data?: { copied: number; renamed: number; failed: StashBulkFail[]; importing: number }
     error?: string
   }>
+  /**
+   * 读文本素材内容。主进程负责编码兜底（UTF-8 严格解码失败退 GB18030）与大小上限，
+   * `readOnly` 为真时 UI 只给预览、不给编辑。
+   */
+  text: (id: number) => Promise<{
+    ok: boolean
+    data?: {
+      text: string
+      encoding: string
+      bytes: number
+      mtime: number
+      readOnly: boolean
+      readOnlyReason: string | null
+    }
+    error?: string
+  }>
+  /**
+   * 写文本素材（**写的是库内真文件**）。
+   * `baseMtime` 与磁盘现状不符时抛 `ERR_MTIME_CONFLICT`（文件在软件外被改过），由 UI 决定是否覆盖。
+   */
+  writeText: (id: number, text: string, baseMtime?: number) => Promise<{
+    ok: boolean
+    data?: { bytes: number; mtime: number; hash: string; name: string }
+    error?: string
+  }>
+}
+
+/** 放大预览：策略查询 + 派生生成（进度走事件，IPC 不等长任务） */
+export interface StashPreviewApi {
+  /** 先问「这张该怎么给」：original 直出 / derived 需派生 / unsupported */
+  info: (id: number) => Promise<{ ok: boolean; data?: StashPreviewInfo; error?: string }>
+  /** 显式发起派生（长任务，立即返回 previewId，进度看下面两个订阅） */
+  ensure: (id: number) => Promise<{ ok: boolean; data?: { previewId: number }; error?: string }>
+  onProgress: (cb: (d: { previewId: number; assetId: number; ratio: number }) => void) => Unsub
+  onDone: (cb: (d: { previewId: number; assetId: number; ok: boolean; derive?: string | null; error?: string }) => void) => Unsub
+}
+
+/**
+ * 「这张素材该怎么给渲染层」的答复。
+ * - `original`：原文件直出（Chromium 自己解得开）
+ * - `derived`：得先产出派生文件（转码 / 高清大图），`ready` 为假时渲染层要发起 `preview.ensure`
+ * - `unsupported`：本项目打不开，UI 显示 `reason`
+ */
+export interface StashPreviewInfo {
+  id: number
+  kind: 'image' | 'video' | 'audio' | 'text'
+  strategy: 'original' | 'derived' | 'unsupported'
+  ready: boolean
+  derive: 'image' | 'remux' | 'transcode' | 'audio' | null
+  mime: string | null
+  reason: string | null
+  bytes: number
+  editable: boolean
+  width: number | null
+  height: number | null
+  durationMs: number | null
+}
+
+/** 交给系统处理（Chromium 真解不了的格式的兜底出口 / 在文件夹中显示） */
+export interface StashShellApi {
+  /** 用系统默认程序打开素材。`opened` 为假时 `error` 说明原因 */
+  open: (id: number) => Promise<{ ok: boolean; data?: { opened: boolean; error?: string }; error?: string }>
+  reveal: (id: number) => Promise<{ ok: boolean; data?: { revealed: boolean }; error?: string }>
 }
 
 /** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
@@ -183,6 +246,8 @@ export interface StashApi {
   import: StashImportApi
   thumb: StashThumbApi
   asset: StashAssetApi
+  preview: StashPreviewApi
+  shell: StashShellApi
   clipboard: StashClipboardApi
   /** 拖拽进来的 File → 磁盘绝对路径（Electron 32+ 必须用 webUtils） */
   pathForFile: (file: File) => string

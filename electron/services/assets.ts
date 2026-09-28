@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 'fs'
 import { extname, isAbsolute, join, relative } from 'path'
+import { shell } from 'electron'
 import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
 import { importFiles } from './importer'
 import { uniqueName } from './naming'
@@ -600,6 +601,38 @@ export function deleteTag(id: number): { unlinked: number } {
   const r = db.prepare('DELETE FROM tags WHERE id=?').run(id)
   if (r.changes === 0) throw new Error('ERR_TAG_NOT_FOUND')
   return { unlinked }
+}
+
+/**
+ * 取素材在库内的绝对路径，并确认它确实存在（两个 shell 动作共用）。
+ * 注意：这里**不查 missing 列**，直接看磁盘 —— 索引可能滞后于现实。
+ */
+function assetAbsPath(id: number): string {
+  const { db, path: libPath } = requireCurrent()
+  const row = db.prepare('SELECT rel_path FROM assets WHERE id=?').get(id) as { rel_path: string } | undefined
+  if (!row) throw new Error('ERR_ASSET_NOT_FOUND')
+  const abs = join(libPath, ...row.rel_path.split('/'))
+  if (!existsSync(abs)) throw new Error('ERR_ASSET_MISSING')
+  return abs
+}
+
+/**
+ * 用系统默认程序打开素材。
+ * 这是「Chromium 真解不了」时的兜底出口（例如 avi 里塞了 mpeg4 之外的怪编码），
+ * 也可能是用户单纯想用外部工具看。
+ *
+ * ⚠️ Electron 44 的 `shell.openPath` 返回的是 **Promise<string>**（空串 = 成功，
+ * 非空 = 错误描述），不是旧版本的同步字符串 —— 所以这里必须是 async。
+ */
+export async function openAsset(id: number): Promise<{ opened: boolean; error?: string }> {
+  const err = await shell.openPath(assetAbsPath(id))
+  return err ? { opened: false, error: err } : { opened: true }
+}
+
+/** 在资源管理器里定位该素材（`explorer /select` 语义，由 Electron 的 showItemInFolder 提供） */
+export function revealAsset(id: number): { revealed: boolean } {
+  shell.showItemInFolder(assetAbsPath(id))
+  return { revealed: true }
 }
 
 /** 侧栏计数：总数 + 按文件夹直挂数 + 按标签数（子树聚合由渲染层按路径前缀计算） */

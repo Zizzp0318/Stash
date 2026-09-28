@@ -3,6 +3,9 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { fmtSize, fmtDate, fmtDuration } from '../utils/format'
+import PreviewVideo from './preview/PreviewVideo.vue'
+import PreviewAudio from './preview/PreviewAudio.vue'
+import PreviewText from './preview/PreviewText.vue'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -31,12 +34,31 @@ watch(
   }
 )
 
-/** 预览容器按素材真实宽高比撑开，高度由宽度推出；超长图由 CSS max-height 兜底 */
+/**
+ * 预览容器按素材真实宽高比撑开，高度由宽度推出；超长图由 CSS max-height 兜底。
+ *
+ * 只给**图片与视频**算比例：音频和文本没有「宽高比」这个概念，
+ * 硬套一个 4:3.6 只会让它们被塞进一个比例奇怪的盒子里 —— 交给 CSS 给固定高度。
+ */
 const previewStyle = computed(() => {
   const a = asset.value
-  if (a?.width && a?.height) return { aspectRatio: `${a.width} / ${a.height}` }
-  if (natRatio.value) return { aspectRatio: natRatio.value }
-  return { aspectRatio: '4 / 3.6' }
+  if (!a) return { aspectRatio: '4 / 3.6' }
+  if (a.type === 'image') {
+    if (a.width && a.height) return { aspectRatio: `${a.width} / ${a.height}` }
+    if (natRatio.value) return { aspectRatio: natRatio.value }
+    return { aspectRatio: '4 / 3.6' }
+  }
+  if (a.type === 'video') {
+    if (a.width && a.height) return { aspectRatio: `${a.width} / ${a.height}` }
+    return { aspectRatio: '16 / 9' }
+  }
+  return {}
+})
+
+/** 音频 / 文本：没有比例可用，靠 CSS 的固定高度撑开 */
+const isFixedHeightPreview = computed(() => {
+  const t = asset.value?.type
+  return t === 'audio' || t === 'text'
 })
 
 /** 加载完成：淡入；索引缺宽高时用图片真实尺寸补出比例 */
@@ -270,15 +292,24 @@ async function copyNote(): Promise<void> {
 <template>
   <aside class="detail">
     <template v-if="asset">
-      <div class="detail-preview" :style="previewStyle">
+      <div
+        class="detail-preview"
+        :class="{ 'is-media': asset.type !== 'image', 'is-fixed': isFixedHeightPreview }"
+        :style="previewStyle"
+      >
+        <!-- 图片保留快速缩略图：800px 对这条 340px 宽的面板绰绰有余，秒开、几何断言也稳。
+             视频/音频/文本原先只能显示占位图/静帧，这里换成真预览（与中栏浮层同一套组件）。 -->
         <img
-          v-if="asset.content_hash"
+          v-if="asset.type === 'image' && asset.content_hash"
           :key="detailReady"
           class="detail-img"
           :src="assets.thumbUrl(asset.content_hash, 'detail')"
           @error="($event.target as HTMLImageElement).style.opacity = '0'"
           @load="onPreviewLoad"
         />
+        <PreviewVideo v-else-if="asset.type === 'video'" :asset="asset" compact />
+        <PreviewAudio v-else-if="asset.type === 'audio'" :asset="asset" compact />
+        <PreviewText v-else-if="asset.type === 'text'" :asset="asset" view-only />
         <span v-else class="detail-fallback">无预览</span>
       </div>
       <div class="detail-body">

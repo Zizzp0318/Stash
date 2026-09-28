@@ -180,7 +180,48 @@ export const useAssetStore = defineStore('assets', () => {
     return `stash://thumb/${hash}/${size}.webp?v=${thumbV.value}`
   }
 
-  /** 切换库时清空全部素材状态（查询条件、列表、选中、详情） */
+  // ==================== 中栏放大预览（浮出层）====================
+  /**
+   * 正在浮层里查看的素材 id；null = 浮层关闭。
+   *
+   * **触发是双击**（用户拍板）：单击仍然是「选中 + 右侧详情」，所以这个状态与
+   * `selectedId` 完全独立 —— 不能写成「选中就弹浮层」，那会把多选流程整个打乱。
+   */
+  const previewId = ref<number | null>(null)
+
+  /**
+   * 预览里有没有未保存的改动（P4 的文本编辑器会写它）。
+   * 放 store 而不是组件里：浮层要拦「关闭 / 左右切换」，编辑器要上报 —— 两头都得读得到。
+   */
+  const previewDirty = ref(false)
+
+  function openPreview(id: number): void {
+    previewId.value = id
+  }
+
+  function closePreview(): void {
+    previewId.value = null
+    previewDirty.value = false
+  }
+
+  /**
+   * 在**当前列表顺序**里前后切换。
+   * 只在已加载的 `items` 里走，越界就停住（不自动 loadMore —— 翻页加载是异步的，
+   * 浮层里等加载再跳会闪一下；想看更后面的，关掉浮层滚下去再双击即可）。
+   * 返回是否真的切换了（没切换时 UI 不用重置媒体状态）。
+   */
+  function stepPreview(delta: number): boolean {
+    const id = previewId.value
+    if (id == null || items.value.length === 0) return false
+    const idx = items.value.findIndex((i) => i.id === id)
+    if (idx < 0) return false
+    const next = items.value[idx + delta]
+    if (!next) return false
+    previewId.value = next.id
+    return true
+  }
+
+  /** 切换库时清空全部素材状态（查询条件、列表、选中、详情、浮层） */
   function reset(): void {
     query.folderId = null
     query.tagId = null
@@ -195,6 +236,8 @@ export const useAssetStore = defineStore('assets', () => {
     selectedId.value = null
     selectedIds.value = []
     detail.value = null
+    previewId.value = null
+    previewDirty.value = false
   }
 
   /**
@@ -560,6 +603,7 @@ export const useAssetStore = defineStore('assets', () => {
     thumbV, bumpThumbs, thumbUrl,
     cardFields, toggleCardField, viewZoom,
     detailCollapsed, toggleDetail,
+    previewId, previewDirty, openPreview, closePreview, stepPreview,
     activeFilterCount, clearFilters,
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
