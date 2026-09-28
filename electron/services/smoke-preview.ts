@@ -26,6 +26,11 @@
 //
 // 样张全部用 ffmpeg / sharp 现造，跑完连临时库一起删掉，不留痕。
 //
+// ⚠️ 本套件会**把全局偏好临时置成默认值**再跑（断言是按默认值写的：派生文件名带 2560 的 tag、
+//   「点画面即播放」……），跑完在 `finally` 里把用户的原值写回。不这么做的话，用户一旦
+//   把「高清预览上限」改成 4096 或打开「自动播放」，就会有 5 条断言整片变红 —— 而且
+//   那跟产品有没有坏毫无关系（2026-09-29 实测：用户设置 85/90，默认设置 90/90）。
+//
 // 运行：node_modules/electron/dist/electron.exe . --smoke-preview
 //   ⚠️ 一个环境坑：有些宿主会注入 `ELECTRON_RUN_AS_NODE=1`，那会把 electron.exe 变成纯 Node，
 //   启动即报 `Cannot read properties of undefined (reading 'registerSchemesAsPrivileged')`。
@@ -42,7 +47,7 @@ import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
-import { patchSettings } from './config'
+import { DEFAULT_SETTINGS, getSettings, patchSettings } from './config'
 import {
   analyze, previewInfo, deriveFor, serveMedia, derivedPathFor, rowOf, readText, writeText,
   textMaxBytes, type PreviewInfo
@@ -105,6 +110,20 @@ function rmWithRetry(target: string, tries = 6): void {
 export async function runSmokePreview(win: BrowserWindow): Promise<void> {
   const result: Record<string, unknown> = {}
   let dir: string | null = null
+
+  // ⚠️ 跑之前必须**把设置固定成默认值**。设置存在 `userData/config.json` 里，
+  // 而本套件的断言是按默认值写的（派生文件名带最大尺寸的 tag、「点画面即播放」……）：
+  // 用非默认设置跑会整片变红，而且那跟产品有没有坏毫无关系
+  // （2026-09-29 实测：用户设置 85/90、默认设置 90/90）。
+  //
+  // 两层隔离一起用：
+  //   · `main.ts` 已经把**所有** `--smoke-*` 的 userData 换成一次性目录（根本隔离，用户的
+  //     config.json 根本不会被读/写）；
+  //   · 这里再做一遍「快照 → 置默认 → `finally` 写回」，作为纵深防御 —— 万一哪天隔离被
+  //     误删，也仍然不会把用户的偏好改坏。
+  const settingsBackup = JSON.parse(JSON.stringify(getSettings()))
+  patchSettings(JSON.parse(JSON.stringify(DEFAULT_SETTINGS)))
+
   try {
     dir = mkdtempSync(join(tmpdir(), 'stash-smoke-preview-'))
     const lib = createLibrary({ name: 'smoke-preview-lib', parentDir: dir })
@@ -294,7 +313,7 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       // 文件名必须带上限尺寸：改了「高清预览上限」就该生成新文件。
       // 不带 tag 的话会命中旧尺寸的缓存，用户看着就是「改了设置没生效」。
       check('S3 派生图文件名带上限尺寸 tag（改设置不会命中旧文件）',
-        out.includes('preview-2560.webp'), out.replace(lib.path, '<lib>'))
+        out.includes(`preview-${DEFAULT_SETTINGS.preview.maxImagePx}.webp`), out.replace(lib.path, '<lib>'))
 
       // 「能解码」而不是「文件存在」：让 sharp 真读一遍
       const meta = await sharp(out).metadata()
@@ -858,6 +877,10 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         '   await new Promise((r) => setTimeout(r, 120));' +
         ' }' +
         ' const br = bar.getBoundingClientRect();' +
+        // ⚠️ 先暂停再 seek。开着「自动播放」时媒体是**正在播**的，
+        // 点完进度条还要等 300ms 才读数 —— 这 300ms 里 currentTime 会继续往前走，
+        // 实测原来量到 0.73（期望 0.6）就是被播放推进出来的，跟 seek 本身无关。
+        ' media.pause();' +
         ' const kids = [...bar.children].map((el) => el.getBoundingClientRect());' +
         ' const centers = kids.filter((r) => r.height > 0).map((r) => r.top + r.height / 2);' +
         ' const spread = centers.length ? Math.max(...centers) - Math.min(...centers) : 0;' +
@@ -1053,6 +1076,10 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         ' }' +
         ' if (!media) return empty;' +
         ' media.currentTime = 0;' +
+        // ⚠️ 归位：开着「自动播放」时浮层一打开视频就在播，那「点画面」就变成**暂停**了 ——
+        // 下面三条断言（点一下播 / 再点一下停 / 点控制条不变）全依赖「起点是暂停」。
+        ' media.pause();' +
+        ' await new Promise((r) => setTimeout(r, 150));' +
         ' const stage = document.querySelector("[data-pv-video-stage]");' +
         ' const bar = document.querySelector(".pv-video [data-pp-bar]");' +
         ' const click = (el) => el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));' +
@@ -1170,6 +1197,10 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     result.checks = checks
     console.log('[SMOKE-PREVIEW] ' + JSON.stringify(result, null, 2))
   } finally {
+    // 把用户的真实偏好写回去（本套件为了可复现，会临时把设置置成默认值跑）
+    try {
+      patchSettings(settingsBackup)
+    } catch { /* 还原失败不能挡住退出 */ }
     closeCurrent()
     // Windows 上 ffmpeg/sharp 的句柄偶尔还没释放完，rmSync 会抛 EPERM。
     // 这里必须吞掉：清理失败不能挡住 app.exit，否则进程会一直挂着不退。

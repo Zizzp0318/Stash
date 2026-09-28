@@ -39,15 +39,16 @@ asarUnpack:
 
 win:
   icon: build/icon.ico
+  # 这里只打**安装版**；便携版（zip）走 electron-builder-portable.yml 单独构建 ——
+  # 它要往包里多塞一个 `portable.txt`（便携模式标记），而 extraFiles 对所有 target 一视同仁，
+  # 放这里会连安装版一起带上（见那个文件顶部的说明）。跑法：npm run package:win
   target:
     - target: nsis
       arch: [x64]
-    - target: zip
-      arch: [x64]
 
 # 产物名用 ASCII：中文文件名在旧解压工具/网盘上容易乱码，中文只留在快捷方式与卸载项里。
-# ⚠️ 根级没有 `zip:` 这个配置段（electron-builder 26 会直接报 unknown property 'zip'），
-# 所以「便携版」这个名字只能靠顶层 artifactName 承担，再由 nsis 覆盖成安装版的名字。
+# 顶层这个名字是给**便携版 zip** 用的（由 electron-builder-portable.yml 继承）；
+# 安装版由下面的 nsis.artifactName 覆盖成 -setup。
 artifactName: ${productName}-${version}-portable.${ext}
 
 # 安装版：给用户选安装目录，不写注册表以外的东西，卸载**不动**用户数据

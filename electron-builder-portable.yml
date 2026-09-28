@@ -1,0 +1,21 @@
+# 便携版（zip）专用配置：在主配置基础上，多塞一个 `portable.txt` 标记文件。
+#
+# 有了它，用户**解压即便携**：数据写进 `data\`（程序目录旁），不碰 %APPDATA%。
+#
+# 为什么不直接在主配置里加 extraFiles？
+#   `win-unpacked` 是 nsis 与 zip **共用**的中间目录，而 extraFiles 对两个 target 一视同仁 ——
+#   标记会跟着进安装版。装到 Program Files 时那个目录不可写，产品只能退回默认目录并告警，
+#   变成「能跑但行为跟预期不一致」的坑。所以从构建层面把两个包分开：
+#     · electron-builder.yml          → 只打 nsis（安装版，无标记）
+#     · electron-builder-portable.yml → 只打 zip（便携版，带标记）
+extends: ./electron-builder.yml
+
+win:
+  target:
+    - target: zip
+      arch: [x64]
+
+# `to` 相对于 app 目录（= win-unpacked 的根），所以标记就落在 Stash.exe 旁边
+extraFiles:
+  - from: build/portable.txt
+    to: portable.txt

@@ -53,6 +53,10 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       return null
     }
   }
+  /** 不做错误包装的版本：`location.reload()` 会中断页面，executeJavaScript 必然 reject —— 不能算 jsError */
+  const rawJs = (code: string): Promise<unknown> => win.webContents.executeJavaScript(code)
+  const onceLoaded = (): Promise<void> =>
+    new Promise((resolve) => win.webContents.once('did-finish-load', () => resolve()))
 
   let dir: string | null = null
   let libPath = ''
@@ -100,6 +104,19 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     ((await js(`[...document.querySelectorAll('.masonry-card')].map(c => c.querySelector('.ci-name')?.textContent ?? '')`)) as
       | string[]
       | null) ?? []
+  /**
+   * 轮询等待条件成立。
+   * `typeSearch` 里的 `sleep(420)` 是「300ms 防抖 + 一次查询」的**固定**估计 —— 机器一忙就不够，
+   * 抢跑的步骤会偶发拿到 null（实测 `--smoke-search` 3 次里红 1 次）。容易 flake 的步骤用这个。
+   */
+  const waitUntil = async (expr: string, timeoutMs = 8000): Promise<boolean> => {
+    const t0 = Date.now()
+    while (Date.now() - t0 < timeoutMs) {
+      if (await js<boolean>(expr)) return true
+      await sleep(100)
+    }
+    return false
+  }
   const clickSel = async (sel: string): Promise<boolean> =>
     ((await js(`(() => { const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.click(); return true })()`)) as
       | boolean
@@ -152,6 +169,16 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       rated3plus: (D().prepare('SELECT count(*) c FROM assets WHERE rating >= 3').get() as { c: number }).c,
       fav: (D().prepare('SELECT count(*) c FROM assets WHERE is_fav = 1').get() as { c: number }).c
     }
+
+    // ⚠️ 必须**自己**把渲染层带到这个库。A 段全是主进程侧操作（建库 / 导入 / 改 DB），
+    // 渲染层只有在启动时靠 `bootstrap()` 自动恢复「最近库」这一条路 ——
+    // 以前能进库视图，是因为**用户 config.json 里恰好有库**（本质上是撞运气，不是设计）；
+    // 现在冒烟统一跑在一次性 userData 里（config 是空的），渲染层就停在欢迎页，
+    // 从 `uiSearchResult` 起 37 条 UI 断言整片全垮。
+    // 照 smoke-edit / smoke-compress 的做法：自己 open + reload + 等加载完。
+    await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
+    await onceLoaded()
+    await sleep(2500)
 
     // ==================== B. 关键词搜索 + LIKE 转义 ====================
     step('B-关键词')
@@ -269,7 +296,12 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
 
     // 空结果：文案要区分「没有匹配」而不是「暂无素材」
     await typeSearch('zzz绝不存在的关键词')
+    // ⚠️ 必须等空状态**真的渲染出来**再读/点：抢跑时 `.empty .w-btn` 是 null，
+    // 下一次点击会抛 TypeError，更麻烦的是**筛选没被清掉** → 后面一整片依赖
+    // 「列表回到 11 项」的断言级联失败（实测 3 次里红 1 次，纯 flake）。
+    const emptyReady = await waitUntil("!!document.querySelector('.empty .w-btn')")
     R.g_empty = {
+      ready: emptyReady,
       items: (await cardNames()).length,
       text: await js(`document.querySelector('.empty')?.textContent.replace(/\\s+/g, ' ').trim() ?? null`),
       hasSub: await js(`!!document.querySelector('.empty-sub')`),
@@ -277,7 +309,8 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     }
 
     // 清除筛选：列表恢复全量、搜索框同步清空、清除按钮消失
-    await js(`document.querySelector('.empty .w-btn').click()`)
+    // （可选链 + 吞掉返回值：万一没等到也让它走断言去报红，别在这里抛异常把后续整片带崩）
+    await js(`document.querySelector('.empty .w-btn')?.click(); true`)
     await sleep(500)
     R.g_cleared = {
       count: (await cardNames()).length,
@@ -440,7 +473,7 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     const f = R.f_page as Record<string, unknown>
     const gHl = R.g_highlight as { marks: string[] | null; fullName: string | null; rawHTML: string | null }
     const gEs = R.g_escape as { text: string[] | null; childElements: number[] | null }
-    const gEm = R.g_empty as { items: number; text: string | null; clearBtn: string | null }
+    const gEm = R.g_empty as { ready: boolean; items: number; text: string | null; clearBtn: string | null }
     const gCl = R.g_cleared as { count: number; total: string | null; searchValue: string | null; clearChipGone: boolean }
     const hTm = R.h_typeMenu as { items: string[] | null; active: string | null }
     const hIc = R.h_iconOnly as {
@@ -531,8 +564,10 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       escapeNoInjectedNodes: Array.isArray(gEs?.childElements) && gEs.childElements.every((n) => n <= 1),
 
       // G 空态：文案要指向「筛选」而不是「去导入」
-      emptyCopyFiltered: /没有匹配的素材/.test(gEm?.text ?? '') && !/暂无素材/.test(gEm?.text ?? ''),
-      emptyHasClearButton: (gEm?.clearBtn ?? '').includes('清除筛选'),
+      // （`ready` 是防假绿的闸门：没等到空状态就不算通过）
+      emptyCopyFiltered: gEm?.ready === true &&
+        /没有匹配的素材/.test(gEm?.text ?? '') && !/暂无素材/.test(gEm?.text ?? ''),
+      emptyHasClearButton: gEm?.ready === true && (gEm?.clearBtn ?? '').includes('清除筛选'),
 
       // G 清除筛选：列表恢复、搜索框同步清空、按钮消失、分母回归「个文件」
       clearRestoresAll: gCl?.count === 11,

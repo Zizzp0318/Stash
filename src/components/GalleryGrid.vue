@@ -336,15 +336,33 @@ const cardW = computed(() => {
   return (w - MASONRY_GAP * (c - 1)) / c
 })
 
-// 图片宽高比（h / w）：优先用索引里的尺寸，索引缺失时用图片实际加载尺寸兜底
-const measuredRatio = reactive(new Map<number, number>())
+// 图片宽高比（h / w）：**优先用索引里的尺寸**，索引缺失时才用图片实际加载尺寸兜底。
+//
+// ⚠️ 这里踩过一个「切库串号」的坑（用户报「多个库切换后，别的比例的图都变成 1:1」）：
+//   · 键原本是**素材 id**，而每个库的 id 都从 1 开始 → 切库必然撞号，且本 Map 是组件内状态，
+//     切库时 store 的 reset() 清不到它；
+//   · 判断顺序还写反了（先查实测值、再退回索引尺寸），于是**索引里明明有正确尺寸**的图
+//     也会被上一个库的实测值盖掉；
+//   · 污染源很具体：音频/文本的占位图是 320×320 → 实测比例记成 **1**，
+//     切到图片库之后，相同 id 的图片就全被渲染成正方形。
+// 三处一起改：① 判断顺序改回「索引优先」；② 键改用 content_hash（跨库唯一）；③ 切库时清空。
+const measuredRatio = reactive(new Map<string, number>())
+
+/** 实测比例的键：content_hash 跨库唯一（内容相同则比例必然相同）；无 hash 时退回「库路径 + id」 */
+function ratioKey(it: StashAssetRow): string {
+  return it.content_hash ?? `${lib.info?.path ?? ''}#${it.id}`
+}
 
 function ratioOf(it: StashAssetRow): number {
-  const m = measuredRatio.get(it.id)
-  if (m) return m
   if (it.width && it.height) return it.height / it.width
+  const m = measuredRatio.get(ratioKey(it))
+  if (m) return m
   return 0.75 // 未知尺寸的默认比例（4:3）
 }
+
+// 切库时清掉实测比例：键虽然已经跨库安全，但**没算 hash 的素材**是拿「库路径 + id」当键的，
+// 留着就会在新库里积下上一个库的旧键（脏数据不该跨库存活）。
+watch(() => lib.info?.path, () => measuredRatio.clear())
 
 /** 缩略图可视宽度 = 卡片宽度 - 两侧内边距 */
 const thumbW = computed(() => Math.max(0, cardW.value - CARD_PAD * 2))
@@ -419,7 +437,7 @@ function onImgLoad(it: StashAssetRow, ev: Event): void {
   const el = ev.target as HTMLImageElement
   el.style.opacity = '1'
   if (!(it.width && it.height) && el.naturalWidth > 0 && el.naturalHeight > 0) {
-    measuredRatio.set(it.id, el.naturalHeight / el.naturalWidth)
+    measuredRatio.set(ratioKey(it), el.naturalHeight / el.naturalWidth)
   }
 }
 

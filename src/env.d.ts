@@ -366,6 +366,8 @@ export interface StashAppInfo {
   chrome: string
   node: string
   userData: string
+  /** 便携模式：数据目录在「程序目录旁的 data\」里（由 portable.txt 或 --portable 触发） */
+  portable: boolean
 }
 
 export interface StashCacheBucket {

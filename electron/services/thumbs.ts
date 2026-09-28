@@ -7,7 +7,7 @@ import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
-import { requireCurrent } from './library'
+import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
 
 export const SIZES = { grid: 320, detail: 800 } as const
@@ -163,20 +163,31 @@ function relOf(abs: string): string {
 const placeholderCache = new Map<string, string>()
 const placeholderPending = new Map<string, Promise<string>>()
 
+/**
+ * 占位图缓存的键必须**带库路径**。
+ * 键只用 type 的话，切库后 `placeholderCache.get(type)` 会命中**上一个库**的
+ * `.thumbs/placeholder-audio.webp` 绝对路径，然后被 `copyFileSync` 复制进新库 ——
+ * 内容虽然一样，但拿旧库的路径当新库的缓存用是错的（旧库被删/移动后才自愈）。
+ */
+function placeholderKey(type: string): string {
+  return `${requireCurrent().path}|${type}`
+}
+
 function placeholder(type: string): Promise<string> {
-  const hit = placeholderCache.get(type)
+  const key = placeholderKey(type)
+  const hit = placeholderCache.get(key)
   if (hit && existsSync(hit)) return Promise.resolve(hit)
-  const pending = placeholderPending.get(type)
+  const pending = placeholderPending.get(key)
   if (pending) return pending // 已经有人在生成了，等他就行
-  const p = generatePlaceholder(type).finally(() => placeholderPending.delete(type))
-  placeholderPending.set(type, p)
+  const p = generatePlaceholder(key, type).finally(() => placeholderPending.delete(key))
+  placeholderPending.set(key, p)
   return p
 }
 
-async function generatePlaceholder(type: string): Promise<string> {
+async function generatePlaceholder(key: string, type: string): Promise<string> {
   const out = join(requireCurrent().path, '.thumbs', `placeholder-${type}.webp`)
   if (existsSync(out)) {
-    placeholderCache.set(type, out)
+    placeholderCache.set(key, out)
     return out
   }
   mkdirSync(join(out, '..'), { recursive: true })
@@ -187,7 +198,7 @@ async function generatePlaceholder(type: string): Promise<string> {
   const tmp = tmpPath(out)
   writeFileSync(tmp, buf)
   renameTmp(tmp, out) // 原子替换：失败也只可能留下临时文件，最终路径要么没有、要么是完整的
-  placeholderCache.set(type, out)
+  placeholderCache.set(key, out)
   return out
 }
 
@@ -204,6 +215,30 @@ async function writeImageMeta(asset: { id: number; rel_path: string }): Promise<
   } catch { /* HEIC 之外解析失败忽略 */ }
 }
 
+/**
+ * 把一个图片素材的「索引字段」（尺寸 + 主色板）补齐。
+ *
+ * 两个字段都自身幂等（算过就不再算），所以可以对每个 grid job 无脑调用 ——
+ * 正常库里这里只是两次 SELECT，开销可忽略。
+ *
+ * ⚠️ 色板算不出来（文件损坏等）时**保持 NULL、不写哨兵**：NULL 的语义就是「还没算出来过」，
+ * 下次 backfill 会再试。敢这么写是因为「能解码的图必定算得出颜色」——
+ * 算不出来只可能是解码失败，而那时 sharp 会立刻抛错，重试成本极低。
+ * （对比 `genmeta` 那边必须用状态位：那里「本来就没元数据」是**常态**，会无限重扫。）
+ */
+async function writeIndexFields(asset: { id: number; rel_path: string }): Promise<void> {
+  await writeImageMeta(asset)
+  if (!getSettings().importing.palette) return
+  const { db } = requireCurrent()
+  const row = db.prepare('SELECT palette FROM assets WHERE id=?').get(asset.id) as
+    | { palette: string | null }
+    | undefined
+  if (!row || row.palette != null) return
+  const abs = join(requireCurrent().path, ...asset.rel_path.split('/'))
+  const pal = await computePalette(abs)
+  if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, asset.id)
+}
+
 /** 图片主色板：取 50px 缩图原始像素，粗量化后取出现最多的 5 个颜色 */
 export async function computePalette(abs: string): Promise<string | null> {
   try {
@@ -214,6 +249,9 @@ export async function computePalette(abs: string): Promise<string | null> {
       .removeAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true })
+    // 灰度/双通道输入按 3 通道去读会越界（`data[i+1]` 是 undefined → 位运算得 0），
+    // 结果是整块偏黑的**错色板**。宁可不给，也不给错的。
+    if (info.channels < 3) return null
     const counts = new Map<number, number>()
     for (let i = 0; i < data.length; i += info.channels) {
       const r = data[i] & 0xF0, g = data[i + 1] & 0xF0, b = data[i + 2] & 0xF0
@@ -243,6 +281,14 @@ interface Job {
   asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }
   size: ThumbSize
   batch: number
+  /**
+   * 入队时所属的库。**执行前必须核对** —— 缩略图是按「当前库目录 + content_hash」落盘的，
+   * 排队期间用户切了库的话，同一个 job 会拿**新库的 `.thumbs` 目录 + 旧库的 rel_path/hash**
+   * 去执行：运气好文件不存在直接失败，运气不好新库有同名相对路径，就会把 B 文件的缩略图
+   * 写进 `hashA` 的目录里（**内容与 hash 对不上**，之后这张图永远显示错图）。
+   * 校验不过就丢弃 —— 新库自己的 backfill 会把它的素材重新入队，不会漏。
+   */
+  libPath: string
 }
 const queue: Job[] = []
 let running = 0
@@ -251,46 +297,84 @@ function broadcast(channel: string, data: unknown): void {
   BrowserWindow.getAllWindows()[0]?.webContents.send(channel, data)
 }
 
+/** 当前库路径；没有打开的库（切库中途）返回 null */
+function libPathNow(): string | null {
+  try {
+    return getLibrary()?.path ?? null
+  } catch {
+    return null
+  }
+}
+
+/** 更新 job 所属批次的进度（到齐了就广播 thumb:done 并回调） */
+function settleBatch(job: Job): void {
+  const b = batches.get(job.batch)
+  if (!b) return
+  b.done++
+  if (b.done % 10 === 0 || b.done === b.total) {
+    broadcast('thumb:progress', { done: b.done, total: b.total })
+  }
+  if (b.done >= b.total) {
+    broadcast('thumb:done', { done: b.done, total: b.total })
+    batches.delete(job.batch)
+    b.cb?.()
+  }
+}
+
+/** 异步 job 收尾：让出并发位、结批次、继续推队列 */
+function finishJob(job: Job): void {
+  running--
+  settleBatch(job)
+  pump()
+}
+
 function pump(): void {
   while (running < concurrency() && queue.length > 0) {
     const job = queue.shift()!
     running++
+    if (libPathNow() !== job.libPath) {
+      // 排队期间用户切了库 → 这个 job 的 rel_path/hash 属于上一个库，直接丢弃。
+      // 见 Job.libPath 的注释：不丢的话会按旧库的 hash 往新库的 .thumbs 里写东西。
+      // 这里**不要**调 pump()：外层 while 会继续（同步分支里递归反而重复推进）。
+      running--
+      settleBatch(job)
+      continue
+    }
     ensureOne(job.asset, job.size)
       .then(async (r) => {
-        // 首个 grid 缩略图成功后补写图片元数据与主色板
-        if (r?.generated && job.size === 'grid' && job.asset.type === 'image') {
-          const abs = join(requireCurrent().path, ...job.asset.rel_path.split('/'))
-          await writeImageMeta(job.asset)
-          // 色板可以在设置里关掉（省一点 CPU）——关掉只是「以后不再算」，
-          // 已经算过的保留着；想补算就重新打开设置、再清一次缓存重建。
-          if (getSettings().importing.palette) {
-            const { db } = requireCurrent()
-            const row = db.prepare('SELECT palette FROM assets WHERE id=?').get(job.asset.id) as { palette: string | null } | undefined
-            if (row && !row.palette) {
-              const pal = await computePalette(abs)
-              if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, job.asset.id)
-            }
-          }
+        // 缩略图可用就补写索引字段（尺寸 + 主色板）。
+        // ⚠️ **不要再要求 `r.generated`**（这里原本是 `r?.generated && ...`）：
+        // 缩略图命中缓存的素材同样要补写 —— 否则 palette/width 为空的存量素材永远补不上，
+        // 只能「清理缓存 + 重建」。详见 ensureBatch 里 indexFields 的注释。
+        if (r && job.size === 'grid' && job.asset.type === 'image') {
+          await writeIndexFields(job.asset)
         }
       })
       .catch(() => { /* ignore */ })
-      .finally(() => {
-        running--
-        const b = batches.get(job.batch)
-        if (b) {
-          b.done++
-          if (b.done % 10 === 0 || b.done === b.total) {
-            broadcast('thumb:progress', { done: b.done, total: b.total })
-          }
-          if (b.done >= b.total) {
-            broadcast('thumb:done', { done: b.done, total: b.total })
-            batches.delete(job.batch)
-            b.cb?.()
-          }
-        }
-        pump()
-      })
+      .finally(() => finishJob(job))
   }
+}
+
+/**
+ * 索引里还缺「尺寸 / 主色板」的图片 id（`size==='grid'` 的 job 会顺带补写这两个字段）。
+ *
+ * ⚠️ **必须把它们也放进队列**：`ensureBatch` 原本只收「缩略图文件不存在」的素材，
+ * 而索引字段的回写挂在入队 job 上 —— 于是
+ * 「缩略图已缓存（命中）、但 palette/width 仍为 NULL」的素材**永远补不上**，
+ * 只能手工「清理缓存 + 重建」。两个真实成因都很常见：
+ *   · 素材删掉后重新导入同一文件（content_hash 相同 → `.thumbs/{hash}/` 缓存还在）
+ *   · 导入那一刻「生成主色板」关着，之后才打开（开关只影响以后，存量不会补）
+ * 用户报的「有些图片导入进去色板读不出来，要清理并重建才行」就是这条。
+ * `genmeta` 的 `backfillMeta` 早就用位标记绕过了同一个坑（见 main.ts `thumb:backfill`
+ * 里那段注释），色板这条当时漏了。
+ */
+function indexFieldsSinkIds(wantPalette: boolean): Set<number> {
+  const { db } = requireCurrent()
+  const cond = wantPalette ? '(width IS NULL OR palette IS NULL)' : 'width IS NULL'
+  const rows = db
+    .prepare(`SELECT id FROM assets WHERE missing=0 AND type='image' AND ${cond}`)
+    .all() as Array<{ id: number }>
+  return new Set(rows.map((r) => r.id))
 }
 
 /** 批量生成（入队，立即返回）。onDone 在**这一批**全部完成时回调（冒烟测试用） */
@@ -299,14 +383,20 @@ export function ensureBatch(
   size: ThumbSize,
   onDone?: () => void
 ): void {
-  const fresh = assets.filter((a) => a.content_hash && !existsSync(thumbFile(a.content_hash, size)))
+  // grid 顺带回写尺寸与色板 → 「索引里缺这两个字段」的也要进队列（虽然缩略图早就在了）
+  const sink = size === 'grid' ? indexFieldsSinkIds(getSettings().importing.palette) : new Set<number>()
+  const fresh = assets.filter(
+    (a) => a.content_hash && (!existsSync(thumbFile(a.content_hash, size)) || sink.has(a.id))
+  )
   if (fresh.length === 0) {
     onDone?.()
     return
   }
   const id = ++batchSeq
+  const libPath = requireCurrent().path
   batches.set(id, { total: fresh.length, done: 0, cb: onDone ?? null })
-  queue.push(...fresh.map((asset) => ({ asset, size, batch: id })))
+  queue.push(...fresh.map((asset) => ({ asset, size, batch: id, libPath })))
+  pump()
   pump()
 }
 

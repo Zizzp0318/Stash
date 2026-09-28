@@ -13,18 +13,23 @@
 //                    会生成**新文件名**的派生文件（不是复用旧的）、音量/自动播放/文本上限落盘
 //   S9 导入组     —— 方式/去重/色板落盘，且**不传 mode 直接调 import.files** 时管线真的按设置走
 //                    （移动真的搬走源文件、关掉去重真的会重复导入、关掉色板真的不再回写色板）
+//                    S9c：打开色板后重跑 backfill，**缩略图已缓存**的存量素材也要补算色板
+//                    （旧实现只在缩略图本次新生成时回写 → 这类素材永远补不上，只能清缓存重建）
 //   S10 库与存储  —— 体检能找出「文件已不在磁盘」的素材、清理点两次才生效且**不碰磁盘上还在的文件**
 //   S11 快捷键    —— 只读清单：有内容、不留空行、且**里面不该有任何可点控件**（防「假设置」）
+//   S12 切换库     —— 两个临时库（X: 400×200 的图；Y: txt 占位图 1:1）来回切，
+//                    断言图片卡片的宽高比不被上一个库的实测值带偏（用户报过「切库后都变成 1:1」）
 //
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, dialog } from 'electron'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { basename, join } from 'path'
 import sharp from 'sharp'
-import { closeCurrent, createLibrary, mkdirRel, requireCurrent } from './library'
+import { closeCurrent, createLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
 import { importFiles } from './importer'
+import { ensureBatch } from './thumbs'
 import { libraryUsage } from './health'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
 
@@ -365,10 +370,16 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await new Promise((r) => setTimeout(r, 300))
       check('S8 初始音量落盘', Math.abs(diskSettings().preview.volume - 0.35) < 1e-6,
         String(diskSettings().preview.volume))
+      // ⚠️ 不能写成「点一下 → 断言变成 true」：那是**依赖初始值**的写法。
+      // 用户自己在设置里把「自动播放」打开后（config 里 autoPlay:true），点一下反而变 false
+      // → 这条断言永远红（2026-09-29 实测踩到，当时还误以为是别处改动带坏的）。
+      // toggle 的真实语义是「翻转」，所以先读当前值、再断言它变成了反值。
+      const autoBefore = diskSettings().preview.autoPlay
       await clickEl('[data-sp-autoplay]')
       await new Promise((r) => setTimeout(r, 300))
-      check('S8 自动播放开关落盘', diskSettings().preview.autoPlay === true,
-        JSON.stringify(diskSettings().preview))
+      check('S8 自动播放开关落盘（点一下即翻转并写盘）',
+        diskSettings().preview.autoPlay === !autoBefore,
+        `${autoBefore} → ${String(diskSettings().preview.autoPlay)}`)
       await clickEl('[data-sp-textmb] button:nth-child(3)') // 8 MB
       await new Promise((r) => setTimeout(r, 300))
       check('S8 文本预览上限落盘（8MB）', diskSettings().preview.textMaxBytes === 8 * 1024 * 1024,
@@ -544,6 +555,33 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await clickEl('[data-sp-palette]')
       await new Promise((r) => setTimeout(r, 250))
       check('S9 「生成主色板」已恢复成开', diskSettings().importing.palette === true)
+
+      // —— S9c 色板补算：存量素材（缩略图已缓存、色板为空）必须能自动补上 ——
+      // 这就是用户报的场景：nopal.png 是在开关关着时导入的，缩略图已生成并缓存，
+      // 而旧实现只在「缩略图**本次新生成**」时回写色板 → 这张图的色板**永远补不上**，
+      // 只能去清缓存重建。现在应该只要重跑一次 backfill 就补上。
+      const nopalRow = (): { id: number; content_hash: string | null; palette: string | null } =>
+        requireCurrent().db
+          .prepare("SELECT id, content_hash, palette FROM assets WHERE name='nopal.png'")
+          .get() as { id: number; content_hash: string | null; palette: string | null }
+      const nopalGrid = (): string => join(lib.path, '.thumbs', nopalRow().content_hash ?? 'x', 'grid.webp')
+      check(
+        'S9c 前置：该素材此刻「缩略图已缓存 + 色板为空」（正是用户遇到的状态）',
+        existsSync(nopalGrid()) && nopalRow().palette === null,
+        `grid存在=${existsSync(nopalGrid())} palette=${String(nopalRow().palette)}`
+      )
+
+      await new Promise<void>((resolve) => {
+        const rows = requireCurrent().db
+          .prepare("SELECT id, type, ext, content_hash, rel_path FROM assets WHERE name='nopal.png'")
+          .all() as Array<never>
+        ensureBatch(rows, 'grid', resolve)
+      })
+      check(
+        'S9c 打开色板后重跑 backfill，缩略图已缓存的存量素材也会补算色板（不必清缓存重建）',
+        /^\["#/.test(String(nopalRow().palette)),
+        String(nopalRow().palette)
+      )
       await capture('shot-settings-import.png')
     }
 
@@ -759,6 +797,152 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
     check('S5 恢复默认后 DOM 也跟着变回来（瀑布 + 角标 + 详情栏都在）',
       domDefault?.masonry === true && (domDefault?.badge ?? 0) > 0 && domDefault?.detail === true,
       JSON.stringify(domDefault))
+
+    // ==================== S12 切换库不该串号 ====================
+    // 用户报：「多个库切换，原来别的比例的预览图都变成 1:1」。
+    // 根因：卡片「实测比例」那张 Map 以**素材 id** 为键、切库时又不清空，而每个库的 id 都从 1 开始；
+    // 音频/文本的缩略图是 320×320 的占位图（实测比例 = 1），于是切到图片库之后，
+    // 相同 id 的图片就全被渲染成正方形。
+    // 这一段拿两个受控临时库复现：X 库 id=1 是 400×200 的图（比例 0.5），Y 库 id=1 是 txt（占位图 1:1）。
+    {
+      const xDir = mkdtempSync(join(tmpdir(), 'stash-smoke-ratio-x-'))
+      const yDir = mkdtempSync(join(tmpdir(), 'stash-smoke-ratio-y-'))
+      // 新库没有现成的文件夹行（createLibrary 只建 .thumbs 与 meta），所以先建一个再导入
+      const makeFolder = (): number => mkdirRel('素材').id
+      /** 导入并等这一批缩略图跑完 —— 不等的话渲染层切过去时 img 还没生成，量不到高度 */
+      const importAndThumbs = async (path: string): Promise<void> => {
+        await new Promise<void>((resolve) => {
+          importFiles({ paths: [path], folderId: makeFolder(), mode: 'copy', onDone: () => resolve() })
+        })
+        await new Promise<void>((resolve) => {
+          const rows = requireCurrent().db
+            .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets')
+            .all() as Array<never>
+          ensureBatch(rows, 'grid', resolve)
+        })
+      }
+
+      const xLib = createLibrary({ name: 'ratio-x', parentDir: xDir })
+      const widePng = join(xDir, 'wide.png')
+      await sharp({ create: { width: 400, height: 200, channels: 3, background: '#336699' } }).png().toFile(widePng)
+      const tallPng = join(xDir, 'tall.png')
+      await sharp({ create: { width: 200, height: 400, channels: 3, background: '#996633' } }).png().toFile(tallPng)
+      await importAndThumbs(widePng) // 先导这张 → 它拿到 id=1
+      await importAndThumbs(tallPng) // 第二张只是让 X 库有 2 个卡片，好跟 Y 库（1 个）区分开
+
+      const yLib = createLibrary({ name: 'ratio-y', parentDir: yDir })
+      const noteTxt = join(yDir, 'note.txt')
+      writeFileSync(noteTxt, 'ratio smoke')
+      await importAndThumbs(noteTxt)
+
+      // 主进程切回本套件原来的库；渲染层全程没动过，所以两边仍然一致
+      openLibrary(lib.path)
+
+      // ⚠️ 切库必须走**真实的 UI 入口**。IPC + location.reload() 那种做法会把组件状态一起清掉
+      // （等于重启软件），而脏值本来只在内存里 —— 那样就复现不出来了。
+      // 这里把系统目录选择框拦掉，点「打开库…」→ 走真实的 switchTo()。
+      const origPickDialog = dialog.showOpenDialog
+      let nextPick = ''
+      dialog.showOpenDialog = (async () =>
+        nextPick ? { canceled: false, filePaths: [nextPick] } : { canceled: true, filePaths: [] }) as typeof dialog.showOpenDialog
+
+      const switchLibByPick = async (target: string): Promise<boolean> => {
+        nextPick = target
+        await js("document.querySelector('.lib-menu-backdrop')?.click(); true") // 先关掉可能开着的菜单
+        await new Promise((r) => setTimeout(r, 150))
+        await js("document.querySelector('.tab-select')?.click(); true")
+        const opened = await waitFor("!!document.querySelector('.lib-menu')", 5000)
+        if (!opened) return false
+        const hit = await js<boolean>(
+          `(() => {
+             const el = [...document.querySelectorAll('.lib-menu .lib-menu-item.action')]
+               .find((n) => (n.textContent ?? '').includes('打开库'))
+             if (!el) return false
+             el.click()
+             return true
+           })()`
+        )
+        if (!hit) return false
+        // ⚠️ 必须等**标题栏的库名**变过去再继续：两个库的素材 id 都是 1，
+        // 只等 `.masonry-card[data-id="1"]` 的话，上一个库的旧卡片还在 DOM 里 → 立刻命中
+        // → 后面量到的还是旧库的几何，断言就假绿了（注入验证时踩到过）。
+        const want = basename(target)
+        return waitFor(
+          `(document.querySelector('.tab-select')?.textContent ?? '').includes(${JSON.stringify(want)})`,
+          20000
+        )
+      }
+      /** 当前标题栏显示的库名（断言 detail 里带上它，假绿时一眼能看出停在了哪个库） */
+      const libNameNow = async (): Promise<string> =>
+        ((await js<string>("document.querySelector('.tab-select')?.textContent ?? ''")) ?? '').trim()
+      const thumbH = async (id: number): Promise<number | null> => {
+        const v = await js<number | null>(
+          `(() => { const el = document.querySelector('.masonry-card[data-id="${id}"] .thumb'); return el ? Math.round(el.getBoundingClientRect().height) : null })()`
+        )
+        return typeof v === 'number' ? v : null
+      }
+      const cardW = async (id: number): Promise<number | null> => {
+        const v = await js<number | null>(
+          `(() => { const el = document.querySelector('.masonry-card[data-id="${id}"]'); return el ? Math.round(el.getBoundingClientRect().width) : null })()`
+        )
+        return typeof v === 'number' ? v : null
+      }
+      /**
+       * 等「切库真的生效 + 这一库的列表真的渲染完 + 目标卡片的图真的加载完」。
+       * 三重判据缺一不可：只等卡片的话，上一个库的旧卡片还在 DOM 里（两库的 id 都是 1），
+       * 会立刻命中 → 量到旧库的几何 → 断言假绿。
+       */
+      const settledLib = async (libName: string, expectCards: number, id: number): Promise<boolean> => {
+        const nameOk = await waitFor(
+          `(document.querySelector('.tab-select')?.textContent ?? '').includes(${JSON.stringify(libName)})`,
+          20000
+        )
+        if (!nameOk) return false
+        const countOk = await waitFor(`document.querySelectorAll('.masonry-card').length === ${expectCards}`, 20000)
+        if (!countOk) return false
+        return waitFor(
+          `(() => { const im = document.querySelector('.masonry-card[data-id="${id}"] img.thumb-img'); return !!im && im.complete && im.naturalWidth > 0 })()`,
+          20000
+        )
+      }
+
+      const goX = await switchLibByPick(xLib.path)
+      const s1 = await settledLib('ratio-x', 2, 1)
+      const h1 = await thumbH(1)
+      const w1 = await cardW(1)
+
+      const goY = await switchLibByPick(yLib.path)
+      const s2 = await settledLib('ratio-y', 1, 1) // 这一步会让渲染层加载 1:1 的占位图（旧实现就在这记脏了 id=1）
+
+      const backX = await switchLibByPick(xLib.path)
+      const s3 = await settledLib('ratio-x', 2, 1)
+      const h2 = await thumbH(1)
+      // 判据说明：这条断言盯的是**判断顺序**（索引尺寸优先于实测值）——
+      // 注入验证就是把 ratioOf 的顺序改回去、断言转红（detail 里会看到「切库后=186」，
+      // 正好等于卡片内宽 = 正方形）。X 库的图 DB 有尺寸，所以键与「切库清空」这两处加固
+      // 不在这条断言的覆盖范围内（它们管的是「DB 缺尺寸、只能靠实测兜底」的素材）。
+      const nameAtEnd = await libNameNow()
+
+      check(
+        'S12 前置：X 库那张 400×200 的图确实按非正方形渲染（否则这条断言抓不到东西）',
+        goX && goY && backX && s1 && s2 && s3 && h1 != null && w1 != null && h1 < w1 - 8,
+        `切库=${goX}/${goY}/${backX} 就绪=${s1}/${s2}/${s3} 缩略图高=${h1} 卡片宽=${w1} 当前库=${nameAtEnd}`
+      )
+      check(
+        'S12 切到别的库再切回来，图片的宽高比不会被带偏（不会变成 1:1）',
+        h1 != null && h1 === h2,
+        `首次=${h1} 切库后=${h2}（卡片宽=${w1}，若后者≈宽说明被渲染成正方形了）`
+      )
+
+      // 收尾：把系统对话框换回去、切回本套件原来的库、删掉两个临时库目录
+      dialog.showOpenDialog = origPickDialog
+      openLibrary(lib.path)
+      for (const d of [xDir, yDir]) {
+        try {
+          rmSync(d, { recursive: true, force: true })
+        } catch { /* 句柄没释放就留着，系统会回收 */ }
+      }
+    }
 
     // ==================== S1 尾巴：Esc 关闭 + 无运行期错误 ====================
     await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")

@@ -369,7 +369,7 @@ async function copyDiagnostics(): Promise<void> {
   const text = [
     `Stash ${t?.version ?? '?'}`,
     `Electron ${t?.electron ?? '?'} / Chromium ${t?.chrome ?? '?'} / Node ${t?.node ?? '?'}`,
-    `数据目录 ${t?.userData ?? '?'}`,
+    `数据目录 ${t?.userData ?? '?'}${t?.portable ? '（便携模式）' : ''}`,
     `视图 ${s.value.defaultView} · 卡片宽 ${s.value.viewZoom}px`,
     `字段 ${CARD_FIELDS.filter((f) => s.value.cardFields[f.key]).map((f) => f.label).join('/') || '无'}` +
       (s.value.cardFields.typeBadge ? ' + 类型角标' : '')
@@ -1049,7 +1049,10 @@ async function copyDiagnostics(): Promise<void> {
               <span>Chromium</span><b>{{ info?.chrome ?? '—' }}</b>
               <span>Node</span><b>{{ info?.node ?? '—' }}</b>
               <span>数据目录</span>
-              <b class="sp-path" :title="info?.userData">{{ info?.userData ?? '—' }}</b>
+              <b class="sp-path" :title="info?.userData">
+                {{ info?.userData ?? '—' }}
+                <span v-if="info?.portable" class="sp-chip on" data-sp-portable>便携模式</span>
+              </b>
             </div>
 
             <div class="sp-note">

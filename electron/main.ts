@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
 import { spawn } from 'child_process'
-import { join } from 'path'
-import { existsSync, readFileSync, rmSync } from 'fs'
+import { join, dirname } from 'path'
+import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import * as librarySvc from './services/library'
 import * as assetsSvc from './services/assets'
@@ -52,17 +52,78 @@ const GPU_FALLBACK_FLAG = '--gpu-fallback'
 const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke-'))
 if (isSmokeRun) app.commandLine.appendSwitch('disable-gpu-sandbox')
 
-// 欢迎页冒烟：渲染层启动会自动恢复「最近打开的库」，只有库列表为空才会落在欢迎页 ——
-// 所以先把 userData 换成一次性目录（config.json 不存在 → 无历史库），跑完连同目录一起丢弃，
-// 绝不碰用户真实的 config.json（recentLibraries / settings 都在里面）。
-if (process.argv.includes('--smoke-welcome')) {
-  const ud = join(tmpdir(), 'stash-smoke-welcome-ud')
+// ── 数据目录：默认 `%APPDATA%\Stash`，**便携模式**下改到「程序目录旁的 data\」 ──
+//
+// 两条触发通道（任一成立即可）：
+//   · 程序目录里有标记文件 `portable.txt` —— 便携包 zip 里预置了它，**解压即便携**
+//   · 启动参数带 `--portable`
+//
+// ⚠️ 必须在 app ready 之前 setPath：Chromium 一旦把 userData 用起来就改不动了。
+// ⚠️ 开发模式下「程序目录」取 `process.cwd()`：dev 时 `process.execPath` 指向
+//    `node_modules/electron/dist/electron.exe`，按它算会把数据丢进依赖目录里。
+// ⚠️ 目标目录不可写时**退回默认目录并打印警告**，不静默假装成功 ——
+//    否则用户以为数据在 U 盘上、其实写回了 C 盘（便携包常被放在只读介质或受保护目录）。
+const PORTABLE_MARK = 'portable.txt'
+
+/** 「程序目录」：打包后是 exe 所在目录，开发时是项目根 */
+function appDir(): string {
+  return app.isPackaged ? dirname(process.execPath) : process.cwd()
+}
+
+/** 便携数据目录；没启用便携、或目录不可写时返回 null */
+function resolvePortableDir(): string | null {
+  if (!process.argv.includes('--portable') && !existsSync(join(appDir(), PORTABLE_MARK))) return null
+  const dir = join(appDir(), 'data')
+  try {
+    mkdirSync(dir, { recursive: true })
+    const probe = join(dir, '.write-probe')
+    writeFileSync(probe, 'ok')
+    unlinkSync(probe)
+    return dir
+  } catch (e) {
+    console.warn(
+      `[Stash] 便携数据目录不可写，已退回默认目录：${dir} —— ${String((e as Error).message ?? e)}`
+    )
+    return null
+  }
+}
+
+const portableDir = resolvePortableDir()
+if (portableDir) app.setPath('userData', portableDir)
+
+// **所有冒烟都跑在一次性 userData 里**（config.json 根本不落在用户目录）。两个理由：
+//   ① 绝不碰用户真实配置 —— 用户 2026-09-29 明确提过：不想每次冒烟都拿他的设置跑。
+//      顺带治好一个副作用：套件里的 createLibrary 会 addRecentLibrary，以前会把一堆
+//      `smoke-*-lib` 临时库写进用户「最近打开的库」列表里。
+//   ② 每次都是全新的默认设置 → 断言可复现，不会因为用户改了「高清预览上限 / 自动播放」
+//      之类的偏好就让断言整片变红（那种红跟产品有没有坏毫无关系）。
+// `--smoke-welcome` 原先就靠这招保证「落在欢迎页」（config 里没有历史库），这里推广到全部。
+// 必须在 app ready 之前设置；目录固定、启动时先清空，所以不会留一堆残留。
+// ⚠️ 这一层的**优先级高于便携模式**：冒烟永远用一次性目录，绝不动 portable\data。
+if (isSmokeRun) {
+  const ud = join(tmpdir(), 'stash-smoke-ud')
   try {
     rmSync(ud, { recursive: true, force: true })
   } catch {
-    /* 清不掉就复用，config 里没库同样能进欢迎页 */
+    /* 清不掉就复用：里面也只会是上一次冒烟写的东西 */
   }
   app.setPath('userData', ud)
+}
+
+// 数据目录排错入口：`electron . --data-dir-probe` 一行看清「最终用的是哪个目录、为什么」
+// （放在冒烟那段之后，这样报告的是**最终生效**的值）
+if (process.argv.includes('--data-dir-probe')) {
+  console.log(
+    '[stash-data-dir] ' +
+      JSON.stringify({
+        packaged: app.isPackaged,
+        appDir: appDir(),
+        portable: portableDir,
+        smoke: isSmokeRun,
+        userData: app.getPath('userData')
+      })
+  )
+  app.exit(0)
 }
 
 /**
@@ -410,7 +471,9 @@ function bootstrap(): void {
         electron: process.versions.electron,
         chrome: process.versions.chrome,
         node: process.versions.node,
-        userData: app.getPath('userData')
+        userData: app.getPath('userData'),
+        /** 是否运行在便携模式（数据在程序目录旁的 data\ 里） */
+        portable: portableDir !== null
       }))
     )
     ipcMain.handle('app:open-user-data', () =>

@@ -1,6 +1,6 @@
 {
   "name": "stash",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stash · 素材库 - Windows 本地素材管理软件",
   "author": "Zizzp0318",
   "private": true,
@@ -13,7 +13,9 @@
     "start": "electron-vite preview",
     "icon": "node scripts/make-icon.mjs",
     "clean:build": "node scripts/clean-build.mjs",
-    "package:win": "npm run clean:build -- --with-packages && npm run build && electron-builder --win --x64 --publish never",
+    "package:win": "npm run clean:build -- --with-packages && npm run build && npm run package:win:setup && npm run package:win:portable",
+    "package:win:setup": "electron-builder --win --x64 --publish never --config electron-builder.yml",
+    "package:win:portable": "node scripts/make-portable.mjs",
     "release": "node scripts/release.mjs"
   },
   "dependencies": {
