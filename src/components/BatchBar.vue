@@ -5,7 +5,7 @@ import { ref } from 'vue'
 import { useAssetStore } from '../stores/assets'
 
 const assets = useAssetStore()
-const emit = defineEmits<{ (e: 'move'): void; (e: 'remove'): void }>()
+const emit = defineEmits<{ (e: 'move'): void; (e: 'remove'): void; (e: 'compress'): void }>()
 
 // 悬停时预览评分（不影响已选中的公共评分）
 const hoverStar = ref(0)
@@ -51,6 +51,20 @@ const starOn = (n: number): boolean => n <= (hoverStar.value || assets.selectedR
           <path d="M6.5 10.8S1.8 8.2 1.8 4.9c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2.1 1.2.4-.6 1.1-1.2 2.1-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.3-4.7 5.9-4.7 5.9z" stroke="currentColor" stroke-width="1.1" />
         </svg>
         {{ assets.selectedAllFav ? '取消喜欢' : '喜欢' }}
+      </button>
+
+      <!-- 压缩：四角向内的「收拢」图标，和删除/移动区分得开 -->
+      <button class="bb-btn" data-bb-compress @click="emit('compress')">
+        <svg viewBox="0 0 13 13" fill="none">
+          <path
+            d="M3.2 5.4V3.2h2.2M7.6 3.2h2.2v2.2M9.8 7.6v2.2H7.6M5.4 9.8H3.2V7.6"
+            stroke="currentColor"
+            stroke-width="1.1"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+        压缩
       </button>
 
       <button class="bb-btn" @click="emit('move')">

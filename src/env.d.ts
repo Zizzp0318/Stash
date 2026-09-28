@@ -303,6 +303,16 @@ export interface StashGenMeta {
   rawKeys: string[]
 }
 
+/** 按需压缩偏好 */
+export interface StashCompressSettings {
+  format: 'jpeg' | 'webp'
+  quality: number
+  /** 长边上限；0 = 不限制 */
+  maxEdge: number
+  /** 也重新压缩已经是 JPG 的图（二次有损编码） */
+  alsoJpeg: boolean
+}
+
 /** 全局偏好（存在 userData/config.json，跨库一份） */
 export interface StashSettings {
   defaultView: 'masonry' | 'list'
@@ -312,16 +322,18 @@ export interface StashSettings {
   thumbs: StashThumbSettings
   preview: StashPreviewSettings
   importing: StashImportSettings
+  compress: StashCompressSettings
 }
 
 /** 深可选补丁：Partial<StashSettings> 只让顶层可选，嵌套对象得单独放开 */
 export type StashSettingsPatch = Partial<
-  Omit<StashSettings, 'cardFields' | 'thumbs' | 'preview' | 'importing'>
+  Omit<StashSettings, 'cardFields' | 'thumbs' | 'preview' | 'importing' | 'compress'>
 > & {
   cardFields?: Partial<StashCardFields>
   thumbs?: Partial<StashThumbSettings>
   preview?: Partial<StashPreviewSettings>
   importing?: Partial<StashImportSettings>
+  compress?: Partial<StashCompressSettings>
 }
 
 export interface StashSettingsChoices {
@@ -330,6 +342,8 @@ export interface StashSettingsChoices {
   idleHideMs: number[]
   maxImagePx: number[]
   textMaxMb: number[]
+  compressQuality: number[]
+  compressMaxEdge: number[]
 }
 
 export interface StashSettingsApi {
@@ -382,6 +396,37 @@ export interface StashCleanMissingResult {
   pruned: Array<{ id: number; name: string }>
 }
 
+export interface StashCompressItem {
+  id: number
+  name: string
+  status: 'done' | 'skipped' | 'failed'
+  reason: string
+  before: number
+  after: number
+  newName?: string
+}
+
+export interface StashCompressSummary {
+  total: number
+  done: number
+  skipped: number
+  failed: number
+  beforeBytes: number
+  afterBytes: number
+  savedBytes: number
+  items: StashCompressItem[]
+}
+
+export interface StashCompressApi {
+  /** 把选中的图转码并**原地替换**（原文件会被删除，不可恢复） */
+  run: (
+    ids: number[],
+    opts: Partial<StashCompressSettings>
+  ) => Promise<{ ok: boolean; data?: StashCompressSummary; error?: string }>
+  onProgress: (cb: (d: { done: number; total: number; name: string; status: string; savedBytes: number }) => void) => Unsub
+  onDone: (cb: (d: { summary: StashCompressSummary }) => void) => Unsub
+}
+
 export interface StashMetaApi {
   /** 把「该扫但还没扫」的图片入队（开库与导入后都会自动跑） */
   backfill: () => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
@@ -428,6 +473,7 @@ export interface StashApi {
   cache: StashCacheApi
   health: StashHealthApi
   meta: StashMetaApi
+  compress: StashCompressApi
   app: StashAppApi
 }
 

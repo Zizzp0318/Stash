@@ -1593,3 +1593,45 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   padding: 1px 4px;
   margin-right: 8px;
 }
+
+/* ==================== 压缩对话框 ====================
+   复用 .modal / .modal-mask / .w-btn 与设置面板的 .sp-seg / .sp-sw，
+   这里只补对话框特有的行布局与进度条。 */
+.cp-modal { width: 424px; }
+.cp-src { font-size: 12.5px; color: var(--text-2); margin-bottom: 10px; }
+.cp-src b { color: var(--text-1); font-weight: 500; }
+.cp-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.cp-row:last-of-type { border-bottom: 0; }
+.cp-label {
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 0;
+  font-size: 12.5px; color: var(--text-1);
+}
+.cp-sub { font-size: 11px; color: var(--text-3); }
+/* 后果说明用暖色底：这是本项目唯一「改掉用户原文件内容」的操作 */
+.cp-warn {
+  margin-top: 12px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(228, 130, 106, 0.09);
+  font-size: 11.5px; line-height: 1.72;
+  color: var(--text-3);
+}
+.cp-warn strong { color: #E4826A; font-weight: 500; }
+.cp-prog-name {
+  margin-bottom: 8px;
+  font-size: 12.5px; color: var(--text-1);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cp-prog-bar { height: 6px; border-radius: 999px; background: var(--bg-hover); overflow: hidden; }
+.cp-prog-bar i { display: block; height: 100%; background: #5A8AC9; transition: width 0.2s ease; }
+.cp-prog-sub {
+  margin-top: 8px;
+  font-size: 11.5px; color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}

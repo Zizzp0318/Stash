@@ -12,6 +12,7 @@ import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
 import * as healthSvc from './services/health'
 import * as genmetaSvc from './services/genmeta'
+import * as compressSvc from './services/compress'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
@@ -23,6 +24,7 @@ import { runSmokeEdit } from './services/smoke-edit'
 import { runSmokePreview } from './services/smoke-preview'
 import { runSmokeSettings } from './services/smoke-settings'
 import { runSmokeMeta } from './services/smoke-meta'
+import { runSmokeCompress } from './services/smoke-compress'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -355,6 +357,12 @@ function bootstrap(): void {
       })
     )
 
+    // 按需压缩：把选中的图转成 JPG/WebP 并**原地替换**（不可逆，UI 侧已二次确认）。
+    // 选项档位复用现成的 settings:choices（那边已经统一下发 compressQuality / compressMaxEdge）
+    ipcMain.handle('compress:run', (_e, { ids, opts }) =>
+      wrap(() => compressSvc.compressAssets((ids ?? []) as number[], (opts ?? {}) as compressSvc.CompressOptions))
+    )
+
     // 生成参数：手动补扫
     ipcMain.handle('meta:backfill', () => wrap(() => genmetaSvc.backfillMeta()))
     // 来源标识的中文名由主进程给：渲染层再抄一张表迟早和上面分叉
@@ -452,6 +460,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-m4')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeM4(win)
+      })
+    }
+
+    // 图像压缩冒烟：真文件替换 / 保护规则 / 长边限制 / 界面 / watcher 一致性
+    if (process.argv.includes('--smoke-compress')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeCompress(win)
       })
     }
 

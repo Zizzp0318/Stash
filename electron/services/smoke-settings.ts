@@ -177,7 +177,16 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
     )
     check('S1 面板分组导航正确',
       JSON.stringify(nav) ===
-        JSON.stringify(['外观与浏览', '预览与播放', '导入', '缩略图与缓存', '库与存储', '快捷键', '关于']),
+        JSON.stringify([
+          '外观与浏览',
+          '预览与播放',
+          '导入',
+          '图像压缩',
+          '缩略图与缓存',
+          '库与存储',
+          '快捷键',
+          '关于'
+        ]),
       JSON.stringify(nav))
     const bodyTitle = await js<string>("document.querySelector('.sp-h')?.textContent.trim() ?? ''")
     check('S1 默认停在「外观与浏览」', bodyTitle === '外观与浏览', bodyTitle ?? '')

@@ -26,11 +26,20 @@ const settings = useSettingsStore()
 const assets = useAssetStore()
 const lib = useLibraryStore()
 
-type GroupKey = 'appearance' | 'preview' | 'importing' | 'cache' | 'library' | 'shortcuts' | 'about'
+type GroupKey =
+  | 'appearance'
+  | 'preview'
+  | 'importing'
+  | 'compress'
+  | 'cache'
+  | 'library'
+  | 'shortcuts'
+  | 'about'
 const GROUPS: Array<{ key: GroupKey; label: string }> = [
   { key: 'appearance', label: '外观与浏览' },
   { key: 'preview', label: '预览与播放' },
   { key: 'importing', label: '导入' },
+  { key: 'compress', label: '图像压缩' },
   { key: 'cache', label: '缩略图与缓存' },
   { key: 'library', label: '库与存储' },
   { key: 'shortcuts', label: '快捷键' },
@@ -102,8 +111,8 @@ function pickGroup(k: GroupKey): void {
     void loadLibStats()
     scan.value = null // 上次的体检结果只对上次那一刻负责，进来就让它作废
   }
-  // 「预览与播放」和「缩略图与缓存」的档位都来自主进程（校验与 UI 同源），一次拉好共用
-  if ((k === 'cache' || k === 'preview') && !choices.value) {
+  // 这几组的档位都来自主进程（校验与 UI 同源），一次拉好共用
+  if ((k === 'cache' || k === 'preview' || k === 'compress') && !choices.value) {
     void window.stash.settings.choices().then((r) => {
       if (r.ok && r.data) choices.value = r.data
     })
@@ -271,6 +280,22 @@ async function doDeleteLibrary(): Promise<void> {
 async function openCacheDir(): Promise<void> {
   const r = await window.stash.cache.reveal()
   if (!r.ok || !r.data?.opened) assets.notify('error', `打开失败：${r.data?.error ?? r.error ?? '未知原因'}`)
+}
+
+function pickCompressFormat(f: 'jpeg' | 'webp'): void {
+  void settings.patch({ compress: { format: f } })
+}
+function pickCompressQuality(q: number): void {
+  void settings.patch({ compress: { quality: q } })
+}
+function pickCompressEdge(px: number): void {
+  void settings.patch({ compress: { maxEdge: px } })
+}
+function toggleAlsoJpeg(): void {
+  void settings.patch({ compress: { alsoJpeg: !s.value.compress.alsoJpeg } })
+}
+function edgeText(px: number): string {
+  return px === 0 ? '不限制' : String(px)
 }
 
 function pickView(v: 'masonry' | 'list'): void {
@@ -582,6 +607,87 @@ async function copyDiagnostics(): Promise<void> {
             </div>
           </template>
 
+          <!-- ============ 图像压缩 ============ -->
+          <template v-else-if="active === 'compress'">
+            <h3 class="sp-h">图像压缩</h3>
+            <p class="sp-sub">这里的值只是<b>默认档</b>；真正压缩是手动动作（选中素材后的批量条，或右键菜单）</p>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">目标格式</div>
+                <div class="sp-tip">JPG 最通用；同质量下 WebP 还能再小一些</div>
+              </div>
+              <div class="sp-seg" data-sp-cp-format>
+                <button type="button" :class="{ on: s.compress.format === 'jpeg' }" @click="pickCompressFormat('jpeg')">
+                  JPG
+                </button>
+                <button type="button" :class="{ on: s.compress.format === 'webp' }" @click="pickCompressFormat('webp')">
+                  WebP
+                </button>
+              </div>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">质量</div>
+                <div class="sp-tip">90 是肉眼几乎无损的那一档；75 更小但细看有损</div>
+              </div>
+              <div class="sp-seg" data-sp-cp-quality>
+                <button
+                  v-for="q in choices?.compressQuality ?? [90]"
+                  :key="q"
+                  type="button"
+                  :class="{ on: s.compress.quality === q }"
+                  @click="pickCompressQuality(q)"
+                >
+                  {{ q }}
+                </button>
+              </div>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">长边上限</div>
+                <div class="sp-tip">超过就等比缩小；「不限制」只换格式、不动分辨率</div>
+              </div>
+              <div class="sp-seg" data-sp-cp-maxedge>
+                <button
+                  v-for="px in choices?.compressMaxEdge ?? [0]"
+                  :key="px"
+                  type="button"
+                  :class="{ on: s.compress.maxEdge === px }"
+                  @click="pickCompressEdge(px)"
+                >
+                  {{ edgeText(px) }}
+                </button>
+              </div>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">也重新压缩已经是 JPG 的图</div>
+                <div class="sp-tip">默认关：二次有损编码会把上一代的损失叠上来，而 JPG 本来就不大</div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.compress.alsoJpeg }"
+                type="button"
+                role="switch"
+                data-sp-cp-alsojpeg
+                :aria-checked="s.compress.alsoJpeg"
+                @click="toggleAlsoJpeg"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-note">
+              <b>压缩是不可逆的</b>：会把原文件替换掉（项目没有回收站）。落刀前会先写临时文件、
+              校验能解码且尺寸一致、并且<strong>只有结果更小才替换</strong>；
+              此外有两条固定保护：<b>动图不碰</b>（转成单帧等于破坏）、<b>透明先压白底</b>（否则透明区会变纯黑）。
+            </div>
+          </template>
+
           <!-- ============ 缩略图与缓存 ============ -->
           <template v-else-if="active === 'cache'">
             <h3 class="sp-h">缩略图与缓存</h3>
@@ -772,7 +878,7 @@ async function copyDiagnostics(): Promise<void> {
                 <div class="sp-name">识别 AI 来源</div>
                 <div class="sp-tip">
                   认 C2PA 内容凭据、国内 AIGC 隐式标识与 EXIF·XMP 痕迹。⚠️ GPT-image / DALL·E
-                  这类图里**只有来源、没有提示词**，开了也提不出提示词
+                  这类图里<b>只有来源、没有提示词</b>，开了也提不出提示词
                 </div>
               </div>
               <button

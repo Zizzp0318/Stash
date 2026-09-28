@@ -61,6 +61,20 @@ export interface Settings {
     /** 识别 AI 来源（C2PA 内容凭据 / 国内 AIGC 隐式标识 / EXIF·XMP 痕迹），只标来源、不做验签 */
     detectAi: boolean
   }
+  /** 按需压缩（把体积大的图转成 JPG/WebP，原地替换以省磁盘） */
+  compress: {
+    /** 目标格式 */
+    format: 'jpeg' | 'webp'
+    /** 质量。JPG 走 mozjpeg、WebP 走 libwebp */
+    quality: number
+    /** 长边上限；0 = 不限制（只换格式，不缩尺寸） */
+    maxEdge: number
+    /**
+     * 是否也重新压缩已经是 JPG 的图。默认 false ——
+     * 二次有损编码会把上一代的损失叠上来，而库里 JPG 本来就不大，不划算
+     */
+    alsoJpeg: boolean
+  }
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -70,13 +84,21 @@ export const DEFAULT_SETTINGS: Settings = {
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
-  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true }
+  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
+  compress: { format: 'jpeg', quality: 90, maxEdge: 0, alsoJpeg: false }
 }
 
 /** 可选的 webp 质量档位（面板上给三档，别让用户随便填个 1） */
 export const THUMB_QUALITY_CHOICES = [70, 82, 92] as const
 export const THUMB_CONCURRENCY_MIN = 1
 export const THUMB_CONCURRENCY_MAX = 8
+
+/**
+ * 压缩的可选档位。质量默认 90（画质优先）—— 实测 q75 省更多但细看有损，
+ * q90 是「肉眼几乎无损」的那一档。
+ */
+export const COMPRESS_QUALITY_CHOICES = [75, 82, 90] as const
+export const COMPRESS_MAX_EDGE_CHOICES = [0, 2560, 1920] as const
 
 /** 预览各项的可选档位（面板直接用这套，别再各写一份） */
 export const IDLE_HIDE_CHOICES = [0, 1500, 2600, 4000] as const
@@ -107,6 +129,7 @@ export function sanitizeSettings(raw: unknown): Settings {
   }
   const th = (r.thumbs && typeof r.thumbs === 'object' ? r.thumbs : {}) as Partial<Settings['thumbs']>
   const pv = (r.preview && typeof r.preview === 'object' ? r.preview : {}) as Partial<Settings['preview']>
+  const cp = (r.compress && typeof r.compress === 'object' ? r.compress : {}) as Partial<Settings['compress']>
   const im = (r.importing && typeof r.importing === 'object' ? r.importing : {}) as Partial<Settings['importing']>
   const pickOf = (list: readonly number[], v: unknown, def: number): number => {
     const n = Number(v)
@@ -144,6 +167,15 @@ export function sanitizeSettings(raw: unknown): Settings {
       palette: im.palette !== false,
       extractMeta: im.extractMeta !== false,
       detectAi: im.detectAi !== false
+    },
+    compress: {
+      format: cp.format === 'webp' ? 'webp' : 'jpeg',
+      quality: (COMPRESS_QUALITY_CHOICES as readonly number[]).includes(Number(cp.quality))
+        ? Number(cp.quality)
+        : d.compress.quality,
+      maxEdge: pickOf(COMPRESS_MAX_EDGE_CHOICES, cp.maxEdge, d.compress.maxEdge),
+      // 默认「关」，所以反过来判
+      alsoJpeg: cp.alsoJpeg === true
     }
   }
 }
@@ -224,13 +256,17 @@ export function settingsChoices(): {
   idleHideMs: number[]
   maxImagePx: number[]
   textMaxMb: number[]
+  compressQuality: number[]
+  compressMaxEdge: number[]
 } {
   return {
     quality: [...THUMB_QUALITY_CHOICES],
     concurrency: { min: THUMB_CONCURRENCY_MIN, max: THUMB_CONCURRENCY_MAX },
     idleHideMs: [...IDLE_HIDE_CHOICES],
     maxImagePx: [...MAX_IMAGE_PX_CHOICES],
-    textMaxMb: [...TEXT_MAX_MB_CHOICES]
+    textMaxMb: [...TEXT_MAX_MB_CHOICES],
+    compressQuality: [...COMPRESS_QUALITY_CHOICES],
+    compressMaxEdge: [...COMPRESS_MAX_EDGE_CHOICES]
   }
 }
 
@@ -243,11 +279,14 @@ export function getSettings(): Settings {
  * 深可选补丁：`Partial<Settings>` 只让**顶层**可选，嵌套对象仍是必填 ——
  * 而调用方（含冒烟）常常只想改一个开关。和渲染层 `StashSettingsPatch` 同一个形状。
  */
-export type SettingsPatch = Partial<Omit<Settings, 'cardFields' | 'thumbs' | 'preview' | 'importing'>> & {
+export type SettingsPatch = Partial<
+  Omit<Settings, 'cardFields' | 'thumbs' | 'preview' | 'importing' | 'compress'>
+> & {
   cardFields?: Partial<Settings['cardFields']>
   thumbs?: Partial<Settings['thumbs']>
   preview?: Partial<Settings['preview']>
   importing?: Partial<Settings['importing']>
+  compress?: Partial<Settings['compress']>
 }
 
 /** 只覆盖传进来的字段（浅合并；**每个**嵌套对象单独深合并一层，否则会把没传的项抹成 undefined） */
@@ -262,7 +301,8 @@ export function patchSettings(patch: SettingsPatch): Settings {
     cardFields: { ...c.settings.cardFields, ...(patch.cardFields ?? {}) },
     thumbs: { ...c.settings.thumbs, ...(patch.thumbs ?? {}) },
     preview: { ...c.settings.preview, ...(patch.preview ?? {}) },
-    importing: { ...c.settings.importing, ...(patch.importing ?? {}) }
+    importing: { ...c.settings.importing, ...(patch.importing ?? {}) },
+    compress: { ...c.settings.compress, ...(patch.compress ?? {}) }
   })
   save()
   return c.settings

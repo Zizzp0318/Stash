@@ -7,6 +7,7 @@ import { useSettingsStore } from '../stores/settings'
 import { fmtSize, fmtDate, fmtCount, fmtDuration } from '../utils/format'
 import type { StashAssetRow } from '../env'
 import BatchBar from './BatchBar.vue'
+import CompressDialog from './CompressDialog.vue'
 import PreviewStage from './preview/PreviewStage.vue'
 
 const lib = useLibraryStore()
@@ -800,6 +801,14 @@ function openDeleteDialog(): void {
   deleteOpen.value = true
 }
 
+// —— 压缩（原地替换原文件，不可逆）——
+// 对话框自己从 store 读选中集，这里只需要管开关
+const compressOpen = ref(false)
+function openCompressDialog(): void {
+  closeMenu() // 右键菜单进来的：菜单必须先收掉，否则会压在对话框上
+  compressOpen.value = true
+}
+
 async function confirmMove(): Promise<void> {
   const t = moveTarget.value
   if (t == null) return
@@ -1212,7 +1221,12 @@ function onWindowMouseDown(e: MouseEvent): void {
     <PreviewStage v-if="assets.previewId != null" />
 
     <!-- 底部悬浮条 -->
-    <BatchBar @move="openMoveDialog" @remove="openDeleteDialog" />
+    <BatchBar @move="openMoveDialog" @remove="openDeleteDialog" @compress="openCompressDialog" />
+
+    <!-- 压缩对话框（不可逆：原地替换原文件） -->
+    <Teleport to="body">
+      <CompressDialog v-if="compressOpen" @close="compressOpen = false" />
+    </Teleport>
 
     <!-- 拖动素材时的跟随浮层（Teleport 到 body，避免被画廊的滚动容器裁掉） -->
     <Teleport to="body">
@@ -1362,6 +1376,19 @@ function onWindowMouseDown(e: MouseEvent): void {
             <path d="M8.4 1.9l2.7 2.7-6.6 6.6-3.2.5.5-3.2 6.6-6.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
           </svg>
           重命名文件
+        </button>
+
+        <button class="ctx-item" data-ctx="compress" @click="openCompressDialog">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path
+              d="M3.2 5.4V3.2h2.2M7.6 3.2h2.2v2.2M9.8 7.6v2.2H7.6M5.4 9.8H3.2V7.6"
+              stroke="currentColor"
+              stroke-width="1.1"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+          压缩为 JPG…
         </button>
 
         <button class="ctx-item" @click="openMoveDialog">

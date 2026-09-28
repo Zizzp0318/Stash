@@ -122,6 +122,12 @@ contextBridge.exposeInMainWorld('stash', {
     clear: (kind: 'thumbs' | 'derived' | 'all') => ipcRenderer.invoke('cache:clear', { kind }),
     reveal: () => ipcRenderer.invoke('cache:reveal')
   },
+  /** 按需压缩（把选中的图转成 JPG/WebP 并原地替换，不可逆） */
+  compress: {
+    run: (ids: number[], opts: unknown) => ipcRenderer.invoke('compress:run', { ids, opts }),
+    onProgress: (cb: (d: unknown) => void) => subscribe('compress:progress', cb),
+    onDone: (cb: (d: unknown) => void) => subscribe('compress:done', cb)
+  },
   /** AI 生成参数的提取结果（提示词/模型/采样器等与 AI 来源标识） */
   meta: {
     backfill: () => ipcRenderer.invoke('meta:backfill'),

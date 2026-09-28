@@ -9,6 +9,7 @@ import { defineStore } from 'pinia'
 import { ref } from 'vue'
 import type {
   StashCardFields,
+  StashCompressSettings,
   StashImportSettings,
   StashPreviewSettings,
   StashSettings,
@@ -38,7 +39,8 @@ const FALLBACK: StashSettings = {
   detailCollapsed: false,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
-  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true }
+  importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
+  compress: { format: 'jpeg', quality: 90, maxEdge: 0, alsoJpeg: false }
 }
 
 /** 老键（搬家前的位置） */
@@ -74,6 +76,7 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
   const th = (src.thumbs ?? {}) as Partial<StashThumbSettings>
   const pv = (src.preview ?? {}) as Partial<StashPreviewSettings>
   const im = (src.importing ?? {}) as Partial<StashImportSettings>
+  const cp = (src.compress ?? {}) as Partial<StashCompressSettings>
   const conc = Number(th.concurrency)
   const qual = Number(th.quality)
   const z = Number(src.viewZoom)
@@ -106,6 +109,13 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
       palette: im.palette !== false,
       extractMeta: im.extractMeta !== false,
       detectAi: im.detectAi !== false
+    },
+    compress: {
+      format: cp.format === 'webp' ? 'webp' : 'jpeg',
+      quality: Number.isFinite(Number(cp.quality)) ? Math.round(Number(cp.quality)) : FALLBACK.compress.quality,
+      maxEdge: Number.isFinite(Number(cp.maxEdge)) ? Math.round(Number(cp.maxEdge)) : FALLBACK.compress.maxEdge,
+      // 这一项默认「关」，所以反过来判
+      alsoJpeg: cp.alsoJpeg === true
     }
   }
 }
@@ -162,7 +172,8 @@ export const useSettingsStore = defineStore('settings', () => {
       cardFields: { ...settings.value.cardFields, ...(next.cardFields ?? {}) },
       thumbs: { ...settings.value.thumbs, ...(next.thumbs ?? {}) },
       preview: { ...settings.value.preview, ...(next.preview ?? {}) },
-      importing: { ...settings.value.importing, ...(next.importing ?? {}) }
+      importing: { ...settings.value.importing, ...(next.importing ?? {}) },
+      compress: { ...settings.value.compress, ...(next.compress ?? {}) }
     })
   }
 
