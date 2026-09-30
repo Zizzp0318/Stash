@@ -223,9 +223,18 @@ export const useAssetStore = defineStore('assets', () => {
    */
   const deepOpt = (): { folderDeep?: boolean } => (query.folderId != null ? { folderDeep: true } : {})
 
-  async function refresh(): Promise<void> {
+  /**
+   * 重新拉取当前查询的第一页。
+   *
+   * `opts.keepDepth`：外部改动触发的自动刷新会用到。默认（不传）取第一页 `PAGE` 条；
+   * 传 keepDepth 且用户已经加载超过一页时，按**当前已加载的数量**重新取（offset 仍是 0），
+   * 保住浏览深度 —— 否则用户滚到第 5 页时，外部一改就被弹回顶部，是很明显的打扰。
+   * ⚠️ 默认行为必须与改动前一字不差：大量调用点与冒烟都依赖它。
+   */
+  async function refresh(opts?: { keepDepth?: boolean }): Promise<void> {
     loading.value = true
-    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: 0, limit: PAGE })
+    const limit = opts?.keepDepth && items.value.length > PAGE ? items.value.length : PAGE
+    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: 0, limit })
     loading.value = false
     if (r.data) {
       items.value = r.data.items

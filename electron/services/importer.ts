@@ -94,6 +94,54 @@ export function importFiles(args: ImportArgs): { importId: number } {
     const failed: Array<{ path: string; error: string }> = []
     const BATCH = 500
     let inTx = false
+    // 当前事务里「已 INSERT、尚未 COMMIT」的条数。用它（而不是 `added % BATCH`）来判断是否该成批提交：
+    // COMMIT 失败时会从 `added` 里扣回本批条数，`added` 会回退。`added % BATCH` 在本实现下其实仍成立
+    // （回滚恰好扣回一整批，`added` 仍停在 BATCH 的整数倍上，同余关系不破），但直接数 `batchInserts`
+    // 与「每 BATCH 条提交一次」的意图一一对应、也不受 `added` 任何增减运算牵连，更不易在后续改动里被写错。
+    let batchInserts = 0
+
+    /**
+     * 提交当前批次。**自己永不抛出** —— 这是本函数存在的全部意义。
+     *
+     * 为什么要这样：两处 COMMIT（批中间 / 收尾）任一处把异常抛出去都会坏事 ——
+     *   · 批中间那处若抛出，会被外层「逐文件」的 catch 捕获、误记成「某个文件失败」，
+     *     而 `added` 在这之前已经自增过 → 计数虚报；
+     *   · 收尾那处若抛出，原本被空 catch 静默吞掉 → 文件已物理拷入库、索引却没落盘，
+     *     用户却照常看到 `import:done` 的「导入成功」。
+     *
+     * 成功：COMMIT；`inTx=false`；`batchInserts` 归零。
+     * 失败：尽力 ROLLBACK（本批 INSERT 随之作废）；`inTx=false`；从 `added` 里**扣回本批条数**
+     *       （否则 `added` 反映了库里根本不存在的行）；`batchInserts` 归零；
+     *       往 `failed` 追加一条**措辞诚实**的记录（见下）。
+     */
+    const commitBatch = (): void => {
+      if (!inTx) return
+      const n = batchInserts
+      try {
+        db.exec('COMMIT')
+        inTx = false
+        batchInserts = 0
+      } catch (e) {
+        // 回滚是「尽力而为」：即使回滚也失败，也无法再做更多，下面的记录如实反映「索引未写入」这个现实。
+        try {
+          db.exec('ROLLBACK')
+        } catch {
+          /* 回滚失败只能放任事务处于不确定态，但至少把失败如实上报给用户 */
+        }
+        inTx = false
+        batchInserts = 0
+        // 本批 INSERT 已随 ROLLBACK 全部作废 → 把之前误记的成功数扣回来，让 `added` 与库中实际行数一致。
+        added -= n
+        failed.push({
+          // path 刻意**不含任何真实文件名**：App.vue 会取它的 basename 当「首个文件名」展示，
+          // 而这是「整批提交失败」、不是某个文件的问题，别诱导用户去怀疑/重导某一个具体文件。
+          path: '（本批文件·索引未写入）',
+          error:
+            `数据库提交失败：本批 ${n} 个文件已拷入库目录，但索引未写入（库里看不到它们，磁盘文件仍在），` +
+            `请重新导入本批。原因：${String((e as Error).message ?? e)}`
+        })
+      }
+    }
 
     for (const src of args.paths) {
       try {
@@ -123,7 +171,8 @@ export function importFiles(args: ImportArgs): { importId: number } {
           st.size, hash, Math.floor(st.mtimeMs), Date.now()
         )
         added++
-        if (added % BATCH === 0) { db.exec('COMMIT'); inTx = false }
+        batchInserts++
+        if (batchInserts >= BATCH) commitBatch()
       } catch (err) {
         failed.push({ path: src, error: String((err as Error).message ?? err) })
       }
@@ -133,7 +182,9 @@ export function importFiles(args: ImportArgs): { importId: number } {
         BrowserWindow.getAllWindows()[0]?.webContents.send('import:progress', { importId, done, total })
       }
     }
-    if (inTx) { try { db.exec('COMMIT') } catch { /* ignore */ } }
+    // 收尾提交最后不足一批的剩余（`inTx === false` 时是空操作，不会再碰已提交的批次）。
+    // 与批中间那次走同一个 helper：失败会被扣回 added 并如实上报，不再静默吞掉。
+    commitBatch()
 
     const result = { importId, added, skipped, renamed, failed }
     args.onDone?.(result)

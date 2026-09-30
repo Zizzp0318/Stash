@@ -24,7 +24,15 @@ contextBridge.exposeInMainWorld('stash', {
     /** 库占用空间：素材 + 缩略图缓存（侧栏那一行用） */
     usage: () => ipcRenderer.invoke('library:usage'),
     /** 在资源管理器里打开库目录 */
-    reveal: () => ipcRenderer.invoke('library:reveal')
+    reveal: () => ipcRenderer.invoke('library:reveal'),
+    /**
+     * 外部（资源管理器）改动被 watcher 同步进索引后的广播（去抖合并）。
+     * 渲染层据此自动刷新，不必再重开库。
+     * `partial`：`true` = 长拷贝**进行中**的中途 flush（只做轻量刷新）；
+     *           `false` = 流静默后的**收尾** flush（额外 bumpThumbs + 弹一次提示）。
+     */
+    onExternal: (cb: (d: { added: number; changed: number; removed: number; partial: boolean }) => void) =>
+      subscribe('library:external', cb as (data: unknown) => void)
   },
   folder: {
     mkdir: (relPath: string) => ipcRenderer.invoke('folder:mkdir', relPath),

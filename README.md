@@ -107,7 +107,7 @@ npm run package:win    # 打包 Windows 安装版 + 便携版（产物在 dist/�
 
 ## 测试
 
-项目里带 **11 套冒烟测试**，全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
+项目里带 **12 套冒烟测试**，全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
 
 ```bash
 env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
@@ -124,6 +124,7 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 | `--smoke-settings` | 设置面板逐项生效与落盘 |
 | `--smoke-meta` | 六家生成器解析、落库、界面联动 |
 | `--smoke-compress` | 压缩、保护规则、原地替换顺序 |
+| `--smoke-watch` | 外部变更同步（库根/新目录/已存在文件夹/非素材/隐藏目录） |
 | `--smoke-welcome` | 欢迎页与窗口控制 |
 
 新增断言都会做「注入验证」——把对应实现暂时改坏，确认断言真的会红。

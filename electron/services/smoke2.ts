@@ -71,7 +71,11 @@ export async function runSmokeM2(): Promise<void> {
     result.generated = paths.length
 
     // 2. 导入
-    const imp = await new Promise<{ added: number; skipped: number }>((resolve) => {
+    const imp = await new Promise<{
+      added: number
+      skipped: number
+      failed: Array<{ path: string; error: string }>
+    }>((resolve) => {
       importFiles({ paths, folderId: folder.id, mode: 'copy', onDone: (r) => resolve(r) })
     })
     result.import = imp
@@ -79,6 +83,19 @@ export async function runSmokeM2(): Promise<void> {
     // 3. 全量缩略图（grid + detail）计时
     const { db } = requireCurrent()
     const assets = db.prepare('SELECT id, type, ext, content_hash, rel_path FROM assets').all() as Array<{ id: number; type: string; ext: string; content_hash: string; rel_path: string }>
+    // 独立口径：用**另一条只读连接**数库里的行 —— 既不复用 `added` 自证，也不走当前写连接。
+    // 为什么必须换连接：收尾 COMMIT 失败时事务还开着，**同一条连接**的 SELECT 仍能看到那些
+    // 「尚未落盘」的行，照不出「索引没写进去」；换一条连接只能看到**已提交**的行，才有鉴别力。
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DatabaseSync: ProbeDb } = require('node:sqlite')
+    const probe = new ProbeDb(join(lib.path, '.stash'), { readOnly: true })
+    let dbRows = 0
+    try {
+      dbRows = (probe.prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
+    } finally {
+      probe.close()
+    }
+    result.dbRows = dbRows
     const t0 = Date.now()
     await awaitBatch(assets as never, 'grid')
     await awaitBatch(assets as never, 'detail')
@@ -126,6 +143,11 @@ export async function runSmokeM2(): Promise<void> {
 
     result.ok =
       imp.added === paths.length &&
+      // 独立 DB 口径不变量：added 必须恰好等于**另一条连接**看到的库里实际新增行数
+      // （正常导入时二者都应 = paths.length）。收尾 COMMIT 失败只让 added 涨、已提交行不涨
+      // → 这条立刻变红（由 commitBatch 扣回 added 后恢复一致）。
+      imp.added === dbRows &&
+      imp.failed.length === 0 &&
       missing === 0 &&
       audioRows.length === AUDIO_N &&
       missingAudio === 0 &&

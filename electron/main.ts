@@ -27,7 +27,44 @@ import { runSmokeSettings } from './services/smoke-settings'
 import { runSmokeMeta } from './services/smoke-meta'
 import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
+import { runSmokeWatch } from './services/smoke-watch'
 import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
+
+/**
+ * 删库的**唯一收口入口**：删的是「当前正在监听的库」时，先停掉 chokidar 再删目录。
+ *
+ * 为什么必须收口：`deleteLibrary` 有两个调用点 —— 下面的 `--smoke-del` argv 分支 与
+ * `library:delete` IPC handler。只在其中一处补 `unwatchLibrary()` 必然漏掉另一处。
+ *
+ * 为什么顺序与 `library:close` 一致（先 unwatch 再删）：
+ *   chokidar 若还持有已被 `rmSync` 掉的目录句柄，会一直泄漏到下次 `library:open`
+ *   （`watchLibrary` 开头顺带 `unwatchLibrary`）才回收；Windows 上还可能让紧随的 `rmSync`
+ *   撞 EBUSY。回调本身因 `current` 为 null 抛错、被内部 try/catch 吞掉，所以**不崩、只是泄漏**，
+ *   正因如此它长期没被发现 —— 必须在删之前显式停掉。
+ *
+ * 为什么「先 unwatch、后 deleteLibrary 抛错」在本项目里不会发生（也不会把当前库留在裸奔态）：
+ *   ① 只有「目标就是当前库」才会走到 unwatch。能成为 `current` 的库必然经 `setCurrent` 装进来，
+ *      而 `createLibrary`/`openLibrary` 都在调 `setCurrent` **之前**校验过 `existsSync(.stash)`，
+ *      `setCurrent` 又调 `addRecentLibrary` —— 这正是 `deleteLibrary` 两条校验
+ *      （`ERR_NOT_A_LIBRARY` / `ERR_NOT_REGISTERED`）的前提，故校验必然通过。
+ *   ② 万一仍在校验上抛错（如外部把 `.stash` 删了这种病态态），`current` 尚未被 `closeCurrent` 清掉，
+ *      这里按原样把监听器重新挂回去再抛出 —— 自愈兜底，绝不接受「当前库失去监听」这个中间态。
+ */
+function deleteLibrarySafely(target: string): void {
+  const cur = librarySvc.getLibrary()
+  const isCurrentLib = !!cur && cur.path.toLowerCase() === librarySvc.normalizeLibraryPath(target).toLowerCase()
+  if (isCurrentLib) unwatchLibrary()
+  try {
+    librarySvc.deleteLibrary(target)
+  } catch (e) {
+    // 自愈：只有「删当前库」这条路才可能把它短暂置空监听器；校验抛错时 current 还在，重新挂回。
+    if (isCurrentLib) {
+      const still = librarySvc.getLibrary()
+      if (still) watchLibrary(still.path, librarySvc.getDatabase())
+    }
+    throw e
+  }
+}
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
 protocol.registerSchemesAsPrivileged([
@@ -167,7 +204,7 @@ if (process.argv.includes('--smoke-m1')) {
   const target = process.argv[idx + 1]
   app.whenReady().then(() => {
     try {
-      librarySvc.deleteLibrary(target)
+      deleteLibrarySafely(target)
       console.log('SMOKE-DEL OK exists:', existsSync(target))
     } catch (e) {
       console.log('SMOKE-DEL FAIL:', String((e as Error).message ?? e))
@@ -305,7 +342,7 @@ function bootstrap(): void {
 
     // 库
     ipcMain.handle('library:create', (_e, args) => wrap(() => librarySvc.createLibrary(args)))
-    ipcMain.handle('library:delete', (_e, target: string) => wrap(() => librarySvc.deleteLibrary(target)))
+    ipcMain.handle('library:delete', (_e, target: string) => wrap(() => deleteLibrarySafely(target)))
     ipcMain.handle('library:open', (_e, target) =>
       wrap(() => {
         const info = librarySvc.openLibrary(target)
@@ -606,6 +643,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-welcome')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeWelcome(win)
+      })
+    }
+
+    // 外部变更同步冒烟：把文件从「资源管理器」直接拷进库目录 → watcher 增量同步索引（I1 修复）
+    if (process.argv.includes('--smoke-watch')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeWatch(win)
       })
     }
 

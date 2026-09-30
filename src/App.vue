@@ -35,6 +35,34 @@ onMounted(async () => {
   // 缩略图批量生成完成 → bump 版本号，让所有 <img> 重新加载
   window.stash.thumb.onDone(() => assets.bumpThumbs())
 
+  // 外部（资源管理器）改动 → 主进程 watcher 同步完索引后广播过来。
+  // 界面因此**不必重开库**就能看到外部新增/改写/删除的素材。
+  window.stash.library.onExternal(async (d) => {
+    // 欢迎页（没有打开的库）不该被搅动：没有任何东西需要刷新
+    if (!lib.info) return
+    const n = d.added + d.changed + d.removed
+    // 空的**中途**事件（partial）没有可刷新的内容 → 忽略；
+    // 空的**收尾**事件（partial=false, n=0）保留：它是「流已结束」的纯信号，仍要做收尾动作。
+    if (!n && d.partial) return
+    await lib.refreshCounts()
+    // keepDepth：保住用户已加载的深度，别把人弹回第一页（见 stores/assets.ts 的 refresh）
+    await assets.refresh({ keepDepth: true })
+    await assets.reloadDetail()
+    // —— 到这里为止，中途与收尾都做（否则又回到「拷贝期间界面不动」，正是 maxWait 要解决的问题）——
+    // —— 下面两件「贵且打扰」的事，**只在收尾**（!d.partial）做 ——
+    if (d.partial) return
+    // 让所有 <img> 的 ?v= 前进，强制重新拉缩略图。
+    // 这一条正是「卡片变 404 破图」的解：内容被外部改写后 hash 变了，旧 URL 已指向被删的缓存目录，
+    // bump 后 <img> 换成新 hash，网格的自愈逻辑（GalleryGrid 的 thumbRetried）随后会请求 thumb:ensure。
+    // 为什么只在收尾 bump：新增素材与新 hash 的 URL 本来就是全新的，不 bump 也会正常加载；
+    // bump 的作用是强制**已缓存**的旧 URL 重取 —— 那件事收尾做一次即可。
+    // 若中途也 bump，maxWait 会把「全网格重拉缩略图」从「每批一次」放大成「长拷贝期间每 ~1.4s 一次」。
+    assets.bumpThumbs()
+    // 提示只在收尾弹一次（统一走 assets.notify 单槽位 timer；别用本组件里那份重复的 setNotice，两份 timer 会打架）。
+    // 为什么不在中途弹：每次 notify 都会把 5s 自动消失的计时重置 → 提示条整段拷贝期间常驻、数字乱跳。
+    if (n) assets.notify('info', `库在外部被改动了：新增 ${d.added} 个 / 修改 ${d.changed} 个 / 删除 ${d.removed} 个`)
+  })
+
   // 生成参数是**后台异步**扫的（导入后/开库时补扫）。扫完必须把列表与详情重拉一次，
   // 否则卡片角标与详情栏会一直停在「没有 AI 信息」那一版 —— 用户会以为功能没生效。
   window.stash.meta.onDone(async () => {

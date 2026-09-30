@@ -34,6 +34,13 @@ export interface StashLibraryApi {
   }>
   /** 在资源管理器里打开库目录 */
   reveal: () => Promise<{ ok: boolean; data?: { opened: boolean; error: string | null }; error?: string }>
+  /**
+   * 外部（资源管理器）改动被 watcher 同步进索引后的广播（去抖合并）。
+   * `added/changed/removed` 是这次外部批次实际改动索引的行数，界面据此自动刷新。
+   * `partial`：`true` = 长拷贝**进行中**的中途 flush（只做轻量刷新）；
+   *           `false` = 流静默后的**收尾** flush（额外 bumpThumbs + 弹一次提示）。
+   */
+  onExternal: (cb: (d: { added: number; changed: number; removed: number; partial: boolean }) => void) => Unsub
 }
 
 export interface StashFolderApi {

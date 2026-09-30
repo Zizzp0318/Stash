@@ -80,12 +80,27 @@ export function listLibraries(): LibraryInfo[] {
 }
 
 /**
+ * 把「库路径」的多种写法统一解析成**库目录**的绝对路径。
+ *
+ * 允许传入 `.stash` 索引文件本身或库目录本身 —— 两者都指向同一个库（与 openLibrary 同口径）。
+ * 纯提取自 deleteLibrary 的头两行，逻辑一字未改；导出是为了让 main.ts 的删库收口入口
+ * 能与 deleteLibrary 内部用**同一份**规范化结果去判断「删的是不是当前库」，
+ * 避免两边各写一份路径比较而分叉。
+ */
+export function normalizeLibraryPath(target: string): string {
+  const raw = target.toLowerCase().endsWith('.stash') ? dirname(target) : target
+  return resolve(raw)
+}
+
+/**
  * 彻底删除库：库目录（含全部素材、.stash 索引、.thumbs 缓存）直接从磁盘移除，不进回收站。
  * 安全约束：只允许删除「最近列表中注册且含 .stash 的库目录」，防止误删任意路径。
+ *
+ * ⚠️ 本函数**不含** `unwatchLibrary()`：直接 import watcher 会与 watcher → library 形成 import 环。
+ * 「删当前库前先停 chokidar」由 main.ts 的收口入口 `deleteLibrarySafely` 负责（两个调用点都走它）。
  */
 export function deleteLibrary(target: string): void {
-  const raw = target.toLowerCase().endsWith('.stash') ? dirname(target) : target
-  const libPath = resolve(raw)
+  const libPath = normalizeLibraryPath(target)
   if (!existsSync(join(libPath, '.stash'))) throw new Error('ERR_NOT_A_LIBRARY')
   const registered = listRecentLibraries().some((p) => p.toLowerCase() === libPath.toLowerCase())
   if (!registered) throw new Error('ERR_NOT_REGISTERED')
@@ -362,8 +377,12 @@ export function deleteFolder(id: number): {
   return { folders: sub.length, assets: assetRows.length, thumbsRemoved, pruned }
 }
 
-/** 为已存在的物理目录补齐 folders 表行（不建目录），返回最深层 id */
-function ensureFolderRows(db: DB, parts: string[]): { id: number; path: string } {
+/**
+ * 为已存在的物理目录补齐 folders 表行（不建目录），返回最深层 id。
+ * 导出供 watcher 复用：外部（资源管理器）新建的子目录物理上已存在，但 folders 表里没有行，
+ * 直接 INSERT asset 会因 `folder_id NOT NULL` 违约 —— 这里把各级祖先一起补上。
+ */
+export function ensureFolderRows(db: DB, parts: string[]): { id: number; path: string } {
   let parentId: number | null = null
   let cur = ''
   let lastId = 0
