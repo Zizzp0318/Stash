@@ -30,6 +30,15 @@ export const useLibraryStore = defineStore('library', () => {
   })
   const recent = ref<LibInfo[]>([])
 
+  /**
+   * 启动时自动恢复最近库失败的**原因**（原始错误码，展示时经 libErrorText 映射成人话）。
+   *
+   * 场景：最近打开的库是「太新」的库（由更新版本的 Stash 升级过）或被移动/删除了。
+   * 期望行为是**优雅退回欢迎页**并说清原因，而不是白屏/卡在加载态。
+   * 空串 = 没有失败。
+   */
+  const bootError = ref('')
+
   const folderById = computed(() => {
     const m = new Map<number, FolderRow>()
     for (const f of folders.value) m.set(f.id, f)
@@ -163,6 +172,7 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function bootstrap(): Promise<void> {
+    bootError.value = ''
     const r = await window.stash.library.getInfo()
     if (r.data) {
       info.value = r.data
@@ -176,8 +186,12 @@ export const useLibraryStore = defineStore('library', () => {
     if (last) {
       const e = await openLibrary(last.path)
       if (e) {
-        // 库目录可能已被移动/删除，从最近列表里剔除后留在欢迎页
+        // 库目录可能已被移动/删除，或该库由更新版本的 Stash 升级过（ERR_LIBRARY_TOO_NEW）。
+        // 两种情况都从最近列表里剔除并**留在欢迎页**，同时把原因记下来给欢迎页展示 ——
+        // 绝不把异常往上抛（onMounted 里没人接，会变成未捕获异常/白屏），也绝不停在加载态。
         recent.value = recent.value.filter((x) => x.path !== last.path)
+        bootError.value = e
+        console.warn(`[stash] 自动打开最近的库失败，已退回欢迎页：${last.path} —— ${e}`)
       }
     }
   }
@@ -185,6 +199,9 @@ export const useLibraryStore = defineStore('library', () => {
   async function createLibrary(name: string, parentDir: string): Promise<string | null> {
     const r = await window.stash.library.create({ name, parentDir })
     if (!r.ok) return r.error ?? '创建失败'
+    // 成功进入一个库 → 之前那条「启动时最近库打不开」的理由已经与用户当下所见无关，清掉，
+    // 否则回到欢迎页时 `.w-err` 会弹出一条早已过期的错误（见 openLibrary/closeLibrary 同款注释）。
+    bootError.value = ''
     info.value = r.data ?? null
     useAssetStore().reset()
     await loadMeta()
@@ -195,6 +212,10 @@ export const useLibraryStore = defineStore('library', () => {
   async function openLibrary(target: string): Promise<string | null> {
     const r = await window.stash.library.open(target)
     if (!r.ok) return r.error ?? '打开失败'
+    // 成功打开一个库 → 清掉启动失败时留下的 bootError。
+    // 场景：启动时最近库是「太新」的库 → bootError='ERR_LIBRARY_TOO_NEW' → 用户手动打开一个正常库，
+    // 若不在这里清，之后关掉该库回到欢迎页时，那条与当前无关的旧错误又会冒出来（I5 带出的低危 UI 缺陷）。
+    bootError.value = ''
     info.value = r.data ?? null
     useAssetStore().reset()
     await loadMeta()
@@ -204,6 +225,8 @@ export const useLibraryStore = defineStore('library', () => {
 
   async function closeLibrary(): Promise<void> {
     await window.stash.library.close()
+    // 关库回到欢迎页 → 同样清掉陈旧的启动失败理由（否则它在欢迎页上「复活」）。
+    bootError.value = ''
     info.value = null
     folders.value = []
     tags.value = []
@@ -217,6 +240,10 @@ export const useLibraryStore = defineStore('library', () => {
     const isCurrent = info.value?.path.toLowerCase() === target.toLowerCase()
     const r = await window.stash.library.delete(target)
     if (!r.ok) return r.error ?? '删除失败'
+    // delete 与 open/create/close 同属「库生命周期成功动作」，成功时一并清掉 bootError：
+    // 删的是当前库时用户直接回到欢迎页（与 closeLibrary 同一情形），留着陈旧文案一样会误导；
+    // 删的是别的库时，用户的操作上下文也已改变，那条启动理由同样不再代表当下。
+    bootError.value = ''
     if (isCurrent) {
       useAssetStore().reset()
       info.value = null
@@ -233,6 +260,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

@@ -9,6 +9,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
 import { useSettingsStore } from './stores/settings'
+import { importFailedText } from './utils/format'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -82,12 +83,9 @@ onMounted(async () => {
     // 导入后为新素材排队生成缩略图
     window.stash.thumb.backfill('grid')
     if (r.failed.length) {
-      const first = r.failed[0]
-      const name = first.path.split(/[\\/]/).pop()
-      setNotice({
-        kind: 'error',
-        text: `${r.failed.length} 个文件导入失败（首个：${name}：${first.error}）`
-      })
+      // 文案统一交给 importFailedText：它会按 batch 标记区分「整批提交失败」与「逐文件失败」，
+      // 不再出现「1 个文件导入失败（…本批 41 个…）」这种把整批说成单个文件的自相矛盾措辞。
+      setNotice({ kind: 'error', text: importFailedText(r.failed) ?? '导入失败' })
     } else if (r.added === 0 && r.skipped === 0) {
       setNotice({ kind: 'info', text: '没有可导入的文件（格式不支持或无有效文件）' })
     } else {

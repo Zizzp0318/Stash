@@ -348,21 +348,45 @@ const cardW = computed(() => {
 // 三处一起改：① 判断顺序改回「索引优先」；② 键改用 content_hash（跨库唯一）；③ 切库时清空。
 const measuredRatio = reactive(new Map<string, number>())
 
-/** 实测比例的键：content_hash 跨库唯一（内容相同则比例必然相同）；无 hash 时退回「库路径 + id」 */
-function ratioKey(it: StashAssetRow): string {
+/**
+ * 「按素材内容」定位的键 —— 全项目**只有这一份**（单一真相源，见铁律 A5/A6 的精神）。
+ *
+ * 为什么不能用素材 id：id 是**库内自增**（每个库都从 1 开始），切库必然撞号（铁律 A9）；
+ * 更隐蔽的是 —— 内容被**就地改写**时 id 与 rel_path 都**不变**、只有 content_hash 变，
+ * 于是「按 id 索引的缓存」根本察觉不到「这已经是另一份内容了」。
+ * content_hash 跨库唯一、且随内容而变，正好是下面两个 Map/Set 需要的那把钥匙。
+ * 无 hash 的素材（极罕见）退回「库路径 + id」，至少保证跨库不串号。
+ */
+function assetKey(it: StashAssetRow): string {
   return it.content_hash ?? `${lib.info?.path ?? ''}#${it.id}`
 }
 
+/**
+ * 已经补生成过一次的素材：别在 error ↔ 重试之间打转。
+ *
+ * ⚠️ 键必须与 measuredRatio **共用同一个 assetKey（content_hash）**，绝不能用素材 id：
+ * 内容被就地改写时 id 不变、只有 hash 变。若按 id 存，同一素材的**第二次**外部改写会让
+ * 「新 hash 的缩略图还不存在 → <img> 404 → onImgErr」永远被 `has(id)` 挡住，卡片自此**永久**
+ * 停在破图，直到用户重开库（这正是铁律 A9「按素材 id 索引的缓存必串号/失效」的形态）。
+ * 按 hash 存则「内容一变 = 新键」→ 自动重新武装，每次改写都能各自愈一次。
+ */
+const thumbRetried = new Set<string>()
+
 function ratioOf(it: StashAssetRow): number {
   if (it.width && it.height) return it.height / it.width
-  const m = measuredRatio.get(ratioKey(it))
+  const m = measuredRatio.get(assetKey(it))
   if (m) return m
   return 0.75 // 未知尺寸的默认比例（4:3）
 }
 
-// 切库时清掉实测比例：键虽然已经跨库安全，但**没算 hash 的素材**是拿「库路径 + id」当键的，
-// 留着就会在新库里积下上一个库的旧键（脏数据不该跨库存活）。
-watch(() => lib.info?.path, () => measuredRatio.clear())
+// 切库时清掉这两份**按内容/库索引的组件内状态**（store 的 reset() 清不到它们）：
+//   · measuredRatio：键虽然已经跨库安全，但**没算 hash 的素材**是拿「库路径 + id」当键的，
+//     留着就会在新库积下上一个库的旧键（脏数据不该跨库存活）。
+//   · thumbRetried：同理，键一旦跨库残留，新库里同 key 的素材会被误判「已补生成过」而不再自愈。
+watch(() => lib.info?.path, () => {
+  measuredRatio.clear()
+  thumbRetried.clear()
+})
 
 /** 缩略图可视宽度 = 卡片宽度 - 两侧内边距 */
 const thumbW = computed(() => Math.max(0, cardW.value - CARD_PAD * 2))
@@ -409,24 +433,32 @@ const placed = computed<Placed[]>(() => {
 /** 瀑布容器总高度 = 最长列的底部 */
 const masonryHeight = computed(() => placed.value.reduce((m, p) => Math.max(m, p.y + p.h), 0))
 
-/** 已经补生成过一次的素材：别在 error ↔ 重试之间打转 */
-const thumbRetried = new Set<number>()
-
 function onImgErr(it: StashAssetRow, ev: Event): void {
   const img = ev.target as HTMLImageElement
   img.style.opacity = '0'
-  console.warn('IMG_ERR', it.name, it.content_hash)
+  // 守卫键用 assetKey（= content_hash），与 measuredRatio 同一把钥匙。
+  // ⚠️ 刻意**不再打印闭包里的 it.content_hash**：onImgErr 可能在 `it` 还是旧行时被触发，
+  // 那个 hash 会误导排查（看起来像「新 hash 的图 404」，其实打印的是旧 hash）。打印 key 才准。
+  const key = assetKey(it)
+  console.warn('IMG_ERR', it.name, `key=${key}`)
   // 缩略图 404 只有两种可能：生成时失败、或还没生成（协议就是直接读文件，没有别的失败面）。
   // 不补的话这张卡会一直灰到下次开库 backfill —— 用户看到的就是「有时候导入进来预览图是灰的」。
-  // 所以这里补一次生成 + 换 URL 重试；每个素材每个会话只补一次，避免死循环。
-  if (thumbRetried.has(it.id)) return
-  thumbRetried.add(it.id)
+  // 所以这里补一次生成 + 换 URL 重试；同一份内容（同一个 key）每个会话只补一次，避免死循环。
+  // 内容一变 key 就变 → 自动重新武装，这正是「外部反复改写也能反复自愈」的关键。
+  if (thumbRetried.has(key)) return
+  thumbRetried.add(key)
   void (async () => {
     try {
       const r = await window.stash.thumb.ensure(it.id, 'grid')
-      if (!r.ok || !r.data?.url || !img.isConnected) return
+      // ⚠️ 拼 URL 必须用 ensure **实际使用**的那个 hash（r.data.hash），绝不能回落到闭包里的 it.content_hash：
+      //   · 主进程 ensureThumb 是**现场从 DB 读当前 content_hash** 的，返回的就是「当前内容」的产物路径；
+      //   · 而 bumpThumbs 与 refresh 是两条独立链路 —— App.vue 收到 library:external 后先 await assets.refresh()、
+      //     之后才 bumpThumbs()，所以 onImgErr 完全可能在 `it` 仍是旧行时触发。若此时用闭包里的旧 hash 拼 URL，
+      //     拼出的又是一个 404 的 URL，而这次 key 已在集合里 → 被直接挡掉 → 卡片卡死。
+      //   用主进程回传的 hash，则无论渲染层这一帧的行有多旧，拿到的都是磁盘上真实存在的那份缩略图。
+      if (!r.ok || !r.data?.hash || !img.isConnected) return
       // 只给这一张换 URL：不用 bumpThumbs，那会把整片网格的 <img> 全部重发一次请求、白闪一下
-      img.src = assets.thumbUrl(it.content_hash) + '&retry=' + Date.now()
+      img.src = assets.thumbUrl(r.data.hash) + '&retry=' + Date.now()
       img.style.opacity = '1' // 真失败的话 onImgErr 会再把它压回 0
     } catch { /* 补生成失败就维持现状，不吵用户 */ }
   })()
@@ -437,7 +469,7 @@ function onImgLoad(it: StashAssetRow, ev: Event): void {
   const el = ev.target as HTMLImageElement
   el.style.opacity = '1'
   if (!(it.width && it.height) && el.naturalWidth > 0 && el.naturalHeight > 0) {
-    measuredRatio.set(ratioKey(it), el.naturalHeight / el.naturalWidth)
+    measuredRatio.set(assetKey(it), el.naturalHeight / el.naturalWidth)
   }
 }
 

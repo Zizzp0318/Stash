@@ -2,6 +2,7 @@
 import { watch, ref } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
+import { libErrorText } from '../utils/format'
 import WinControls from './WinControls.vue'
 
 const lib = useLibraryStore()
@@ -74,7 +75,7 @@ async function doDelete(path: string): Promise<void> {
   busy.value = false
   pendingDel.value = null
   if (e) {
-    err.value = e
+    err.value = libErrorText(e)
     return
   }
   // 删掉当前库后 lib.info 变 null，App 会自动切到欢迎页；否则留在菜单里
@@ -91,7 +92,8 @@ async function switchTo(path: string): Promise<void> {
   const e = await lib.openLibrary(path)
   busy.value = false
   if (e) {
-    err.value = e
+    // 切到「太新」的库会被拒（ERR_LIBRARY_TOO_NEW）等 → 映射成人话，别把裸错误码甩给用户
+    err.value = libErrorText(e)
     return
   }
   menuOpen.value = false
@@ -114,7 +116,7 @@ async function createNew(): Promise<void> {
   const e = await lib.createLibrary(newName.value.trim() || '我的素材库', dir)
   busy.value = false
   if (e) {
-    err.value = e === 'ERR_LIBRARY_EXISTS' ? '该目录已存在同名库' : e
+    err.value = libErrorText(e)
     return
   }
   menuOpen.value = false

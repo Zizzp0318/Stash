@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, renameSync, rmSync } from 'fs'
 import { join, dirname, basename, relative, isAbsolute, resolve } from 'path'
-import { openDatabase, type DB } from './db'
+import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
 
 let current: { db: DB; path: string } | null = null
@@ -53,7 +53,10 @@ export function createLibrary({ name, parentDir }: { name: string; parentDir: st
   mkdirSync(join(libPath, '.thumbs'), { recursive: true })
   const db = openDatabase(join(libPath, '.stash'))
   const now = Date.now()
-  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','1')").run()
+  // 版本号引用共享常量（单一真相源）。openDatabase 建新库时其实已经写过一次；
+  // 这里再显式 WRITE 一遍是刻意为之：把「建库 = 当前版本」这条不变量钉在创建路径上，
+  // 不依赖 openDatabase 的内部实现细节。meta.value 是 TEXT，所以要 String()。
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)").run(String(SCHEMA_VERSION))
   db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('library_name',?)").run(name)
   db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('created_at',?)").run(String(now))
   setCurrent(db, libPath)

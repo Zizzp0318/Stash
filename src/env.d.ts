@@ -57,11 +57,16 @@ export interface StashFolderApi {
 export interface StashImportApi {
   files: (args: { paths: string[]; folderId?: number | null; mode?: 'copy' | 'move' }) => Promise<{ ok: boolean; data?: { importId: number }; error?: string }>
   onProgress: (cb: (d: { importId: number; done: number; total: number }) => void) => Unsub
-  onDone: (cb: (d: { importId: number; added: number; skipped: number; renamed: number; failed: Array<{ path: string; error: string }> }) => void) => Unsub
+  onDone: (cb: (d: { importId: number; added: number; skipped: number; renamed: number; failed: Array<{ path: string; error: string; batch?: boolean; count?: number }> }) => void) => Unsub
 }
 
 export interface StashThumbApi {
-  ensure: (assetId: number, size: 'grid' | 'detail') => Promise<{ ok: boolean; data?: { url: string | null; generated: boolean }; error?: string }>
+  /**
+   * 确保单个缩略图存在。`hash` = 主进程**本次实际使用**的 content_hash
+   * （现场从 DB 读出的当前值；渲染层拼 `stash://` URL 必须用它，而不是自己素材行里的 hash）。
+   * 生成失败 / 不支持的类型 / 文件缺失时 `url` 与 `hash` 都为 null。
+   */
+  ensure: (assetId: number, size: 'grid' | 'detail') => Promise<{ ok: boolean; data?: { url: string | null; generated: boolean; hash: string | null }; error?: string }>
   ensureBatch: (ids: number[], size: 'grid' | 'detail') => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
   backfill: (size: 'grid' | 'detail') => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
   onProgress: (cb: (d: { done: number; total: number }) => void) => Unsub

@@ -46,6 +46,22 @@ export interface ImportArgs {
   onDone?: (r: ImportResult) => void
 }
 
+/**
+ * 一条导入失败记录。
+ *
+ * `batch` / `count` 是**批次提交失败**（整批）的机器可读标记 —— 渲染层（`importFailedText`）
+ * 据此换用「整批」措辞，避免把「整批 N 个都没进索引」误渲染成「某一个文件失败」。
+ * 逐文件失败不设这两个字段。
+ */
+export interface ImportFailItem {
+  path: string
+  error: string
+  /** 该条代表一次「整批提交失败」，不是单个文件 */
+  batch?: boolean
+  /** `batch === true` 时：本次失败涉及的文件条数（整批） */
+  count?: number
+}
+
 export interface ImportResult {
   importId: number
   added: number
@@ -53,7 +69,7 @@ export interface ImportResult {
   skipped: number
   /** 因目标目录已有同名文件、被自动改成 `名字 (1).ext` 的数量 */
   renamed: number
-  failed: Array<{ path: string; error: string }>
+  failed: ImportFailItem[]
 }
 
 let importSeq = 0
@@ -91,7 +107,7 @@ export function importFiles(args: ImportArgs): { importId: number } {
     const dupStmt = db.prepare('SELECT id FROM assets WHERE content_hash=?')
 
     let done = 0, added = 0, skipped = 0, renamed = 0
-    const failed: Array<{ path: string; error: string }> = []
+    const failed: ImportFailItem[] = []
     const BATCH = 500
     let inTx = false
     // 当前事务里「已 INSERT、尚未 COMMIT」的条数。用它（而不是 `added % BATCH`）来判断是否该成批提交：
@@ -133,12 +149,15 @@ export function importFiles(args: ImportArgs): { importId: number } {
         // 本批 INSERT 已随 ROLLBACK 全部作废 → 把之前误记的成功数扣回来，让 `added` 与库中实际行数一致。
         added -= n
         failed.push({
-          // path 刻意**不含任何真实文件名**：App.vue 会取它的 basename 当「首个文件名」展示，
-          // 而这是「整批提交失败」、不是某个文件的问题，别诱导用户去怀疑/重导某一个具体文件。
+          // path 刻意**不含任何真实文件名**：它是「万一渲染层没认出 batch 标记」时的兜底，
+          // 确保这条记录不会被当成某个真实文件去展示/重导。
           path: '（本批文件·索引未写入）',
-          error:
-            `数据库提交失败：本批 ${n} 个文件已拷入库目录，但索引未写入（库里看不到它们，磁盘文件仍在），` +
-            `请重新导入本批。原因：${String((e as Error).message ?? e)}`
+          // error 只放**底层原因**（SQLite 的原始报错）。面向用户的那整句话由渲染层的
+          // `importFailedText` 依据 batch/count 组装 —— 两处各写一遍会重复、且容易说得不一致。
+          error: String((e as Error).message ?? e),
+          // 机器可读标记：这是一次「整批提交失败」，涉及 n 个文件（渲染层据此换措辞）。
+          batch: true,
+          count: n
         })
       }
     }

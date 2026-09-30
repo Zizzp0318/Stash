@@ -141,6 +141,65 @@ export async function runSmokeM2(): Promise<void> {
     await awaitBatch(assets as never, 'detail')
     result.cacheHitMs = Date.now() - t1
 
+    // 7. F3 导入失败文案：用 **真实的** `src/utils/format.ts`（esbuild 打成 CJS 后 require）
+    //    为什么打真实模块、而不是在测试里重写一份函数：重写一份就与被测代码脱钩 —— 被测代码坏了
+    //    它照样绿（铁律 G11：断言不能脱离/复用被测代码）。esbuild 随 devDependencies 提供、可 require。
+    {
+      let f3dir: string | null = null
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const esbuild = require('esbuild') as { buildSync: (o: any) => unknown }
+        let entry = join(app.getAppPath(), 'src', 'utils', 'format.ts')
+        if (!existsSync(entry)) entry = join(process.cwd(), 'src', 'utils', 'format.ts')
+        f3dir = mkdtempSync(join(tmpdir(), 'stash-smoke2-fmt-'))
+        const out = join(f3dir, 'format.cjs')
+        esbuild.buildSync({ entryPoints: [entry], bundle: true, format: 'cjs', platform: 'node', outfile: out })
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const fmt = require(out) as {
+          importFailedText: (
+            f: Array<{ path: string; error: string; batch?: boolean; count?: number }>
+          ) => string | null
+        }
+
+        // 单条批次失败（batch:true, count:41）→ 必须带 41、且**绝不能**出现「首个：」
+        const batchOnly = fmt.importFailedText([
+          { path: '（本批文件·索引未写入）', error: 'database is locked', batch: true, count: 41 }
+        ])
+        // 只有逐文件失败 → 保持「N 个文件导入失败（首个：name：err）」语义
+        const fileOnly = fmt.importFailedText([{ path: 'C:\\pics\\坏图.png', error: '文件被占用' }])
+        // 空 → null
+        const empty = fmt.importFailedText([])
+        // 两类同时存在 → 各说各的，都要说清
+        const mixed = fmt.importFailedText([
+          { path: '（本批文件·索引未写入）', error: 'disk I/O error', batch: true, count: 40 },
+          { path: 'C:\\pics\\a.png', error: 'not a file' }
+        ])
+
+        result.f3 = { entry, batchOnly, fileOnly, empty, mixed }
+        result.f3ok =
+          typeof batchOnly === 'string' &&
+          batchOnly.includes('41') &&
+          !batchOnly.includes('首个：') &&
+          typeof fileOnly === 'string' &&
+          /1 个文件导入失败（首个：坏图\.png：文件被占用）/.test(fileOnly) &&
+          empty === null &&
+          typeof mixed === 'string' &&
+          mixed.includes('40') &&
+          mixed.includes('首个：')
+      } catch (e) {
+        result.f3ok = false
+        result.f3Error = String((e as Error)?.message ?? e)
+      } finally {
+        if (f3dir) {
+          try {
+            rmSync(f3dir, { recursive: true, force: true })
+          } catch {
+            /* 临时目录删不掉就留给系统清理 */
+          }
+        }
+      }
+    }
+
     result.ok =
       imp.added === paths.length &&
       // 独立 DB 口径不变量：added 必须恰好等于**另一条连接**看到的库里实际新增行数
@@ -156,6 +215,7 @@ export async function runSmokeM2(): Promise<void> {
       stats.vidDur === 2 &&
       stats.vidWH === 2 &&
       stats.audDurNull === 0 &&
+      result.f3ok === true &&
       result.cacheHitMs < 500
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))

@@ -79,6 +79,8 @@ const HEX20 = /^[0-9a-f]{20}$/
 
 export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
   const checks: Check[] = []
+  /** 诊断容器（QA 追加）：记录 C5/D2 的等待前几何/加载态与等待耗时，供定位偶发红 */
+  const R: Record<string, unknown> = {}
   const check = (name: string, pass: boolean, detail?: string): void => {
     checks.push({ name, pass, detail })
   }
@@ -382,6 +384,86 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       ` const img = c?.querySelector('.thumb-img');` +
       ` return !!(img && (img.getAttribute('src') ?? '').includes('stash://thumb/${hash}/grid.webp') && img.naturalWidth > 0) })()`
 
+    /**
+     * 只在断言失败时补充的诊断：把 <img> 的**真实状态**（src/naturalWidth/是否进入视口）与
+     * 磁盘缩略图是否已生成，一起塞进 check detail —— 用来定位「C5/D2 偶发红」的根因，
+     * 而不是把等待时间一放了之。
+     */
+    const imgDiag = async (id: number, hash: string): Promise<string> => {
+      const st = (await js<string | null>(
+        `(() => {
+           const c = document.querySelector('.masonry-card[data-id="${id}"]');
+           const img = c ? c.querySelector('.thumb-img') : null;
+           const r = img ? img.getBoundingClientRect() : null;
+           return JSON.stringify({
+             card: !!c,
+             img: !!img,
+             src: img ? (img.getAttribute('src') ?? null) : null,
+             nw: img ? img.naturalWidth : -1,
+             complete: img ? img.complete : null,
+             inViewport: r ? (r.bottom > 0 && r.top < window.innerHeight) : null,
+             rect: r ? { top: Math.round(r.top), bottom: Math.round(r.bottom) } : null,
+             vh: window.innerHeight
+           });
+         })()`
+      )) as string | null
+      let thumbOnDisk: boolean | null = null
+      try {
+        thumbOnDisk = existsSync(join(lib.path, '.thumbs', hash, 'grid.webp'))
+      } catch {
+        thumbOnDisk = null
+      }
+      return `diag=${st} thumbOnDisk=${thumbOnDisk}`
+    }
+
+    /** 把目标卡片滚入视口（可重复调用），用于对抗 <img loading="lazy"> 的「屏外不加载」 */
+    const scrollCardIntoView = async (id: number): Promise<void> => {
+      await js(
+        `(() => { const c = document.querySelector('.masonry-card[data-id="${id}"]'); if (c) c.scrollIntoView({ block: 'center' }); return true })()`
+      )
+    }
+
+    /**
+     * 等目标卡片的 <img> 指向**新** hash 且真的加载出来。
+     *
+     * ⚠️ 为什么不能只对 imgExpr 死等：卡片 <img> 带 `loading="lazy"`，**落在视口外时浏览器
+     * 根本不发请求**，naturalWidth 恒为 0 —— 这是纯测试伪影（不是产品 bug），却正好是 C5/D2
+     * 偶发红的头号嫌疑：瀑布列位会随缩略图陆续加载而重排，哪张卡在屏外并不稳定。
+     * 所以轮询期间把目标卡片滚入视口（等价于用户滚到它面前），再判「新 hash 且已加载」。
+     * 判据**没有放松**：仍要求 src 含**新** hash（≠ 已被删的旧 hash）且 naturalWidth>0 ——
+     * 若产线在外部改写后不再刷新（留着旧 hash URL），本断言照样红。
+     */
+    const waitImgLoaded = async (id: number, hash: string, timeout: number): Promise<boolean> => {
+      await scrollCardIntoView(id)
+      const t0 = Date.now()
+      let lastScroll = Date.now()
+      let lastNudge = 0
+      while (Date.now() - t0 < timeout) {
+        if ((await js<boolean>(`!!(${imgExpr(id, hash)})`)) === true) return true
+        // 每 ~1.2s 再滚一次：加载中列位重排可能又把目标卡挤出视口
+        if (Date.now() - lastScroll > 1200) {
+          await scrollCardIntoView(id)
+          lastScroll = Date.now()
+        }
+        // 每 ~1.5s 推一把「让浏览器真的发起请求」：
+        // 冒烟运行的窗口常被判为「不可见 / 被遮挡」，Chromium 会因此**推迟** `<img loading="lazy">`
+        // 的首次加载 —— 请求压根不发，就不会有 error 事件，自愈链自然无从触发。这是**测试环境伪影**，
+        // 不是产品缺陷（实测：对缺失的 stash:// 缩略图 fetch 会立刻 reject，强制加载后同一张图能正常显示）。
+        // 这里把该 <img> 改成 eager，并给它**当前（产品设置的）src**追加一个 cache-buster 强制重新请求。
+        // ⚠️ **只改查询串、绝不动 hash**：若产品根本没把 src 更新到新 hash，本断言照样红
+        //    （判据「src 含新 hash 且 nw>0」未放松，鉴别力不受影响）。
+        if (Date.now() - lastNudge > 1500) {
+          await js(
+            `(() => { const c=document.querySelector('.masonry-card[data-id="${id}"]'); const im=c&&c.querySelector('.thumb-img');` +
+              ` if(im){ im.loading='eager'; const cur=im.getAttribute('src'); if(cur) im.src=cur+(cur.includes('?')?'&':'?')+'z='+Date.now(); } return true })()`
+          )
+          lastNudge = Date.now()
+        }
+        await sleep(200)
+      }
+      return false
+    }
+
     const cardPresent = (await js<boolean>(
       `!!document.querySelector('.masonry-card[data-id="${rootId}"]')`
     )) === true
@@ -593,11 +675,16 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         await waitUntil("document.querySelector('.masonry-card')", 15000)
         const tId = rowByRel(targetRel)?.id ?? -1
         const tHash = rowByRel(targetRel)?.content_hash ?? ''
-        const okImg = await waitUntil(imgExpr(tId, tHash), 25000)
+        // 采「等待前」的几何/加载态：即使本轮绿，也能看出目标卡片是否**一开始就落在屏外**
+        // （<img loading="lazy"> 在屏外不发请求 → naturalWidth 恒 0，是 C5/D2 偶发红的头号嫌疑）
+        R.c5Pre = await imgDiag(tId, tHash)
+        const tC5 = Date.now()
+        const okImg = await waitImgLoaded(tId, tHash, 25000)
+        R.c5WaitMs = Date.now() - tC5
         check(
           'C5 DOM：改写后的卡片 <img> 指向新 hash 且真的加载出来（不是旧图、没留 404）',
           okImg,
-          `id=${tId} hash=${tHash}`
+          okImg ? `id=${tId} hash=${tHash} waitMs=${R.c5WaitMs}` : `id=${tId} hash=${tHash} ${await imgDiag(tId, tHash)}`
         )
         const newThumb = await waitDb(
           () => existsSync(join(lib.path, '.thumbs', tHash, 'grid.webp')),
@@ -689,9 +776,12 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         // 关键：旧 hash 的 .thumbs 已被 watcher 删掉 → 不刷新的话这张卡就是 404 破图。
         // 广播触发 bumpThumbs 后 <img> 指向新 hash，再经网格自愈逻辑生成出来。
         const tHash = rowByRel(rel)?.content_hash ?? ''
-        const okImg = await waitUntil(imgExpr(id, tHash), 30000)
+        R.d2Pre = await imgDiag(id, tHash)
+        const tD2 = Date.now()
+        const okImg = await waitImgLoaded(id, tHash, 30000)
+        R.d2WaitMs = Date.now() - tD2
         check('D2 不重开库，卡片 <img> 指向**新** hash 且 naturalWidth>0（修复「改写后变 404 破图」的证据）',
-          okImg, `id=${id} hash=${tHash}`)
+          okImg, okImg ? `id=${id} hash=${tHash} waitMs=${R.d2WaitMs}` : `id=${id} hash=${tHash} ${await imgDiag(id, tHash)}`)
         check('D2 旧 hash 的缩略图目录已被 watcher 清掉（所以旧 URL 必然 404，全靠刷新换 URL 兜住）',
           !existsSync(join(lib.path, '.thumbs', oldHash)), join('.thumbs', oldHash))
       }
@@ -1311,6 +1401,168 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         `added=${res.added} rows=${rows} expect=${paths.length} failed=${JSON.stringify(res.failed)}`
       )
     }
+
+    // ==================== E3 F3 真实链路：注入 commitBatch 抛错 → 真实导入 → 取 failed 与渲染层文案 ====================
+    // 目的（报告 E3）：不只看工程师给的那串字，而是走**真实链路**取出两样东西：
+    //   ① 主进程 `importFiles` 的 `onDone` 收到的 `failed` 记录（真形状：batch/count）；
+    //   ② 渲染层 `assets.importNotice` 实际要渲染的那句话（App.vue 的 onDone → importFailedText）。
+    // 注入方式：临时在 importer.ts 的 commitBatch 里按 `process.env.STASH_QA_E3_PHASE==='1'` 抛错（跑完按备份还原）。
+    // ⚠️ 为什么注入读的是 **PHASE** 而不是这个外层门控 `STASH_QA_E3`：同一个 watch 进程里，本段**之前**还有
+    //    I4-D1 的正常导入（必须成功）。若注入直接读 `STASH_QA_E3`，那次导入也会被连坐抛错、并级联污染后面
+    //    的断言（实测过一版：E3 段自身根本没跑到）。所以「是否跑 E3 段」用外层 `STASH_QA_E3` 门控，
+    //    而「是否让 commitBatch 抛错」只在**真正发起 E3 那次 import 的前后**用 PHASE 单独开关——两次导入
+    //    互不影响。正常回归（env 未设、importer 已还原）整段跳过，断言计数不变。
+    // 关键点：用 `createLibrary`（会 setCurrent、但**不挂 watcher**）+ 直接读 Pinia store 的 importNotice，
+    // 免得被「物理拷贝进来的失败批」触发的 library:external 广播把这条 error 提示覆盖掉。
+    if (process.env.STASH_QA_E3 === '1') {
+      const libE = createLibrary({ name: 'watch-e3', parentDir: dir })
+      const srcE = join(dir, 'e3src')
+      mkdirSync(srcE, { recursive: true })
+      const pathsE: string[] = []
+      for (let i = 0; i < 5; i++) {
+        const p = join(srcE, `e3-${i}.png`)
+        writeFileSync(p, await makePng(64, 64, (i * 29 + 60) % 360))
+        pathsE.push(p)
+      }
+      // 只在这一次 import 期间打开 PHASE 开关，让 commitBatch 抛错；随后立刻关掉，避免影响后续任何导入。
+      process.env.STASH_QA_E3_PHASE = '1'
+      const resE = await new Promise<{
+        added: number
+        failed: Array<{ path: string; error: string; batch?: boolean; count?: number }>
+      }>((resolve) => importFiles({ paths: pathsE, mode: 'copy', onDone: (r) => resolve(r) }))
+      delete process.env.STASH_QA_E3_PHASE
+      check(
+        `E3(注入) 整批提交失败：added 扣回为 0、failed 恰 1 条且带 batch:true/count:${pathsE.length}（真形状，非渲染层自造）`,
+        resE.added === 0 &&
+          resE.failed.length === 1 &&
+          resE.failed[0].batch === true &&
+          resE.failed[0].count === pathsE.length,
+        JSON.stringify(resE)
+      )
+      // 渲染层实际要展示的那句话（直接读 store 的 importNotice，不依赖 DOM 视图）
+      const noticeExpr = `(() => { const a = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('assets'); return a.importNotice ? String(a.importNotice.text) : null })()`
+      const noticeShown = await waitUntil(
+        `(() => { const a = document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('assets'); return !!(a.importNotice && /索引未写入/.test(a.importNotice.text)) })()`,
+        15000
+      )
+      const noticeText = (await js<string | null>(noticeExpr)) ?? null
+      check(
+        'E3(注入) 渲染层实际文案说清「1 批共 5 个文件…索引未写入」且**不含**「首个：」（与 importer 契约一致）',
+        noticeShown &&
+          !!noticeText &&
+          noticeText.includes(String(pathsE.length)) &&
+          noticeText.includes('索引未写入') &&
+          !noticeText.includes('首个：'),
+        `notice=${JSON.stringify(noticeText)}`
+      )
+      console.log('[QA-E3] ' + JSON.stringify({ failed: resE.failed, notice: noticeText, lib: libE.path }))
+    }
+
+    // ==================== F1 缩略图自愈必须能「重新武装」：同一素材连续两次外部改写（不重开库）====================
+    // 命题（对应审计 §2.4 / 铁律 A9）：`GalleryGrid.thumbRetried` 原以**素材 id** 为键，同一素材
+    // 内容被**就地改写**时 id 不变，于是「第 1 次改写把 id 记进集合 → 第 2 次改写（同一 id、新 hash）
+    // 一进 onImgErr 就被挡住、再也不补生成」→ 卡片**永久**停在破图，直到用户重开库。
+    //
+    // 为什么这条断言有鉴别力（而不是两条都可能绿的空转）：
+    //   · 第 1 次改写时「新 hash 的缩略图尚未生成」，按 id 键与按 hash 键**都会**补生成成功（两种实现都绿）；
+    //   · 第 2 次改写时哈希又变 → 按 **id** 键的实现因 id 已在集合里而**直接 return、永久卡死**；
+    //     按 **hash** 键的实现则「新 hash = 新键」→ 正常自愈。→ **只有正确实现能绿。**
+    // ⚠️ 两次改写之间**绝不 reopen**：reopen 会重建组件、thumbRetried 变新实例，从而掩盖这个 bug
+    //    （这正是它此前只偶发 1/9、难以稳定复现的根因）。
+    {
+      // 用一个全新的库，避免与前面各段的资产/DOM 相互干扰。
+      const libF1 = createLibrary({ name: 'watch-f1-rearm', parentDir: dir })
+      // ⚠️ 目标文件夹必须在**开监听之前**建好：chokidar 只会在既有的目录上可靠地建立 watch，
+      // 「监听建立后才新建的目录 / 被 watcher 自己 move 进来的文件」会让首个 change 事件被吞
+      // （纯测试伪影）。所以这里先 mkdirRel('素材')，再 reopen 挂监听。
+      const f1Folder = mkdirRel('素材')
+      await reopen(libF1.path)
+
+      // 正对照探针（铁律 G9/G11）：记录渲染层 onImgErr 是否真的触发过。
+      // onImgErr 里 `console.warn('IMG_ERR', it.name, key=...)` 打在「是否已补过」判断**之前**，
+      // 所以只要该素材的缩略图 404 过一次，这里就会留下它的名字。用来断言「初始加载确实走了
+      // 404 → 补生成」这条路，即 `thumbRetried` 真的被占过。
+      // 为什么必须有这条前置：下面对同一素材连续两次改写、断言「两次都能恢复新 hash 的缩略图」，
+      // 其鉴别力隐含一个前提 —— 集合里已经有一把旧键。若首次请求时缩略图就已存在（根本没有 404），
+      // 集合是空的：第 1 次改写才把键写进空集合、第 2 次才可能被挡。缺这条前置，「两次都恢复」就
+      // 可能在「自愈链压根没被触发」的时序下恒真 —— 这正是 G9/G11 那一族的「负向/空转假绿」。
+      await js(
+        `window.__imgErr=[];
+         if(!window.__imgErrHooked){const ow=console.warn.bind(console);
+           console.warn=function(){if(String(arguments[0])==="IMG_ERR")window.__imgErr.push(String(arguments[1]||""));return ow.apply(null,arguments)};
+           window.__imgErrHooked=true;}
+         'ok'`
+      )
+
+      // 外部写进这个既有文件夹（不经过根目录 → 未分类 的移动，行为最干净），随后**不重开库**等卡片上屏。
+      const targetRel = `${f1Folder.path}/rearm-f1.png`
+      writeFileSync(relAbs(targetRel), await makePng(300, 200, 18))
+      const inDb = await waitDb(() => !!rowByRel(targetRel), 20000)
+      const id = rowByRel(targetRel)?.id ?? -1
+      const h0 = rowByRel(targetRel)?.content_hash ?? ''
+      // ⚠️ 对抗开关（默认关，仅 STASH_QA_F1P=1 时开）：在初始 <img> 加载**之前**就把缩略图生成好，
+      //    人为制造「首次请求时缩略图已存在、没有 404」的时序，用来证伪「集合为空 → 按 id 键也会全绿」
+      //    这个假绿担忧（报告 B1）。
+      if (process.env.STASH_QA_F1P === '1') {
+        await js(`window.stash.thumb.ensure(${id}, 'grid')`)
+        await waitDb(() => existsSync(join(lib.path, '.thumbs', h0, 'grid.webp')), 20000)
+      }
+      const cardSeen = await waitUntil(`!!document.querySelector('.masonry-card[data-id="${id}"]')`, 25000)
+      // 让初始缩略图真正加载出来（把「外部新增 → 广播 → 补生成」整条链跑完）。
+      const h0Loaded = await waitImgLoaded(id, h0, 25000)
+      // —— 正对照断言（铁律 G9/G11）：初始加载确实 404 过 → thumbRetried 被占过 ——
+      // 若这条红，说明本段赖以成立的前提没满足（首次请求时缩略图已存在），整段断言不具备鉴别力；
+      // 宁可直接红（不静默假绿）。STASH_QA_F1P=1 时本条**预期为红**，正是为了证明它真的能拦住假绿。
+      const imgErrNames = (await js<string[]>('window.__imgErr')) ?? []
+      check(
+        'F1-D 前置⓪（正对照）：初始加载确实走了「404 → 补生成」（thumbRetried 被占过）——否则两次改写是空转、按 id 键也会假绿',
+        imgErrNames.includes('rearm-f1.png'),
+        `imgErr=${JSON.stringify(imgErrNames)}${process.env.STASH_QA_F1P === '1' ? ' [STASH_QA_F1P=1 对抗模式：本条预期红]' : ''}`
+      )
+      // 同目录**正对照**：改写前先写一个控制文件并等它入库 —— 证明 chokidar 已把这批事件追平，
+      // 从而目标文件的 awaitWriteFinish 窗口也已关闭。否则紧接着的改写可能与「初始新增」的
+      // write-finish 窗口重叠、被 chokidar 合并而没有 change 事件（纯测试伪影，非产品缺陷）。
+      writeFileSync(relAbs(`${f1Folder.path}/ctl.png`), await makePng(120, 120, 40))
+      const ctlOk = await waitDb(() => !!rowByRel(`${f1Folder.path}/ctl.png`), 20000)
+      check(
+        'F1-D 前置：目标素材已入库上屏 + 初始缩略图已加载 + 同目录正对照已入库（证明 chokidar 已追平，未重开库）',
+        inDb && id !== -1 && cardSeen && HEX20.test(h0) && h0Loaded && ctlOk,
+        `id=${id} h0=${h0} card=${cardSeen} h0Loaded=${h0Loaded} ctl=${ctlOk}`
+      )
+
+      // —— 第 1 次外部就地改写 ——
+      writeFileSync(relAbs(targetRel), await makePng(340, 220, 130))
+      const d1 = hashOf(relAbs(targetRel))
+      const sync1 = await waitDb(() => rowByRel(targetRel)?.content_hash === d1, 20000)
+      check(
+        'F1-D 前置①：第 1 次外部改写已同步，且 hash 真的变了（≠ 初值）——否则后续是空转',
+        sync1 && HEX20.test(d1) && d1 !== h0,
+        `${h0} -> ${d1}`
+      )
+      const ok1 = await waitImgLoaded(id, d1, 25000)
+      check(
+        'F1-D 第 1 次改写后卡片恢复到新 hash 的缩略图（naturalWidth>0）',
+        ok1,
+        ok1 ? `id=${id} hash=${d1}` : `id=${id} hash=${d1} ${await imgDiag(id, d1)}`
+      )
+
+      // —— 第 2 次外部就地改写（同一 id、又一个新 hash；绝不 reopen）——
+      writeFileSync(relAbs(targetRel), await makePng(360, 240, 280))
+      const d2 = hashOf(relAbs(targetRel))
+      const sync2 = await waitDb(() => rowByRel(targetRel)?.content_hash === d2, 20000)
+      check(
+        'F1-D 前置②：第 2 次外部改写已同步，且 hash 又变了（≠ 第 1 次的 hash）——否则是空转',
+        sync2 && HEX20.test(d2) && d2 !== d1,
+        `${d1} -> ${d2}`
+      )
+      const ok2 = await waitImgLoaded(id, d2, 25000)
+      check(
+        'F1-D【核心】第 2 次改写（不重开库）后卡片仍能恢复到新 hash 的缩略图（旧实现按 id 作键会永久卡死）',
+        ok2,
+        ok2 ? `id=${id} hash=${d2}` : `id=${id} hash=${d2} ${await imgDiag(id, d2)}`
+      )
+    }
+
   } catch (e) {
     check('套件执行未抛异常', false, String((e as Error)?.message ?? e))
   } finally {
@@ -1327,7 +1579,7 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       }
     }
     const failed = checks.filter((c) => !c.pass)
-    console.log('[SMOKE-WATCH] ' + JSON.stringify({ checks, failed, ok: failed.length === 0 }, null, 2))
+    console.log('[SMOKE-WATCH] ' + JSON.stringify({ checks, failed, ok: failed.length === 0, diag: R }, null, 2))
     app.exit(0)
   }
 }

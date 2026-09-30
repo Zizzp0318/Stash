@@ -29,11 +29,17 @@ function thumbFile(hash: string, size: ThumbSize): string {
   return join(requireCurrent().path, '.thumbs', hash, `${size}.webp`)
 }
 
-/** 确保单个缩略图存在。返回 { path, generated }；不支持的类型/失败返回 null */
-async function ensureOne(asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }, size: ThumbSize): Promise<{ path: string; generated: boolean } | null> {
+/**
+ * 确保单个缩略图存在。返回 `{ path, generated, hash }`；不支持的类型/失败返回 null。
+ *
+ * `hash` = 本次**实际使用**的 content_hash（就是 `asset.content_hash`）。回传它是必须的：
+ * 渲染层拼 `stash://` URL 时需要「磁盘上这份缩略图对应的 hash」，而不是它自己那一帧（可能是旧的）
+ * 素材行里的 hash —— 见 `ensureThumb` 与 `GalleryGrid.onImgErr` 的注释。
+ */
+async function ensureOne(asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }, size: ThumbSize): Promise<{ path: string; generated: boolean; hash: string } | null> {
   if (!asset.content_hash) return null
   const out = thumbFile(asset.content_hash, size)
-  if (existsSync(out)) return { path: out, generated: false }
+  if (existsSync(out)) return { path: out, generated: false, hash: asset.content_hash }
 
   const libPath = requireCurrent().path
   const abs = join(libPath, ...asset.rel_path.split('/'))
@@ -75,7 +81,7 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
       }
     }
     renameTmp(tmp, out)
-    return { path: out, generated: true }
+    return { path: out, generated: true, hash: asset.content_hash }
   } catch {
     try { unlinkSync(tmp) } catch { /* ignore */ }
     return null
@@ -400,13 +406,21 @@ export function ensureBatch(
   pump()
 }
 
-/** 单个确保存在（IPC 用），返回 file:// 可用路径 */
-export async function ensureThumb(assetId: number, size: ThumbSize): Promise<{ url: string | null; generated: boolean }> {
+/**
+ * 单个确保存在（IPC 用）。
+ *
+ * 返回值里的 `hash` 是**本次实际使用的 content_hash**（`ensureOne` 现场从 DB 读出、就是磁盘上
+ * 那份缩略图对应的 hash）。渲染层必须用它拼 `stash://` URL，不能用自己的素材行里的 hash ——
+ * 素材行可能在外部改写后仍是旧的一帧，用它拼 URL 会再次 404（详见 `GalleryGrid.onImgErr`）。
+ * `ensureOne` 返回 null（不支持的类型 / 文件缺失 / 生成失败）时，`hash` 一并回 null，避免渲染层
+ * 拿到一个「没有对应产物」的 hash 去拼 URL。
+ */
+export async function ensureThumb(assetId: number, size: ThumbSize): Promise<{ url: string | null; generated: boolean; hash: string | null }> {
   const { db } = requireCurrent()
   const asset = db.prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE id=?').get(assetId) as
     | { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }
     | undefined
   if (!asset) throw new Error('ERR_ASSET_NOT_FOUND')
   const r = await ensureOne(asset, size)
-  return r ? { url: r.path, generated: r.generated } : { url: null, generated: false }
+  return r ? { url: r.path, generated: r.generated, hash: r.hash } : { url: null, generated: false, hash: null }
 }

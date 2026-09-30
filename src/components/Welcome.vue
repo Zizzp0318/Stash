@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
+import { libErrorText } from '../utils/format'
 import WinControls from './WinControls.vue'
 
 const lib = useLibraryStore()
@@ -17,7 +18,8 @@ async function openExisting(target: string): Promise<void> {
   err.value = ''
   const e = await lib.openLibrary(target)
   busy.value = false
-  if (e) err.value = e
+  // 打开失败可能是「库太新」（ERR_LIBRARY_TOO_NEW）等 → 统一映射成人话，别把裸错误码甩给用户
+  if (e) err.value = libErrorText(e)
   else await assets.refresh()
 }
 
@@ -34,7 +36,7 @@ async function createNew(): Promise<void> {
   const e = await lib.createLibrary(libName.value.trim() || '我的素材库', dir)
   busy.value = false
   if (e) {
-    err.value = e === 'ERR_LIBRARY_EXISTS' ? '该目录已存在同名库' : e
+    err.value = libErrorText(e)
   } else {
     showNew.value = false
     await assets.refresh()
@@ -69,7 +71,9 @@ async function createNew(): Promise<void> {
         <button class="w-btn small primary" :disabled="busy" @click="createNew">选择位置并创建</button>
       </div>
 
-      <div v-if="err" class="w-err">{{ err }}</div>
+      <!-- err = 本页操作（打开/新建）的报错；bootError = 启动时自动恢复最近库失败的原因
+           （例如最近库是「太新」的库 → 已由 store 退回欢迎页，这里把原因说清楚） -->
+      <div v-if="err || lib.bootError" class="w-err">{{ err || libErrorText(lib.bootError) }}</div>
 
       <div v-if="lib.recent.length" class="w-recent">
         <div class="w-label">最近打开</div>
