@@ -8,7 +8,9 @@
 //   S4 旧偏好迁移 —— 老的 localStorage 三个键被搬进 config 并删除（只迁一次）
 //   S5 恢复默认   —— 二次确认后回到默认值（config 与 DOM 一致）
 //   S6 关于页     —— 版本号与主进程一致、运行环境齐全
-//   S7 缓存组     —— 占用统计（缩略图/派生分开算）、并发与质量落盘、清理缩略图后真被重建
+//   S7 缓存组     —— 占用统计（缩略图/派生分开算，含**图片带尺寸 tag 的高清派生** `preview-2560.webp`）、
+//                    并发与质量落盘、清理缩略图后真被重建；`清理派生预览` 真的删掉 `preview-2560.webp`
+//                    而不动缩略图、`清理缩略图` 反过来不动派生预览（I2 的两条不变量各补一条真断言）
 //   S8 预览与播放 —— 自动隐藏延迟**真的改行为**（浮层提示常驻/淡出）、高清预览上限换了档
 //                    会生成**新文件名**的派生文件（不是复用旧的）、音量/自动播放/文本上限落盘
 //   S9 导入组     —— 方式/去重/色板落盘，且**不传 mode 直接调 import.files** 时管线真的按设置走
@@ -23,13 +25,15 @@
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
 import { app, BrowserWindow, dialog } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 import sharp from 'sharp'
 import { closeCurrent, createLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
+import { cacheStats, clearCache } from './cache'
+import { deriveFor } from './preview'
 import { libraryUsage } from './health'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
 
@@ -86,13 +90,25 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       writeFileSync(join(process.cwd(), name), (await win.webContents.capturePage()).toPNG())
     } catch { /* 截图失败不影响结论 */ }
   }
-  const loadDiskDerived = async (): Promise<number> => cacheDisk().derived
-  /** 直接数磁盘上的缓存文件（不走 IPC）—— 用来验「界面上说的占用」不是编的 */
-  const cacheDisk = (): { thumbs: number; derived: number; total: number } => {
+
+  /**
+   * 直接数磁盘上的缓存文件（不走 IPC）—— 用来验「界面上说的占用」不是编的。
+   *
+   * ⚠️ 这里的判据**刻意不复用 `cache.ts` 的 `classify()`、也不 import 它**：
+   * 本项目的 I2 就是「断言与实现共用同一份错误认知」→ 11 套冒烟全绿也照不到这个 bug
+   * （审计 §1.2：实现只认 `preview.`，断言也照抄只认 `preview.`，图片派生在两边一起漏）。
+   * 真相来源是 `preview.ts` 的命名规则，这里照**真名**手写一遍：
+   *   缩略图   = `{grid|detail}.webp`
+   *   派生预览 = `preview.mp4` / `preview.mp3`（视频、音频无 tag）+ `preview-{尺寸}.webp`（图片带 tag）
+   *   临时文件 = `preview-{尺寸}.webp.tmp` / `preview.{时间戳}.tmp.{mp4,mp3}` → **不计入任何桶**
+   * 返回里带上 `derivedNames`，供断言直接核对「某张具体的派生文件确实被数进来了」。
+   */
+  const cacheDisk = (): { thumbs: number; derived: number; total: number; derivedNames: string[] } => {
     const dir = join(requireCurrent().path, '.thumbs')
     let thumbs = 0
     let derived = 0
     let total = 0
+    const derivedNames: string[] = []
     try {
       for (const hash of readdirSync(dir)) {
         const sub = join(dir, hash)
@@ -104,14 +120,18 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         }
         for (const f of files) {
           total++
-          if (f === 'grid.webp' || f === 'detail.webp') thumbs++
-          else if (f.startsWith('preview.')) derived++
+          if (f === 'grid.webp' || f === 'detail.webp') {
+            thumbs++
+          } else if (f.startsWith('preview') && !f.includes('.tmp') && /\.(webp|mp3|mp4)$/.test(f)) {
+            derived++
+            derivedNames.push(f)
+          }
         }
       }
     } catch {
       /* 目录还没建起来 */
     }
-    return { thumbs, derived, total }
+    return { thumbs, derived, total, derivedNames }
   }
   /** 直接查库（用来拿 TIFF 的 hash） */
   const q = <T>(sql: string): T => requireCurrent().db.prepare(sql).get() as T
@@ -395,6 +415,7 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await waitFor("document.querySelector('[data-sp-cache-total]')?.textContent.trim() !== '—'", 6000)
       const totalText = (await js<string>("document.querySelector('[data-sp-cache-total]')?.textContent.trim() ?? ''")) ?? ''
       const thumbText = (await js<string>("document.querySelector('[data-sp-cache-thumbs]')?.textContent.trim() ?? ''")) ?? ''
+      const derivedText = (await js<string>("document.querySelector('[data-sp-cache-derived]')?.textContent.trim() ?? ''")) ?? ''
       const hasConc = await js<boolean>("!!document.querySelector('[data-sp-conc]')")
       const hasQuality = await js<boolean>("!!document.querySelector('[data-sp-quality]')")
       check('S7 缓存分组能打开并显示占用', cacheOpen && totalText !== '' && totalText !== '—', `total=${totalText} 控件=${hasConc}/${hasQuality}`)
@@ -405,6 +426,29 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         before.thumbs > 0 && thumbText !== '0 B',
         `diskThumbs=${before.thumbs} diskDerived=${before.derived} domThumbs=${thumbText}`)
 
+      // —— A) 图片派生（带尺寸 tag 的 `preview-2560.webp`）必须落进「派生预览」桶 ——
+      // 判据分两层、都用真文件名取证，避免同源盲区（I2 的教训）：
+      //   ① 面板数据来源 cacheStats()（主进程真值）：文件数与字节数都 > 0；
+      //   ② 独立手数的 cacheDisk()（判据照着 preview.ts 真名另写、不复用 classify）里
+      //      确实包含这张具体的 preview-2560.webp —— 不用 stats 自证。
+      const tiffRow = q<{ id: number; content_hash: string }>(
+        "SELECT id, content_hash FROM assets WHERE name='big.tiff'"
+      )
+      const preview2560 = join(lib.path, '.thumbs', tiffRow.content_hash, 'preview-2560.webp')
+      const s0Hash = q<{ content_hash: string }>("SELECT content_hash FROM assets WHERE name='s0.png'").content_hash
+      const gridFile = join(lib.path, '.thumbs', s0Hash, 'grid.webp')
+      const detailFile = join(lib.path, '.thumbs', s0Hash, 'detail.webp')
+      check('S7 A 前置：S8 生成的那张 preview-2560.webp 此刻就在磁盘上', existsSync(preview2560), preview2560)
+      const stA = cacheStats()
+      check('S7 A 派生预览占用把图片派生算进来了（文件数与字节数都 > 0）',
+        stA.derived.files > 0 && stA.derived.bytes > 0,
+        `stats.files=${stA.derived.files} stats.bytes=${stA.derived.bytes}`)
+      check('S7 A 面板上的「派生预览」占用不再是 0（DOM 也跟着对了）',
+        derivedText !== '0 B' && derivedText !== '', derivedText || '(空)')
+      check('S7 A 独立判据也把 preview-2560.webp 数进了派生桶（不用 stats 自证）',
+        cacheDisk().derivedNames.includes('preview-2560.webp'),
+        JSON.stringify(cacheDisk().derivedNames))
+
       // 并发数与质量：改完落盘，且主进程真的按新值跑（清掉缩略图后按新质量重建）
       await js("(() => { const el = document.querySelector('[data-sp-conc]'); el.value = '2'; el.dispatchEvent(new Event('input', { bubbles: true })); return true })()")
       await new Promise((r) => setTimeout(r, 300))
@@ -413,7 +457,11 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await new Promise((r) => setTimeout(r, 300))
       check('S7 质量档位落盘', diskSettings().thumbs.quality === 92, String(diskSettings().thumbs.quality))
 
-      // 清理缩略图：文件真的没了，且随后会被重新生成（不是把卡片清成一片灰）
+      // —— C) 「清理缩略图」绝不能连带动派生预览（头注释第一条不变量）——
+      const derivedBeforeC = cacheDisk().derived
+      check('S7 C 前置：清理缩略图前，grid.webp 与 preview-2560.webp 都在磁盘上',
+        existsSync(gridFile) && existsSync(preview2560),
+        `grid=${existsSync(gridFile)} preview=${existsSync(preview2560)}`)
       await clickEl('[data-sp-clear-thumbs]')
       const armed = (await js<string>("document.querySelector('[data-sp-clear-thumbs]')?.textContent.trim() ?? ''")) ?? ''
       check('S7 清理要先二次确认', armed === '再点一次确认', armed)
@@ -422,13 +470,25 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await new Promise((r) => setTimeout(r, 600))
       // ⚠️ 不能拿「此刻磁盘上还剩几个」来断言「删干净了」—— 6 张小图几百毫秒就重建完了，
       // 这个测量本身是竞态的（第一版就这么假红过）。改从**主进程回报的删除数**取证：
-      // 那些数是我自己先在磁盘上数出来的，两边对上就说明删的正是这批文件。
+      // 那些数是我自己先在磁盘上数出来的，两边对上就说明「这批 grid/detail 确实被她删掉了」。
       const toast = (await js<string>("document.querySelector('.notice-toast')?.textContent.trim() ?? ''")) ?? ''
       const cleared = Number(/已清理 (\d+) 个文件/.exec(toast)?.[1] ?? -1)
-      check('S7 清理缩略图：主进程确实删掉了磁盘上那批 grid/detail',
+      check('S7 C 清理缩略图：主进程确实删掉了磁盘上那批 grid/detail（这批就是缩略图）',
         cleared === before.thumbs, `磁盘实测=${before.thumbs} 回报删除=${cleared} toast=${toast}`)
+      check('S7 C 清理缩略图不会连带删掉派生预览（preview-2560.webp 必须还在）',
+        cacheDisk().derived === derivedBeforeC && existsSync(preview2560),
+        `derived ${derivedBeforeC}→${cacheDisk().derived} preview=${existsSync(preview2560)}`)
+      // ⚠️ QA 独立复核补强（E 项）：下面这条原来是 `loadDiskDerived() === before.derived` ——
+      //    LHS 与 RHS **都**来自本套件自己手数的 cacheDisk()，从头到尾没碰生产代码；
+      //    且修前 cacheDisk 复用了错判据 → before.derived 恒为 0 → `0 === 0` **一直空转、永远绿**。
+      //    两处加固：① 显式前置断言 `before.derived > 0`（杜绝空转）；
+      //              ② LHS 改成**生产口径** `cacheStats().derived.files`（注入 classify 后必红）。
+      check('S7 前置：清理缩略图前「派生预览」占用确实 > 0（否则下一条是 0===0 空转）',
+        before.derived > 0 && cacheStats().derived.files > 0,
+        `独立口径=${before.derived} 生产口径=${cacheStats().derived.files}`)
       check('S7 清理不会连带删掉派生预览（那是要重新转码的）',
-        (await loadDiskDerived()) === before.derived, `before=${before.derived}`)
+        cacheStats().derived.files === before.derived,
+        `独立口径 before=${before.derived} 生产口径 now=${cacheStats().derived.files}`)
 
       // 重建：等 thumb:done 后再看，缩略图应该回来了（按新质量 92 生成，文件更大）
       const need = Math.max(1, before.thumbs)
@@ -440,7 +500,215 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       }
       check('S7 清理后缩略图会被重新生成（卡片不会一直空）', back,
         `rebuilt=${cacheDisk().thumbs} before=${before.thumbs}`)
+
+      // —— B) 「清理派生预览」必须真的删掉那张高清大图，且绝不能碰缩略图
+      //       （呼应头注释：缩略图删了只是秒级重建、派生删了要重新转码 —— 两个清理按钮各管各的、互不越界）——
+      // 先补一张 detail.webp，让「缩略图」这一侧同时覆盖 grid 与 detail 两种文件名。
+      await new Promise<void>((resolve) => {
+        const rows = requireCurrent().db
+          .prepare("SELECT id, type, ext, content_hash, rel_path FROM assets WHERE name='s0.png'")
+          .all() as Array<never>
+        ensureBatch(rows, 'detail', resolve)
+      })
+      const thumbsBeforeB = cacheDisk().thumbs
+      check('S7 B 前置：此刻 grid.webp 与 detail.webp 都在磁盘上',
+        existsSync(gridFile) && existsSync(detailFile),
+        `grid=${existsSync(gridFile)} detail=${existsSync(detailFile)}`)
+      await clickEl('[data-sp-clear-derived]')
+      const armedD = (await js<string>("document.querySelector('[data-sp-clear-derived]')?.textContent.trim() ?? ''")) ?? ''
+      check('S7 B 清理派生预览要先二次确认', armedD === '再点一次确认', armedD)
+      check('S7 B 第一次点击不会真删', existsSync(preview2560))
+      await clickEl('[data-sp-clear-derived]')
+      await new Promise((r) => setTimeout(r, 600))
+      check('S7 B 清理派生预览：preview-2560.webp 真的被删掉了（旧判据下它根本清不掉）',
+        !existsSync(preview2560), `存在=${existsSync(preview2560)}`)
+      check('S7 B 清理派生预览不会连带删掉缩略图（grid 与 detail 都还在）',
+        existsSync(gridFile) && existsSync(detailFile) && cacheDisk().thumbs === thumbsBeforeB,
+        `grid=${existsSync(gridFile)} detail=${existsSync(detailFile)} thumbs ${thumbsBeforeB}→${cacheDisk().thumbs}`)
       await capture('shot-settings-cache.png')
+    }
+
+    // ==================== S7X 缓存分类的独立验证（QA 增补：B / C / D） ====================
+    // ⚠️ 判据**不复用** cache.ts 的 classify()，也不用本套件的 cacheDisk()；而是另写一份
+    //    「照 preview.ts 真名规则」的独立分类器，对 .thumbs 全量 statSync 后与生产 cacheStats()
+    //    三桶逐一比对（文件数 + 字节数）。两套独立判据互证，堵死 I2 的同源盲区。
+    {
+      const thumbsDir = join(lib.path, '.thumbs')
+
+      // 独立分类器（真相来源 = preview.ts 的命名规则，不 import 被测的 classify）
+      const kindOfMine = (name: string): 'thumbs' | 'derived' | 'other' => {
+        if (name === 'grid.webp' || name === 'detail.webp') return 'thumbs'
+        if (/^preview(-\d+)?\.(webp|mp3|mp4)$/.test(name)) return 'derived'
+        return 'other'
+      }
+      type Bucket = { files: number; bytes: number; names: string[] }
+      const scanMine = (): { thumbs: Bucket; derived: Bucket; other: Bucket } => {
+        const mk = (): Bucket => ({ files: 0, bytes: 0, names: [] })
+        const b = { thumbs: mk(), derived: mk(), other: mk() }
+        const add = (name: string, abs: string): void => {
+          const st = statSync(abs)
+          if (!st.isFile()) return
+          const k = kindOfMine(name)
+          b[k].files++
+          b[k].bytes += st.size
+          b[k].names.push(name)
+        }
+        for (const e of readdirSync(thumbsDir)) {
+          const abs = join(thumbsDir, e)
+          if (statSync(abs).isDirectory()) {
+            for (const f of readdirSync(abs)) add(f, join(abs, f))
+          } else {
+            add(e, abs)
+          }
+        }
+        return b
+      }
+
+      // —— 前置：先让生产派生管线生成一张真·派生预览（preview-{当前上限}.webp）——
+      const tiffX = q<{ id: number; content_hash: string }>(
+        "SELECT id, content_hash FROM assets WHERE name='big.tiff'"
+      )
+      const pxX = getSettings().preview.maxImagePx
+      const previewX = join(thumbsDir, tiffX.content_hash, `preview-${pxX}.webp`)
+      const waitFileX = async (p: string): Promise<boolean> => {
+        const t0 = Date.now()
+        while (Date.now() - t0 < 20000) {
+          if (existsSync(p)) return true
+          await new Promise((r) => setTimeout(r, 200))
+        }
+        return existsSync(p)
+      }
+      if (!existsSync(previewX)) await deriveFor(tiffX.id)
+      const previewXOk = await waitFileX(previewX)
+      check('S7X 前置：生产派生管线生成了图片派生文件 preview-{上限}.webp',
+        previewXOk, `preview-${pxX}.webp`)
+
+      // —— B1/B2：三桶文件数与字节数与独立判据**完全一致**（derived.bytes 必须与我 stat 的相等）——
+      const mine = scanMine()
+      const statsX = cacheStats()
+      check('S7X B1 三桶文件数 == 独立分类器（thumbs/derived/other 全部对齐）',
+        statsX.thumbs.files === mine.thumbs.files &&
+          statsX.derived.files === mine.derived.files &&
+          statsX.other.files === mine.other.files,
+        `生产=${statsX.thumbs.files}/${statsX.derived.files}/${statsX.other.files} 独立=${mine.thumbs.files}/${mine.derived.files}/${mine.other.files}`)
+      check('S7X B2 三桶字节数 == 独立 statSync 求和',
+        statsX.thumbs.bytes === mine.thumbs.bytes &&
+          statsX.derived.bytes === mine.derived.bytes &&
+          statsX.other.bytes === mine.other.bytes,
+        `生产=${statsX.thumbs.bytes}/${statsX.derived.bytes}/${statsX.other.bytes} 独立=${mine.thumbs.bytes}/${mine.derived.bytes}/${mine.other.bytes}`)
+      check('S7X B2 前置：derived 桶此刻非空（否则「字节数相等」是在比 0）',
+        mine.derived.files > 0 && mine.derived.bytes > 0,
+        `独立 derived=${mine.derived.files} 个 / ${mine.derived.bytes} B`)
+      check('S7X B3 图片派生 preview-{上限}.webp 被算进生产 derived 桶（不是被漏掉）',
+        mine.derived.names.includes(`preview-${pxX}.webp`) && statsX.derived.files === mine.derived.files,
+        `独立 derivedNames=${JSON.stringify(mine.derived.names)}`)
+      // B4：核心命题 —— 修完之后「其它」桶里**不再**含任何「真·派生预览」名。
+      //     注意：preview* 的**临时文件**归 other 是刻意设计（见 cache.ts 头注释），故此处只筛真名。
+      const inOtherReal = mine.other.names.filter((n) => /^preview(-\d+)?\.(webp|mp3|mp4)$/.test(n))
+      check('S7X B4 「其它」桶里不含任何真·派生预览名（preview-2560.webp 这类必须在 derived）',
+        inOtherReal.length === 0 && statsX.other.files === mine.other.files,
+        `other 独立=${JSON.stringify(mine.other.names)}`)
+
+      // —— DOM：面板「派生预览」卡必须 > 0 且与独立口径一致 ——
+      //    切走再切回 cache 分组 → pickGroup 会重新 loadStats()（SettingsPanel.vue:111）
+      await clickEl('[data-sp-group="about"]')
+      await clickEl('[data-sp-group="cache"]')
+      await waitFor("!!document.querySelector('[data-sp-cache-derived]')", 6000)
+      await waitFor("document.querySelector('[data-sp-cache-total]')?.textContent.trim() !== '—'", 6000)
+      const domDerivedBytes = (await js<string>("document.querySelector('[data-sp-cache-derived]')?.textContent.trim() ?? ''")) ?? ''
+      const domDerivedFiles = (await js<number>(
+        "(() => { const b = document.querySelector('[data-sp-cache-derived]'); const n = b?.parentElement?.querySelector('.sp-card-sub'); return n ? parseInt(n.textContent, 10) : -1 })()"
+      )) ?? -1
+      check('S7X DOM 前置：面板「派生预览」此刻 > 0（不是 0 B）',
+        domDerivedBytes !== '' && domDerivedBytes !== '0 B' && domDerivedFiles > 0,
+        `bytes=${domDerivedBytes} files=${domDerivedFiles}`)
+      check('S7X DOM 对齐：面板「派生预览」文件数 == 独立口径（生产 → IPC → DOM 全链对齐）',
+        domDerivedFiles === mine.derived.files,
+        `dom=${domDerivedFiles} 独立=${mine.derived.files}`)
+
+      // ==================== D 对抗性：像「派生」但不是「真派生」的边界名 ====================
+      // 全部放进独立探针目录，逐个用「桶计数增量 + 字节增量」确定它到底落在哪一桶。
+      // ⚠️ 大小写变体单独放另一个目录：NTFS 大小写不敏感，`PREVIEW-2560.WEBP` 与同目录的
+      //    `preview-2560.webp` 会撞成同一个文件（实测：Δ=0 → 判不出），换个目录才是真·新文件。
+      const probeDir = join(thumbsDir, 'qa-i2-probe')
+      const probeCaseDir = join(thumbsDir, 'qa-i2-probe-case')
+      mkdirSync(probeDir, { recursive: true })
+      mkdirSync(probeCaseDir, { recursive: true })
+      const cases: Array<{ name: string; expect: 'thumbs' | 'derived' | 'other'; why: string; caseDir?: boolean }> = [
+        { name: 'preview.1234567890.tmp.mp4', expect: 'other', why: '视频派生中间临时文件（以 .mp4 结尾但含 .tmp）' },
+        { name: 'preview.1234567890.tmp.mp3', expect: 'other', why: '音频派生中间临时文件' },
+        { name: 'preview-2560.webp.tmp', expect: 'other', why: 'deriveImage 的 out.tmp 形态' },
+        { name: 'preview.9999.tmp.webp', expect: 'other', why: '自补：带 .tmp 的 webp' },
+        { name: 'preview.mp4', expect: 'derived', why: '视频派生真名（无 tag）' },
+        { name: 'preview.mp3', expect: 'derived', why: '音频派生真名（无 tag）' },
+        { name: 'preview-2560.webp', expect: 'derived', why: '图片派生真名（带尺寸 tag）—— I2 的核心' },
+        { name: 'preview-1920.webp', expect: 'derived', why: '另一档尺寸的图片派生真名' },
+        { name: 'grid.webp', expect: 'thumbs', why: '缩略图' },
+        { name: 'detail.webp', expect: 'thumbs', why: '大缩略图' },
+        { name: 'preview-.webp', expect: 'other', why: '边界：破折号后无数字 → 不匹配' },
+        { name: 'preview-0.webp', expect: 'derived', why: '边界：tag=0 会匹配（项目正常不产生 maxImagePx=0）' },
+        { name: 'preview.webp', expect: 'derived', why: '边界：tag 段可选 → 会匹配（图片族从不产此名，属可接受过匹配）' },
+        { name: 'PREVIEW-2560.WEBP', expect: 'other', why: '边界：大写 → 不匹配（项目固定小写生成，有意为之）', caseDir: true }
+      ]
+      {
+        const cur = cacheStats()
+        let f0 = { t: cur.thumbs.files, d: cur.derived.files, o: cur.other.files }
+        let b0 = { t: cur.thumbs.bytes, d: cur.derived.bytes, o: cur.other.bytes }
+        for (let i = 0; i < cases.length; i++) {
+          const c = cases[i]
+          const size = 100 + i * 11
+          writeFileSync(join(c.caseDir ? probeCaseDir : probeDir, c.name), Buffer.alloc(size))
+          const s = cacheStats()
+          const dt = s.thumbs.files - f0.t
+          const dd = s.derived.files - f0.d
+          const dob = s.other.files - f0.o
+          const got = dt === 1 ? 'thumbs' : dd === 1 ? 'derived' : dob === 1 ? 'other' : 'none'
+          const dbytes = got === 'thumbs' ? s.thumbs.bytes - b0.t : got === 'derived' ? s.derived.bytes - b0.d : s.other.bytes - b0.o
+          check(`S7X D 归类：${c.name} → ${c.expect}`, got === c.expect && dbytes === size,
+            `got=${got} bytes+${dbytes}(size=${size}) Δ=${JSON.stringify({ t: dt, d: dd, o: dob })}（${c.why}）`)
+          f0 = { t: s.thumbs.files, d: s.derived.files, o: s.other.files }
+          b0 = { t: s.thumbs.bytes, d: s.derived.bytes, o: s.other.bytes }
+        }
+        rmSync(probeDir, { recursive: true, force: true })
+        rmSync(probeCaseDir, { recursive: true, force: true })
+        const restored = scanMine()
+        const statsR = cacheStats()
+        check('S7X D 收尾：探针已清除，三桶生产口径与独立口径仍一致（无污染）',
+          !existsSync(probeDir) && !existsSync(probeCaseDir) &&
+            statsR.thumbs.files === restored.thumbs.files &&
+            statsR.derived.files === restored.derived.files &&
+            statsR.other.files === restored.other.files &&
+            statsR.derived.bytes === restored.derived.bytes,
+          `独立=${restored.thumbs.files}/${restored.derived.files}/${restored.other.files}`)
+      }
+
+      // ==================== C1/C2 两条不变量（磁盘实况，不只看返回计数）====================
+      const s0HashX = q<{ content_hash: string }>("SELECT content_hash FROM assets WHERE name='s0.png'").content_hash
+      const gridX = join(thumbsDir, s0HashX, 'grid.webp')
+      const detailX = join(thumbsDir, s0HashX, 'detail.webp')
+      check('S7X C 前置：grid.webp / detail.webp / preview-{上限}.webp 三样此刻都在磁盘上',
+        existsSync(gridX) && existsSync(detailX) && existsSync(previewX),
+        `grid=${existsSync(gridX)} detail=${existsSync(detailX)} preview=${existsSync(previewX)}`)
+
+      // C1：清 'derived' → preview 消失，grid/detail 仍在（同步断言，杜绝竞态）
+      clearCache('derived')
+      check('S7X C1 清 derived 后 preview-{上限}.webp 消失', !existsSync(previewX))
+      check('S7X C1 清 derived **不**动 grid.webp', existsSync(gridX))
+      check('S7X C1 清 derived **不**动 detail.webp', existsSync(detailX))
+
+      // C2：清 'thumbs' → grid/detail 消失，preview 仍在
+      if (!existsSync(previewX)) await deriveFor(tiffX.id)
+      const regenX = await waitFileX(previewX)
+      check('S7X C2 前置：preview 已重新生成，且 grid/detail 仍在',
+        regenX && existsSync(gridX) && existsSync(detailX),
+        `preview=${existsSync(previewX)} grid=${existsSync(gridX)} detail=${existsSync(detailX)}`)
+      clearCache('thumbs')
+      check('S7X C2 清 thumbs 后 grid.webp 消失', !existsSync(gridX))
+      check('S7X C2 清 thumbs 后 detail.webp 消失', !existsSync(detailX))
+      check('S7X C2 清 thumbs **不**动派生预览（preview 仍在）', existsSync(previewX))
+
+      // 收尾：把缩略图重建回来，免得后面段落卡片一片 404
+      await js("window.stash.thumb.backfill('grid')")
     }
 
     // ==================== S6 关于页 ====================

@@ -2,11 +2,14 @@
 //
 // 缓存全在 `<库>/.thumbs/` 里，但**三类东西混住**，清理时必须分开：
 //   · 缩略图      `{hash}/grid.webp` `{hash}/detail.webp` —— 删了能重新生成（秒级）
-//   · 派生预览    `{hash}/preview.{webp,mp3,mp4}` —— HEIC/TIFF 的高清大图、老视频的转码结果，
+//   · 派生预览    `{hash}/preview.mp4`（老视频 remux/转码）、`{hash}/preview.mp3`（音频转码）、
+//                 `{hash}/preview-{尺寸}.webp`（HEIC/TIFF 的高清大图，**图片派生的文件名带尺寸 tag**，
+//                 见 `preview.ts` 的 `derivedPathFor()` / `derivedAbs()`）——
 //                 删了要**重新转码**（慢，几十秒都正常），所以绝不能被「清理缓存」一把带走
 //   · 其它        `placeholder-*.webp`（占位图，删了会重新生成）、`*.tmp`（写一半的临时文件）
 //
-// 分类靠文件名而不是靠子目录：`{hash}` 目录是两者共用的（同一个素材的缩略图与派生预览就在一起）。
+// 分类靠文件名而不是靠子目录：`{hash}` 目录是三者共用的
+// （同一个素材的缩略图、派生预览、以及派生中途的临时文件都落在里面）。
 import { existsSync, readdirSync, statSync, unlinkSync } from 'fs'
 import { join } from 'path'
 import { requireCurrent } from './library'
@@ -33,10 +36,25 @@ interface Entry {
   bytes: number
 }
 
+/**
+ * 派生预览的**完整文件名形态**。
+ *
+ * ⚠️ 必须精确匹配，**不能只判 `startsWith('preview')` 或 `startsWith('preview.')`**：
+ *   · 图片派生带尺寸 tag → `preview-2560.webp`（`preview.ts` 的 `derivedPathFor()` 把
+ *     `maxImagePx()` 算进文件名，改设置就换个文件、不会命中旧尺寸）；只认 `preview.` 会**整类漏掉**
+ *     —— 那恰恰是最占空间的 HEIC/TIFF 高清大图，本项目 I2 就栽在这里。
+ *   · 派生**中途的临时文件**也以 `preview` 开头 → 图片 `preview-{尺寸}.webp.tmp`、
+ *     视频/音频 `preview.{时间戳}.tmp.{mp4,mp3}`（见 `preview.ts` 的
+ *     `deriveImage/deriveVideo/deriveAudio`）。它们**不是**可用的派生预览，归「其它」，
+ *     与头注释里 `*.tmp` 的归类一致（否则占用虚高、「清理派生预览」也会误报删除数）。
+ * 一个正则同时把「真派生」与「写一半的临时文件」分开，以后改判据别再退化成前缀判断。
+ */
+const DERIVED_RE = /^preview(-\d+)?\.(webp|mp3|mp4)$/
+
 function classify(name: string): CacheKind {
   if (name === 'grid.webp' || name === 'detail.webp') return 'thumbs'
-  if (name.startsWith('preview.')) return 'derived'
-  return 'other' // placeholder-*.webp / *.tmp / 未知残留
+  if (DERIVED_RE.test(name)) return 'derived'
+  return 'other' // placeholder-*.webp / *.tmp（含 `preview` 前缀的临时文件）/ 未知残留
 }
 
 /** 遍历 `.thumbs`：一层 hash 目录 + 根目录下的散文件（占位图、临时文件） */
