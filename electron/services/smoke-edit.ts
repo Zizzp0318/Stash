@@ -758,16 +758,42 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     R.u8_bulk = { added: bulkImp.added, total: assetCount() }
     await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
     await onceLoaded(win)
-    await sleep(3000)
+    // 原来固定 sleep(3000) 等「reload 后网格渲染完」—— U8 的 6 条断言全靠这一步。
+    // 机器一忙 3s 不够 → 夹具没撑起滚动高度 → topBtnFixtureScrollable 及其级联一起红（G12）。
+    // 改成有界轮询「网格已渲染且容器**真的滚得动**（maxScroll > 300）」，上限给足 20s。
+    const u8ScrollReady = await waitFor(
+      async () =>
+        ((await js(
+          `(() => { const w = document.querySelector('.grid-wrap'); return w ? Math.round(w.scrollHeight - w.clientHeight) : 0 })()`
+        )) as number) > 300,
+      20000
+    )
 
     // 先选一张：批量条要出现，才能验证「浮标让开批量条」不是空断言
+    // 原来固定 sleep(700) —— 改成轮询「选中真的生效」（.masonry-card.selected 出现）
     await clickSel('.masonry-card', 0)
-    await sleep(700)
+    const u8SelReady = await waitFor(
+      async () => ((await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number) > 0,
+      8000
+    )
     R.u8_selected = (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
 
     // 滚到最下方（瀑布视图）
     await js(`(() => { const w = document.querySelector('.grid-wrap'); if (w) w.scrollTop = w.scrollHeight })()`)
-    await sleep(600)
+    // 原来固定 sleep(600) 等「滚动生效 + 浮标渲染出来」。
+    // ⚠️ 光等 `scrollTop > 240` **不够**：浮标是 `v-if="scrolledDown"`、由 scroll 事件回调里置位再渲染的，
+    // 而 `w.scrollTop = …` 是同步赋值 —— 立刻读会「滚动到了、但浮标还没渲染」→ hasBtn=false（实测踩到）。
+    // 所以要等「滚动位置到位 **且** 浮标状态确定（已出现）」，上限 8s；真等不到（产线 bug）则这条轮询为 false、
+    // 由 topBtnAppearsOnScroll 的闸门明确变红。
+    const u8ScrollPosReady = await waitFor(
+      async () =>
+        ((await js(
+          `(() => { const w = document.querySelector('.grid-wrap'); return !!w && w.scrollTop > 240 && !!document.querySelector('[data-to-top]') })()`
+        )) as boolean) === true,
+      8000
+    )
+    // 三步轮询的成败必须被消费：存进诊断字段，并各自并入对应断言（G11：超时必须能红）
+    R.u8_ready = { scrollReady: u8ScrollReady, selReady: u8SelReady, scrollPosReady: u8ScrollPosReady }
     R.u8_masonry = (await js(`(() => {
       const b = document.querySelector('[data-to-top]')
       const g = document.querySelector('.gallery')
@@ -942,6 +968,8 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     const u8b = R.u8_back as Record<string, unknown>
     const u8bl = R.u8_back_list as Record<string, unknown>
     const u8bulk = R.u8_bulk as Record<string, unknown>
+    /** U8 三步有界轮询的成败（防假绿闸门，见 G11）：超时 → 对应断言必须红 */
+    const u8ready = R.u8_ready as { scrollReady: boolean; selReady: boolean; scrollPosReady: boolean } | undefined
     const u6b = (() => {
       const s = R.u6b_preview as string | null
       try {
@@ -1211,9 +1239,12 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       detailExpandWorks: u7e?.detailBack === true && u7e?.flag === '0',
 
       // U8 回到顶部浮标：滚到下方才出现、点击回顶、两种视图都有、不与批量条重叠
-      // 前提守卫：页面得真的滚得起来，否则「滚到底浮标还在」这种断言是没有意义的
-      topBtnFixtureScrollable: (u8bulk?.added as number) >= 20 && (u8m?.maxScroll ?? 0) > 300,
-      topBtnAppearsOnScroll: u8m?.hasBtn === true && (u8m?.scrollTop ?? 0) > 240,
+      // 前提守卫：页面得真的滚得起来，否则「滚到底浮标还在」这种断言是没有意义的。
+      // `u8ready.scrollReady` = 「等容器滚得动」这一步的轮询结果（超时 → 这条明确红，红因不再是「同生共死」）
+      topBtnFixtureScrollable: (u8bulk?.added as number) >= 20 && (u8m?.maxScroll ?? 0) > 300 &&
+        u8ready?.scrollReady === true,
+      topBtnAppearsOnScroll: u8m?.hasBtn === true && (u8m?.scrollTop ?? 0) > 240 &&
+        u8ready?.scrollPosReady === true,
       // 必须待在 .gallery 的右下角（也就是中栏内部，不会压到右侧信息栏）。
       // topInset 两条盯的是「浮标真的在右下角」：一旦它变成参与布局的普通元素
       //（position 没给、或者被塞进某个定位子树里），位置就会跟着内容流跑，
@@ -1245,7 +1276,8 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       topBtnAvailableInList: u8l?.isList === true && u8l?.hasBtn === true && (u8l?.scrollTop ?? 0) > 240,
       topBtnScrollsBackInList: u8bl?.ok === true && u8bl?.scrollTop === 0,
       // 收尾：选中确实发生过（批量条才真的在场，重叠断言才有意义）、Esc 又能干净复位
-      topBtnTestSelectionReset: R.u8_selected === 1 && R.u8_cleared === 0,
+      // `u8ready.selReady` = 「点卡片后等选中生效」的轮询结果（超时 → 这条明确红）
+      topBtnTestSelectionReset: R.u8_selected === 1 && R.u8_cleared === 0 && u8ready?.selReady === true,
 
       noJsErrors: jsErrors.length === 0
     }

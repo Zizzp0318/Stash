@@ -46,7 +46,7 @@ import { join } from 'path'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
-import { importFiles } from './importer'
+import { importFiles, contentHash } from './importer'
 import { DEFAULT_SETTINGS, getSettings, patchSettings } from './config'
 import {
   analyze, previewInfo, deriveFor, serveMedia, derivedPathFor, rowOf, readText, writeText,
@@ -568,10 +568,67 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     // 背景：并发写同一张占位图会失败（见 thumbs.ts），个别素材当时根本没生成缩略图，
     // 而 onImgErr 原先只隐藏不重试 → 卡片永久灰着，要等下次开库 backfill。
     // 这条兜底保证「不管什么原因缺文件，都能当场补回来」，所以直接删真文件来验。
+    //
+    // ⚠️ G11 第 ③ 种形态 —— 鉴别力依赖一个前置状态时，必须把那个前置**显式断言**出来。
+    //   本条的鉴别力依赖「该 content_hash 在本会话里**还没被 latch 过**」这个前置：
+    //   `GalleryGrid.onImgErr` 的 `thumbRetried` 是**按 content_hash、每会话只补一次**（防死循环）。
+    //   同一个 hash 只要本会话已因别的原因（导入期并发写占位图的竞态 / 外部改写产生的新 hash）
+    //   补过一次，本步再删文件就会被 `has(key)` 挡下、永远不再自愈 —— 那不是「自愈坏了」，
+    //   而是「自愈本就只承诺每会话一次」。所以样本不能沿用「现成随便挑一张卡」（它可能已被 latch），
+    //   必须换成**本步新导入的全新 hash**；并用下面那条前置断言把「latch 必为空」证明出来。
     {
-      const healId = orderIds.find((id) => id !== vanishId) ?? orderIds[0]
-      const healHash = q<{ content_hash: string }>('SELECT content_hash FROM assets WHERE id=?', healId).content_hash
+      // ① 记录导入前的全部 content_hash / 最大 id → 用来证明新样本确实是「本会话新产生」的。
+      const preHashes = new Set(
+        (requireCurrent().db.prepare('SELECT content_hash FROM assets').all() as { content_hash: string | null }[])
+          .map((r) => r.content_hash)
+          .filter((h): h is string => !!h))
+      const preMaxId = (requireCurrent().db.prepare('SELECT COALESCE(MAX(id),0) AS m FROM assets').get() as { m: number }).m
+
+      // ② 本步现造一张图并导入 → 全新 content_hash。
+      //    先在磁盘上**按 content_hash 预置**好它的 grid.webp：`import:done → assets.refresh()`
+      //    会先让新卡渲染、`backfill('grid')` 才排队生成缩略图；若首帧就 404，首帧的 onImgErr
+      //    会先把该 hash latch 掉，本步再删就永远不愈。预置让首帧干净加载（无 404 → 无 latch），
+      //    随后再「删文件」制造缺失 —— 这样测的才是「自愈能工作」。
+      const healSrc = join(srcDir, 'heal-src.png')
+      await sharp({ create: { width: 240, height: 180, channels: 3, background: '#7B3FA0' } }).png().toFile(healSrc)
+      const healHash = contentHash(healSrc) // 与导入侧 `contentHash(src)` 完全一致（同 size + 同内容）
       const thumbAbs = join(lib.path, '.thumbs', healHash, 'grid.webp')
+      mkdirSync(join(lib.path, '.thumbs', healHash), { recursive: true })
+      await sharp(healSrc)
+        .resize({ width: 320, height: 320, fit: 'inside', withoutEnlargement: true })
+        .webp({ quality: 80 })
+        .toFile(thumbAbs)
+
+      await new Promise<{ added: number }>((resolve) => {
+        importFiles({ paths: [healSrc], folderId: folder.id, mode: 'copy', onDone: () => resolve({ added: 1 }) })
+      })
+      const healRow = requireCurrent().db
+        .prepare('SELECT id, content_hash FROM assets WHERE name=? ORDER BY id DESC LIMIT 1')
+        .get('heal-src.png') as { id: number; content_hash: string | null } | undefined
+      const healId = healRow?.id ?? -1
+      const healHashActual = healRow?.content_hash ?? ''
+
+      // ③ 等新卡出现、且它的 <img> **干净加载完成**（`src` 里没有 `&retry=` = onImgErr 从未针对这张卡触发）。
+      const cleanFirstFrame = await waitFor(
+        "(() => { const i = document.querySelector('.card[data-id=\"" + healId + "\"] img');" +
+        " return !!i && i.complete && i.naturalWidth > 0 && !/retry=/.test(i.src) })()",
+        15000)
+
+      // ④ 前置断言（显式）：三条一起把「latch 必为空」证出来 ——
+      //   · healId > preMaxId    → 该素材行是本步新插入的；
+      //   · !preHashes.has(hash) → 该 hash 早于本步不存在于任何素材行 → 本会话没有任何 <img> 曾指向过它。
+      //                            ⚠️ **这一条才是承重条款** —— 「latch 必空」是由它证死的。
+      //   · cleanFirstFrame      → 首帧干净加载，**冗余的第二道守卫**。
+      //     ⚠️ 别把它的含义说过头：`!/retry=/` **单看并不严密** —— `onImgErr` 还有一条
+      //        `!r.ok || !r.data?.hash || !img.isConnected` 的早期 return，那条路径**不加** `&retry=`。
+      //        它在这里能成立，是因为两条真实路径都被 `complete && naturalWidth>0` 排除：
+      //        要么走 `&retry=` 分支（src 必含 retry=），要么走早期 return（图必然没加载 ⇒ naturalWidth 为 0）。
+      //        （已用内点构造验证过：人为塞一个「latch 已占位但图已加载」的合成 error 会让它假绿 —— 真实代码里到不了那个状态。）
+      check('U2 前置：自愈样本是本步新导入的全新 hash 且首帧未被 latch（鉴别力前置成立）',
+        healId > preMaxId && healHashActual.length === 20 && !preHashes.has(healHashActual) && cleanFirstFrame,
+        `id=${healId} preMaxId=${preMaxId} hash=${healHashActual} hashWasNew=${!preHashes.has(healHashActual)} cleanFirstFrame=${cleanFirstFrame}`)
+
+      // ⑤ 制造「缺失」这个前提：把刚（预置 / backfill 出来的）缩略图从磁盘删掉
       if (existsSync(thumbAbs)) unlinkSync(thumbAbs)
       const r = await js<{ ok: boolean; srcChanged: boolean; loaded: boolean }>(
         '(async () => {' +
@@ -587,9 +644,13 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         ' }' +
         ' return { ok: true, srcChanged: img.src !== before, loaded: img.naturalWidth > 0 };' +
         '})()')
+      // ⑥ 断言自愈**真的把文件补回了磁盘**（不只是 <img> 又加载出来）：`onDisk` 必须为真。
+      //    这正是历史那次红的签名（`loaded=false` 且 `onDisk=false`），把磁盘侧也纳进判定，
+      //    避免「浏览器缓存把旧图又画出来」冒充自愈成功。
+      const onDisk = existsSync(thumbAbs)
       check('U2 缩略图缺失时渲染层会补生成并自动重试（不再永久灰）',
-        r.ok && r.srcChanged === true && r.loaded === true,
-        JSON.stringify(r) + ' onDisk=' + existsSync(thumbAbs))
+        r.ok && r.srcChanged === true && r.loaded === true && onDisk,
+        JSON.stringify(r) + ' onDisk=' + onDisk)
     }
 
     const fire = (id: number, type: string): Promise<unknown> =>
@@ -634,26 +695,35 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       const scaleExpr = "(() => { const t = document.querySelector('[data-pv-stage]').style.transform || '';" +
         ' const m = /scale\\(([\\d.]+)\\)/.exec(t); return m ? parseFloat(m[1]) : 0 })()'
       if (imgOk) {
-        // ⚠️ 必须等「大图加载完成」再测缩放：`onBigLoad` 会再调一次 `setupPz()`，
-        // 而 `setupPz()` 是先 destroy 再重建 panzoom —— 那一下会把 transform 重置成 scale(1)。
-        // 不等的话，滚轮刚放大就被重建冲掉，断言随机红（实测约一半概率）。
-        await waitFor(
-          "(() => { const i = document.querySelector('.pv-img'); return i && i.style.opacity === '1' })()", 8000)
-        await new Promise((r) => setTimeout(r, 500)) // 让 rAF 里的那次 setupPz 落定
-        await waitFor(scaleExpr + ' > 0', 5000)
+        // ⚠️ 必须等「大图 onload 之后那次 setupPz」落定再测缩放：
+        // `onBigLoad` 把 `<img>` opacity 置 1 **并**用 requestAnimationFrame 再调一次 `setupPz()`
+        //（destroy→重建，会把 transform 重置成 scale(1)）。若在它落定前就滚轮，放大结果会被这次重建冲掉。
+        // 原来这里用 `setTimeout(500)` 赌「500ms 够它落定」——机器一忙就不够（实测 5/6 红）。
+        // 现在：① 有界轮询等 `opacity==='1'`；② 再等 **2 帧** 确保 onBigLoad 里那次 rAF 已执行；
+        //      ③ 有界轮询等 panzoom 写出 transform（scale>0）。三步结果并入断言（超时→明确红）。
+        const bigLoadedReady = await waitFor(
+          "(() => { const i = document.querySelector('.pv-img'); return !!i && i.style.opacity === '1' })()", 15000)
+        await js("new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(() => res(true))))")
+        const pzReady = await waitFor(
+          "(() => { const s = document.querySelector('[data-pv-stage]');" +
+            " if (!s) return false;" +
+            " const m = /scale\\(([\\d.]+)\\)/.exec(s.style.transform || ''); return !!m && parseFloat(m[1]) > 0 })()",
+          8000)
         const scaleBefore = await js<number>(scaleExpr)
-        await js("(() => { const s = document.querySelector('[data-pv-stage]');" +
-          ' const r = s.getBoundingClientRect();' +
-          " s.dispatchEvent(new WheelEvent('wheel', { deltaY: -240, bubbles: true, cancelable: true," +
-          ' clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 })) })()')
-        // 轮询而不是睡固定时间：放大本身是异步的
+        // 滚轮放大是异步的：**有界轮询**等 scale 变大（保留原有循环，不睡固定时间）
+        const wheel = (): Promise<unknown> =>
+          js("(() => { const s = document.querySelector('[data-pv-stage]');" +
+            ' const r = s.getBoundingClientRect();' +
+            " s.dispatchEvent(new WheelEvent('wheel', { deltaY: -240, bubbles: true, cancelable: true," +
+            ' clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 })) })()')
+        await wheel()
         let scaleAfter = scaleBefore
         for (let i = 0; i < 20 && !(scaleAfter > scaleBefore); i++) {
           await new Promise((r) => setTimeout(r, 150))
           scaleAfter = await js<number>(scaleExpr)
         }
-        check('U2 滚轮放大（scale 数值变大）', scaleAfter > scaleBefore,
-          'before=' + scaleBefore + ' after=' + scaleAfter)
+        check('U2 滚轮放大（scale 数值变大）', bigLoadedReady && pzReady && scaleAfter > scaleBefore,
+          'bigLoaded=' + bigLoadedReady + ' pzReady=' + pzReady + ' before=' + scaleBefore + ' after=' + scaleAfter)
       } else {
         check('U2 滚轮放大（scale 数值变大）', false, '图片没加载出来，缩放无从验证')
       }
@@ -929,14 +999,17 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       interface BarAutoHide {
         ok: boolean
         opening: string
+        idleWaited: boolean
         afterIdle: string
         hitsAtIdle: string
+        moveWaited: boolean
         afterMove: string
+        leaveWaited: boolean
         afterLeave: string
       }
       const r = await js<BarAutoHide>(
         '(async () => {' +
-        ' const empty = { ok: false, opening: "?", afterIdle: "?", hitsAtIdle: "?", afterMove: "?", afterLeave: "?" };' +
+        ' const empty = { ok: false, opening: "?", idleWaited: false, afterIdle: "?", hitsAtIdle: "?", moveWaited: false, afterMove: "?", leaveWaited: false, afterLeave: "?" };' +
         ' const card = document.querySelector(\'.card[data-id="' + mp4Id + '"]\');' +
         ' if (!card) return empty;' +
         ' card.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));' +
@@ -949,29 +1022,39 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         ' const stage = document.querySelector(".pv-video [data-pv-video-stage]");' +
         ' if (!bar || !stage) return empty;' +
         ' const st = () => getComputedStyle(bar);' +
+        // 有界轮询：等到 opacity 变成目标值再往下走。原来这里固定等 3.4s（「阈值 2.6s + 0.22s 过渡」的
+        // 固定估计）—— 机器一忙 transition 还没走完就抓，断言偶发红（G12）。超时返回 false 由调用方并入断言。
+        ' const waitOpacity = async (want, ms) => {' +
+        '   const t = Date.now();' +
+        '   while (Date.now() - t < ms) {' +
+        '     if (st().opacity === want) return true;' +
+        '     await new Promise((r) => setTimeout(r, 100));' +
+        '   }' +
+        '   return false;' +
+        ' };' +
         ' const opening = st().opacity;' +
-        // 静止 3.4s（阈值 2.6s + 0.22s 过渡）→ 应该已经淡出，且不再拦点击
-        ' await new Promise((r) => setTimeout(r, 3400));' +
+        // 静止 → 应该淡出（opacity 0）、且不再拦点击。等 opacity 到底（上限 8s），不再赌 3.4s。
+        ' const idleWaited = await waitOpacity("0", 8000);' +
         ' const afterIdle = st().opacity;' +
         ' const hitsAtIdle = st().pointerEvents;' +
-        // 指针在**画面**上动一下（不是非摸到控制条那条）→ 立刻回来，等过渡走完再看
+        // 指针在**画面**上动一下（不是非摸到控制条那条）→ 立刻回来；等 opacity 回到 1（过渡走完）
         ' stage.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 7, isPrimary: true }));' +
-        ' await new Promise((r) => setTimeout(r, 500));' +
+        ' const moveWaited = await waitOpacity("1", 2500);' +
         ' const afterMove = st().opacity;' +
         // 离开画面 → 不等静止计时，直接收起
         ' stage.dispatchEvent(new MouseEvent("mouseleave", { bubbles: false }));' +
-        ' await new Promise((r) => setTimeout(r, 400));' +
+        ' const leaveWaited = await waitOpacity("0", 2500);' +
         ' const afterLeave = st().opacity;' +
-        ' return { ok: true, opening, afterIdle, hitsAtIdle, afterMove, afterLeave };' +
+        ' return { ok: true, opening, idleWaited, afterIdle, hitsAtIdle, moveWaited, afterMove, leaveWaited, afterLeave };' +
         '})()')
       check('U 控制条自动隐藏：一打开是可见的（不是一开始就藏着）',
         r.ok && r.opening === '1', JSON.stringify(r))
       check('U 控制条自动隐藏：静止后淡出且不再挡点击',
-        r.ok && r.afterIdle === '0' && r.hitsAtIdle === 'none', JSON.stringify(r))
+        r.ok && r.idleWaited === true && r.afterIdle === '0' && r.hitsAtIdle === 'none', JSON.stringify(r))
       check('U 控制条自动隐藏：指针在画面上动一下立刻回来',
-        r.ok && r.afterMove === '1', JSON.stringify(r))
+        r.ok && r.moveWaited === true && r.afterMove === '1', JSON.stringify(r))
       check('U 控制条自动隐藏：指针离开画面立刻收起',
-        r.ok && r.afterLeave === '0', JSON.stringify(r))
+        r.ok && r.leaveWaited === true && r.afterLeave === '0', JSON.stringify(r))
 
       // 此刻浮层还开着、控制条已收起 —— 留一张「干净画面」的图复核（Esc 挪到这里之后发，
       // 就是为了别把浮层提前关掉）
@@ -1027,28 +1110,42 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
 
       interface HintIdle {
         ok: boolean
+        idleWaited: boolean
         afterIdle: string
         hitsAtIdle: string
+        moveWaited: boolean
         afterMove: string
       }
       const idle = await js<HintIdle>(
         '(async () => {' +
-        ' const empty = { ok: false, afterIdle: "?", hitsAtIdle: "?", afterMove: "?" };' +
+        ' const empty = { ok: false, idleWaited: false, afterIdle: "?", hitsAtIdle: "?", moveWaited: false, afterMove: "?" };' +
         ' const hint = document.querySelector(".pv-image [data-pv-hint]");' +
         ' const stage = document.querySelector(".pv-image [data-pv-stage]");' +
         ' if (!hint || !stage) return empty;' +
         ' const st = () => getComputedStyle(hint);' +
-        ' await new Promise((r) => setTimeout(r, 3400));' +
+        // 有界轮询等到 opacity 变成目标值：原来固定等 3.4s 赌 transition 走完（G12）。
+        // ⚠️ `afterIdle` 仍取**最终读到**的值 —— 所以若提示永不淡出（产线 bug），
+        // 超时后 afterIdle 仍是 "1"，断言照样红，鉴别力不降。
+        ' const waitOpacity = async (want, ms) => {' +
+        '   const t = Date.now();' +
+        '   while (Date.now() - t < ms) {' +
+        '     if (st().opacity === want) return true;' +
+        '     await new Promise((r) => setTimeout(r, 100));' +
+        '   }' +
+        '   return false;' +
+        ' };' +
+        ' const idleWaited = await waitOpacity("0", 8000);' +
         ' const afterIdle = st().opacity;' +
         ' const hitsAtIdle = st().pointerEvents;' +
         ' stage.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, pointerId: 9, isPrimary: true }));' +
-        ' await new Promise((r) => setTimeout(r, 500));' +
+        ' const moveWaited = await waitOpacity("1", 2500);' +
         ' const afterMove = st().opacity;' +
-        ' return { ok: true, afterIdle, hitsAtIdle, afterMove };' +
+        ' return { ok: true, idleWaited, afterIdle, hitsAtIdle, moveWaited, afterMove };' +
         '})()')
       check('U 图片提示：静止后自动淡出（不再压在图上）',
-        idle.ok && idle.afterIdle === '0' && idle.hitsAtIdle === 'none', JSON.stringify(idle))
-      check('U 图片提示：指针动一下立刻回来', idle.ok && idle.afterMove === '1', JSON.stringify(idle))
+        idle.ok && idle.idleWaited === true && idle.afterIdle === '0' && idle.hitsAtIdle === 'none', JSON.stringify(idle))
+      check('U 图片提示：指针动一下立刻回来',
+        idle.ok && idle.moveWaited === true && idle.afterMove === '1', JSON.stringify(idle))
 
       await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
       await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
@@ -1150,6 +1247,16 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       const r = await js<DetailMedia>(
         '(async () => {' +
         ' const empty = { ok: false, audioBar: true, videoBar: true, played: false, paused: false };' +
+        // 有界轮询：等媒体状态**真的翻转**再读。原来「点一下 → 固定 400/300ms → 读 paused」是赌时间，
+        // 机器一忙就抢跑（QA 全量时观测到这条偶发红）。pWait 的返回值就是该状态是否在窗口内达成。
+        ' const pWait = async (fn, ms) => {' +
+        '   const t = Date.now();' +
+        '   while (Date.now() - t < ms) {' +
+        '     if (fn()) return true;' +
+        '     await new Promise((r) => setTimeout(r, 60));' +
+        '   }' +
+        '   return fn();' +
+        ' };' +
         ' const openDetail = async (id, sel) => {' +
         '   const card = document.querySelector(\'.card[data-id="\' + id + \'"]\');' +
         '   if (!card) return null;' +
@@ -1172,11 +1279,11 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         ' const stage = document.querySelector(".detail-preview [data-pv-video-stage]");' +
         ' const click = () => stage.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));' +
         ' click();' +
-        ' await new Promise((r) => setTimeout(r, 400));' +
-        ' const played = !v.paused;' +
+        // played = 是否在播（等它真的开始播；超时→false→断言红）；语义与原来的 `!v.paused` 一致
+        ' const played = await pWait(() => !v.paused, 3000);' +
         ' click();' +
-        ' await new Promise((r) => setTimeout(r, 300));' +
-        ' const paused = !v.paused;' +
+        // paused = 是否在播（原来的 `!v.paused`；先等它真的暂停，再取反）
+        ' const paused = !(await pWait(() => v.paused, 3000));' +
         ' return { ok: true, audioBar, videoBar, played, paused };' +
         '})()')
       check('D 详情页音频预览没有控制条', r.ok && r.audioBar === false, JSON.stringify(r))

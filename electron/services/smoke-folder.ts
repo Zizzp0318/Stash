@@ -9,6 +9,7 @@ import { closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, r
 import { createTag, setTags } from './assets'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
+import { makeWaitUntil } from './smoke-util'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -34,6 +35,8 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       return null
     }
   }
+  /** 有界轮询（G4）：共享实现见 smoke-util.ts —— 超时返回 false，调用方必须把结果并入断言/诊断 */
+  const waitUntil = makeWaitUntil(js)
 
   let dir: string | null = null
   let libPath = ''
@@ -444,8 +447,8 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const dragBetween = async (
       from: { x: number; y: number },
       to: { x: number; y: number },
-      opts: { ctrl?: boolean; midway?: () => Promise<unknown> } = {}
-    ): Promise<void> => {
+      opts: { ctrl?: boolean; midway?: () => Promise<unknown>; feedback?: string } = {}
+    ): Promise<boolean> => {
       const downMods = opts.ctrl ? ['control'] : []
       const moveMods = opts.ctrl ? ['leftButtonDown', 'control'] : ['leftButtonDown']
       const at = (t: number): { x: number; y: number } => ({
@@ -456,16 +459,28 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       win.webContents.sendInputEvent({ type: 'mouseMove', x: p0.x, y: p0.y, modifiers: downMods })
       win.webContents.sendInputEvent({ type: 'mouseDown', x: p0.x, y: p0.y, button: 'left', clickCount: 1, modifiers: downMods })
       await sleep(90)
+      // ⚠️ 循环里的这些 sleep 是**模拟真实鼠标移动的定速节奏**（拖拽识别靠连续 mousemove），
+      // 属于「模拟输入节奏」而不是「等状态」—— 保留，删了反而会让拖拽识别不到。
       for (const t of [0.15, 0.35, 0.6, 0.85, 1]) {
         const p = at(t)
         win.webContents.sendInputEvent({ type: 'mouseMove', x: p.x, y: p.y, modifiers: moveMods })
         await sleep(80)
       }
-      await sleep(160)
+      // 松手前：原来固定 sleep(160) 等「拖动反馈渲染出来」—— 机器一忙反馈还没出，midway() 就抓了空快照
+      // → dragFeedback 偶发红（G12）。改成有界轮询「拖动反馈真的出现在 DOM 里」再调 midway()。
+      // 通用条件 = 「ghost 或 marquee 出现」二者之一：
+      //   · 不能固定等 ghost —— J3 是 Ctrl 框选，按设计就没有 ghost；
+      //   · 不能固定等落点行高亮 —— J2 的落点是无效目标，按设计就不高亮。
+      // J1 另外传入更严的 feedback（要求目标行同时高亮）。返回值由调用方并入断言/诊断，别丢（G11）。
+      const feedbackOk = await waitUntil(
+        opts.feedback ?? 'document.querySelector(".drag-ghost") || document.querySelector(".marquee")',
+        3000
+      )
       if (opts.midway) await opts.midway()
       const pEnd = at(1)
       win.webContents.sendInputEvent({ type: 'mouseUp', x: pEnd.x, y: pEnd.y, button: 'left', clickCount: 1 })
       await sleep(1500)
+      return feedbackOk
     }
 
     /** 拖拽过程中的即时状态：ghost 是否出现、哪些文件夹行高亮、卡片是否压暗 */
@@ -484,7 +499,10 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     R.j_cardsFound = await js(`document.querySelectorAll('.masonry-card').length`)
     if (c0 && goalRow) {
       const before = assetRow(c0.id)
-      await dragBetween(c0, { x: goalRow.cx, y: goalRow.cy }, {
+      R.j1_feedbackReady = await dragBetween(c0, { x: goalRow.cx, y: goalRow.cy }, {
+        // J1 的反馈要更严：拖到**有效**落点时，目标行必须同时高亮出来再抓快照
+        feedback:
+          '!!document.querySelector(".drag-ghost") && [...document.querySelectorAll(".side-item.drop-on")].some((x) => (x.dataset.folderPath || "").includes("对照/目标"))',
         midway: async () => {
           R.j1_midway = await dragSnapshot()
           // 拖动进行中：这张要能看到 ghost 浮层与落点文件夹的高亮
@@ -511,7 +529,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const treeRow = await rowAt('对照/树A')
     if (c1 && treeRow) {
       const before = assetRow(c1.id)
-      await dragBetween(c1, { x: treeRow.cx, y: treeRow.cy }, { midway: async () => { R.j2_midway = await dragSnapshot() } })
+      R.j2_feedbackReady = await dragBetween(c1, { x: treeRow.cx, y: treeRow.cy }, { midway: async () => { R.j2_midway = await dragSnapshot() } })
       const after = assetRow(c1.id)
       R.j2_noop = {
         relUnchanged: before?.rel_path === after?.rel_path,
@@ -524,7 +542,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const goalRow2 = await rowAt('对照/目标')
     if (c1 && goalRow2) {
       const before = assetRow(c1.id)
-      await dragBetween(c1, { x: goalRow2.cx, y: goalRow2.cy }, { ctrl: true, midway: async () => { R.j3_midway = await dragSnapshot() } })
+      R.j3_feedbackReady = await dragBetween(c1, { x: goalRow2.cx, y: goalRow2.cy }, { ctrl: true, midway: async () => { R.j3_midway = await dragSnapshot() } })
       R.j3_ctrlStillBand = {
         relUnchanged: before?.rel_path === assetRow(c1.id)?.rel_path,
         stillOnDisk: onDisk(before!.rel_path),
@@ -551,7 +569,9 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       }
       R.j4_selectedBefore = await js(`document.querySelectorAll('.card.selected').length`)
       const beforeRels = list4.map((c) => assetRow(c.id)?.rel_path)
-      await dragBetween(list4[0], { x: goalRow3.cx, y: goalRow3.cy }, { midway: async () => { R.j4_midway = await dragSnapshot() } })
+      await dragBetween(list4[0], { x: goalRow3.cx, y: goalRow3.cy }, { midway: async () => { R.j4_midway = await dragSnapshot() } }).then(
+        (fb) => { R.j4_feedbackReady = fb }
+      )
       const afterRels = list4.map((c) => assetRow(c.id)?.rel_path)
       R.j4_batch = {
         movedCount: afterRels.filter((r, i) => r && r !== beforeRels[i]).length,
@@ -800,7 +820,10 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       dragMove: !!j1 && j1.diskGone === true && j1.diskNew === true &&
         (j1.afterRel ?? '').startsWith('对照/目标/') && j1.notice?.includes('目标') === true,
       // 拖动过程中的即时反馈：ghost 跟手、落点行高亮、被拖卡片压暗
-      dragFeedback: j1m.ghost === true && j1m.dropOn?.includes('对照/目标') === true && (j1m.dimmed ?? 0) >= 1,
+      // `R.j1_feedbackReady` = 松手前那次「等反馈出现」的轮询结果（防假绿闸门，G11）：超时 → 这条必红，
+      // 红因直接指向「反馈没等到」，而不是让 6 条断言以「同生共死」的方式模糊变红
+      dragFeedback: (R.j1_feedbackReady as boolean) === true &&
+        j1m.ghost === true && j1m.dropOn?.includes('对照/目标') === true && (j1m.dimmed ?? 0) >= 1,
       // 松手后 ghost 与 body 状态都要收干净，否则会一直留在界面上
       dragCleansUp: j1?.ghostGone === true && j1?.bodyClassGone === true && j1?.selectedAfter === 0,
       // J2 拖回素材原本所在的文件夹 = 无效落点：不高亮、不搬动

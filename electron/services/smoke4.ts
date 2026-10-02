@@ -15,6 +15,7 @@ import sharp from 'sharp'
 import { closeCurrent, createLibrary, deleteLibrary, mkdirRel, requireCurrent } from './library'
 import { deleteAssets } from './assets'
 import { importFiles } from './importer'
+import { makeWaitUntil } from './smoke-util'
 
 type Rect = { id: number; x: number; y: number; w: number; h: number; cx: number; cy: number }
 
@@ -44,6 +45,8 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       return null
     }
   }
+  /** 有界轮询（G4）：共享实现见 smoke-util.ts —— 超时返回 false，调用方必须把结果并入断言/诊断 */
+  const waitUntil = makeWaitUntil(js)
   const click = (x: number, y: number, ctrl = false): void => {
     const m = ctrl ? ['control'] : []
     win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(x), y: Math.round(y), modifiers: m })
@@ -336,15 +339,26 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       // ⑪ 点击空白处取消选择
       cs = await cards()
       click(cs[0].cx, cs[0].cy, true)
-      await sleep(300)
+      // 点卡片后先轮询「选择真的生效」（.masonry-card.selected 出现）—— 否则「点空白」这一步的前提
+      // 不成立，blankClears 的红会被误判成「取消选择坏了」。原来这里是固定 sleep(300)（G12）。
+      const s11SelReady = await waitUntil("document.querySelectorAll('.masonry-card.selected').length > 0", 5000)
       const blankRaw = (await js(`(() => {
            const wr = document.querySelector('.grid-wrap').getBoundingClientRect()
            return JSON.stringify({ x: wr.left + 6, y: wr.top + 60 })
          })()`)) as string | null
       const blankPt = (blankRaw ? JSON.parse(blankRaw) : { x: 0, y: 0 }) as { x: number; y: number }
       click(blankPt.x, blankPt.y)
-      await sleep(800)
-      R.step11_blankClear = { selectedAfter: (await selIds()).length, batchbarGone: !(await js(`!!document.querySelector('.batchbar')`)) }
+      // 点空白后轮询「选择已清空 + 批量条已消失」（上限 5s）—— 原来固定 sleep(800)
+      const s11Cleared = await waitUntil(
+        "document.querySelectorAll('.masonry-card.selected').length === 0 && !document.querySelector('.batchbar')",
+        5000
+      )
+      R.step11_blankClear = {
+        selReady: s11SelReady,
+        cleared: s11Cleared,
+        selectedAfter: (await selIds()).length,
+        batchbarGone: !(await js(`!!document.querySelector('.batchbar')`))
+      }
 
       // ⑫ 详情面板星级 / 心心
       // 每个动作都同时采 **数据库** 与 **DOM** 两份证据 —— 只查 DB 会漏掉「写成功但 UI 不刷新」
@@ -518,7 +532,7 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
     const s6 = R.step6_bulkFav as { allOk: boolean }
     const s7 = R.step7_bulkMove as { relAllInTarget: boolean; filesInTarget: number; selectionCleared: boolean }
     const s10 = R.step10_delete as { fileGone: boolean; rowGone: boolean; trashDirCreated: boolean; menuGone: boolean }
-    const s11 = R.step11_blankClear as { selectedAfter: number; batchbarGone: boolean }
+    const s11 = R.step11_blankClear as { selReady: boolean; cleared: boolean; selectedAfter: number; batchbarGone: boolean }
     const s12 = R.step12_detail as {
       ratingAfterStarClick: number
       starDomFollowsDb: boolean
@@ -556,7 +570,10 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       // 删除即物理删除：文件没了、索引行没了，且绝不产生 .trash 回收站目录；
       // 菜单也必须一起收掉（素材都没了，菜单留在原地写着「删除选中的 0 项」）
       hardDelete: !!s10?.fileGone && !!s10?.rowGone && s10?.trashDirCreated === false && s10?.menuGone === true,
-      blankClears: s11?.selectedAfter === 0 && !!s11?.batchbarGone,
+      // `selReady`/`cleared` 是两次有界轮询的结果（防假绿闸门，G11）：超时 → 这条明确红，
+      // 红因能区分「没先选中（前提不成立）」还是「点空白没清空」
+      blankClears: s11?.selReady === true && s11?.cleared === true &&
+        s11?.selectedAfter === 0 && !!s11?.batchbarGone,
       // 详情页评分：DB 值 + DOM 点亮星数都要对
       detailStar: s12?.ratingAfterStarClick === 3 && !!s12?.starDomFollowsDb,
       // 详情页心心：DB 与 DOM 都必须翻转（只测 DB 会漏掉「没反应」这类 UI 层 bug）

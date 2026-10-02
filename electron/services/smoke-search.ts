@@ -97,7 +97,10 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       el.value = ${JSON.stringify(text)}
       el.dispatchEvent(new Event('input', { bubbles: true }))
     })()`)
-    await sleep(420) // 300ms 防抖 + 一次查询
+    // ⚠️ 这里原来是 `await sleep(420)`（「300ms 防抖 + 一次查询」的**固定**估计）——
+    // 机器一忙就不够，调用方会偶发拿到上一轮的结果（实测 `--smoke-search` 3 次里红 1 次，见 G12）。
+    // 现在**不再在打字函数里赌时间**：派发 input 后立刻返回，
+    // 由每个调用点用自己的 `waitUntil` 等「该关键词对应的 DOM 真的变了」再抓快照（见 G 段）。
   }
   /** 当前画廊里渲染出来的卡片文件名 */
   const cardNames = async (): Promise<string[]> =>
@@ -268,8 +271,17 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     step('G-UI')
     await sleep(200)
 
+    // ⚠️ G 段连调 4 次搜索、每次都要等「该关键词对应的 DOM 真的变了」再抓快照（G4/G12）。
+    // 原来只有空态那一步等到位，前三次是「打字后立即抓」→ 抢跑会一次抓取级联红 6 条。
+    // 每一步都把 `waitUntil` 的返回值并入该步的断言：**超时必须能红**，不能只靠后面的快照兜底（G11）。
+
+    // '100%'：唯一命中 100%.png —— 等卡片集合真的变成它
     await typeSearch('100%')
+    const gSearchReady = await waitUntil(
+      "document.querySelectorAll('.masonry-card').length === 1 && document.querySelector('.masonry-card .ci-name')?.textContent?.trim() === '100%.png'"
+    )
     R.gSearch = {
+      ready: gSearchReady,
       cards: await cardNames(),
       total: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
       clearChip: await js(`document.querySelector('.chip-clear')?.getAttribute('data-count') ?? null`)
@@ -277,16 +289,26 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     await capture('shot-search-keyword.png')
 
     // 高亮：命中片段被包成 <mark>，且内容就是关键词本身
+    // —— 等「高亮片段」真的出现（不是等某个倒计时）
     await typeSearch('红色')
+    const gHighlightReady = await waitUntil(
+      "[...document.querySelectorAll('.masonry-card .ci-name mark')].map((m) => m.textContent).join('|') === '红色'"
+    )
     R.g_highlight = {
+      ready: gHighlightReady,
       marks: await js(`[...document.querySelectorAll('.masonry-card .ci-name mark')].map(m => m.textContent)`),
       fullName: await js(`document.querySelector('.masonry-card .ci-name')?.textContent ?? null`),
       rawHTML: await js(`document.querySelector('.masonry-card .ci-name')?.innerHTML ?? null`)
     }
 
     // HTML 转义：文件名 x&amp;y.png 必须逐字显示，不能被解析成 x&y.png
+    // —— 等「那个带实体的文件名」真的出现在卡片列表里
     await typeSearch('y.png')
+    const gEscapeReady = await waitUntil(
+      "[...document.querySelectorAll('.masonry-card .ci-name')].map((e) => e.textContent).includes('x&amp;y.png')"
+    )
     R.g_escape = {
+      ready: gEscapeReady,
       text: await js(`[...document.querySelectorAll('.masonry-card .ci-name')].map(e => e.textContent)`),
       // 转义正确时 DOM 里只有一个文本节点，不会凭空多出元素
       childElements: await js(
@@ -309,10 +331,14 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     }
 
     // 清除筛选：列表恢复全量、搜索框同步清空、清除按钮消失
-    // （可选链 + 吞掉返回值：万一没等到也让它走断言去报红，别在这里抛异常把后续整片带崩）
+    // 原来固定 sleep(500) 等它生效 —— Round 1 注入验证时这一步的 4 条断言正是「同一次抓取的级联红」。
+    // 改成有界轮询「列表回到 11 项 + 搜索框清空 + 清除按钮消失」，并把结果并入断言（超时→明确红）。
     await js(`document.querySelector('.empty .w-btn')?.click(); true`)
-    await sleep(500)
+    const gClearedReady = await waitUntil(
+      "document.querySelectorAll('.masonry-card').length === 11 && document.querySelector('.search-input')?.value === '' && !document.querySelector('.chip-clear')"
+    )
     R.g_cleared = {
+      ready: gClearedReady,
       count: (await cardNames()).length,
       total: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
       searchValue: await js(`document.querySelector('.search-input')?.value ?? null`),
@@ -471,10 +497,17 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     const d = R.d_combo as Record<string, { total: number; names: string[] }>
     const e = R.e_sort as Record<string, unknown>
     const f = R.f_page as Record<string, unknown>
-    const gHl = R.g_highlight as { marks: string[] | null; fullName: string | null; rawHTML: string | null }
-    const gEs = R.g_escape as { text: string[] | null; childElements: number[] | null }
+    const gHl = R.g_highlight as { ready: boolean; marks: string[] | null; fullName: string | null; rawHTML: string | null }
+    const gEs = R.g_escape as { ready: boolean; text: string[] | null; childElements: number[] | null }
     const gEm = R.g_empty as { ready: boolean; items: number; text: string | null; clearBtn: string | null }
-    const gCl = R.g_cleared as { count: number; total: string | null; searchValue: string | null; clearChipGone: boolean }
+    const gCl = R.g_cleared as {
+      ready: boolean
+      count: number
+      total: string | null
+      searchValue: string | null
+      clearChipGone: boolean
+    }
+    const gSe = R.gSearch as { ready: boolean; cards: string[] | null; total: string | null; clearChip: string | null }
     const hTm = R.h_typeMenu as { items: string[] | null; active: string | null }
     const hIc = R.h_iconOnly as {
       chips: Array<{ key: string; text?: string; svgCount?: number; w?: number; h?: number; iconW?: number; missing?: boolean }>
@@ -548,19 +581,18 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
         (f?.p3Count as number) === 3 && (f?.p1p2Overlap as number) === 0,
       pageWalksAll: f?.walkedCoversAll === true,
 
-      // G UI 搜索
-      uiSearchResult: (R.gSearch as { cards: string[] })?.cards?.length === 1 &&
-        (R.gSearch as { cards: string[] }).cards[0] === '100%.png',
-      uiSearchCount: (R.gSearch as { total: string | null })?.total?.includes('/') === true,
-      uiClearChipShown: (R.gSearch as { clearChip: string | null })?.clearChip === '1',
+      // G UI 搜索（`ready` 是防假绿的闸门：没等到「该关键词对应的结果」就不算通过 —— 见 G11）
+      uiSearchResult: gSe?.ready === true && gSe?.cards?.length === 1 && gSe?.cards?.[0] === '100%.png',
+      uiSearchCount: gSe?.ready === true && gSe?.total?.includes('/') === true,
+      uiClearChipShown: gSe?.ready === true && gSe?.clearChip === '1',
 
-      // G 高亮（关键词被包成 mark，且文本就是关键词）
-      highlightMarks: Array.isArray(gHl?.marks) && gHl.marks.length === 1 && gHl.marks[0] === '红色',
+      // G 高亮（关键词被包成 mark，且文本就是关键词）；`ready` 同上，超时必须红
+      highlightMarks: gHl?.ready === true && Array.isArray(gHl?.marks) && gHl.marks.length === 1 && gHl.marks[0] === '红色',
       highlightKeepsFullName: gHl?.fullName === '红色风景.png',
       highlightHTMLWellFormed: typeof gHl?.rawHTML === 'string' && /^<mark>红色<\/mark>风景\.png$/.test(gHl.rawHTML),
 
-      // G HTML 转义（文件名里的 &amp; 必须逐字显示，不能被解析成 &）
-      escapeEntityPreserved: Array.isArray(gEs?.text) && gEs.text.includes('x&amp;y.png'),
+      // G HTML 转义（文件名里的 &amp; 必须逐字显示，不能被解析成 &）；`ready` 同上
+      escapeEntityPreserved: gEs?.ready === true && Array.isArray(gEs?.text) && gEs.text.includes('x&amp;y.png'),
       escapeNoInjectedNodes: Array.isArray(gEs?.childElements) && gEs.childElements.every((n) => n <= 1),
 
       // G 空态：文案要指向「筛选」而不是「去导入」
@@ -570,10 +602,11 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       emptyHasClearButton: gEm?.ready === true && (gEm?.clearBtn ?? '').includes('清除筛选'),
 
       // G 清除筛选：列表恢复、搜索框同步清空、按钮消失、分母回归「个文件」
-      clearRestoresAll: gCl?.count === 11,
-      clearSyncsSearchBox: gCl?.searchValue === '',
-      clearHidesChip: gCl?.clearChipGone === true,
-      clearCountLabel: /个文件/.test(gCl?.total ?? '') && !/\//.test(gCl?.total ?? ''),
+      // （`ready` = 「清除筛选已生效」这一步的轮询结果，防假绿闸门，见 G11：超时→这几条明确红）
+      clearRestoresAll: gCl?.ready === true && gCl?.count === 11,
+      clearSyncsSearchBox: gCl?.ready === true && gCl?.searchValue === '',
+      clearHidesChip: gCl?.ready === true && gCl?.clearChipGone === true,
+      clearCountLabel: gCl?.ready === true && /个文件/.test(gCl?.total ?? '') && !/\//.test(gCl?.total ?? ''),
 
       // H0 芯片形态：评分/喜欢/类型/排序四个芯片必须是「纯图标」——
       // 无文字节点、恰好一个 svg、32×32 方形（比原来的 26 高文字芯片大）、图标 17px
