@@ -25,12 +25,12 @@
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
 import { app, BrowserWindow, dialog } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 import sharp from 'sharp'
 import { closeCurrent, createLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
-import { importFiles } from './importer'
+import { importFiles, type ImportResult } from './importer'
 import { ensureBatch } from './thumbs'
 import { cacheStats, clearCache } from './cache'
 import { deriveFor } from './preview'
@@ -789,10 +789,21 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await new Promise((r) => setTimeout(r, 300))
       check('S9 「按内容去重」已恢复成开', diskSettings().importing.dedupe === true)
       const beforeSkip = names().length
-      await js(`window.stash.import.files({ paths: [${JSON.stringify(copySrc)}], folderId: ${folder.id} })`)
-      await new Promise((r) => setTimeout(r, 1500))
-      check('S9 打开去重后，同一文件被跳过（没有多出素材）', names().length === beforeSkip,
-        `${beforeSkip} → ${names().length}`)
+      // 正对照（铁律 G9）：把这次导入的 `ImportResult` 抓回来 —— 它是「这一步确实跑了、且确实被判定为
+      // 按内容重复而**跳过**」的独立证据（`added`/`skipped` 由主进程现场统计）。
+      // 原断言只断「没多出素材」，而「什么都没发生」在那次导入**压根没跑 / 整条失败**时同样成立
+      // → 是纯负向、无鉴别力的空转断言（G9）。把正对照并进同一条断言，顺便把固定 sleep 换成有界等待（铁律 G4）：
+      // 监听 `import:done`（正常必达），8s 兜底超时；拿不到 → `skipRes=null` → 断言红，绝不赌时长。
+      const skipRes = await js<ImportResult>(
+        'new Promise((resolve) => {' +
+          'const to = setTimeout(() => { off(); resolve(null) }, 8000);' +
+          'const off = window.stash.import.onDone((d) => { clearTimeout(to); off(); resolve(d) });' +
+          `window.stash.import.files({ paths: [${JSON.stringify(copySrc)}], folderId: ${folder.id} });` +
+          '})'
+      )
+      check('S9 打开去重后，同一文件被跳过（没有多出素材）',
+        names().length === beforeSkip && skipRes?.skipped === 1 && skipRes?.added === 0,
+        `${beforeSkip} → ${names().length}｜ImportResult=${JSON.stringify(skipRes)}`)
 
       // —— 色板：关掉之后新导入的图片不该再回写色板 ——
       // 色板是缩略图生成时顺带回写的，所以要等它的 grid 缩略图出来再看，
@@ -951,7 +962,55 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       const sumAssets = q<{ c: number }>('SELECT coalesce(sum(size),0) AS c FROM assets WHERE missing=0').c
       check('S11b 服务层：素材占用 = 索引里有效素材 size 之和', u1.assetsBytes === sumAssets,
         `${u1.assetsBytes} vs ${sumAssets}`)
-      check('S11b 服务层：总计 = 素材 + 缓存', u1.totalBytes === u1.assetsBytes + u1.thumbsBytes, JSON.stringify(u1))
+
+      // 显式前置（铁律 G11 形态②/③）：证明「素材占用」与「缓存占用」两边都 > 0，
+      // 否则下面的磁盘比对会退化成 `0 === 0` 式空转（什么都不验也绿）。
+      check('S11b 前置：素材占用与缓存占用都 > 0（否则「缓存 == 磁盘实扫」会退化成 0===0 空转）',
+        u1.assetsBytes > 0 && u1.thumbsBytes > 0,
+        `assetsBytes=${u1.assetsBytes} thumbsBytes=${u1.thumbsBytes}`)
+
+      // 独立口径（铁律 G11：判据不得复用被测实现 —— 这里**自写**一遍，不 import 产线的 `thumbsDirBytes()`）。
+      // 原断言 `u1.totalBytes === u1.assetsBytes + u1.thumbsBytes` 是**定义式恒等式**：`totalBytes` 在主进程里
+      // 就是这么加出来的（health.ts:91），把「定义」重念一遍 → 恒真，`thumbsDirBytes()` 整个漏算也照样绿。
+      // 换成「与独立实现逐字节比对」才有鉴别力。
+      //
+      // ⚠️ **口径必须与产线严格一致**（否则这条断言会比产线更严 → 只会**假红**、不会假绿）：
+      //   · 产线把 `.thumbs` 的每个顶层项**当作目录**去 `readdirSync`：顶层若是**文件**
+      //     （如 `placeholder-{audio|text}.webp`、生成期的顶层 `*.tmp`）→ ENOTDIR → `continue` → **不计**；
+      //   · 只在 `.thumbs/{hash}/` 这一层累加 `statSync(...).size`，**不再往下递归**（更深项只取其目录自身 size）。
+      //   → 所以这里也严格照此口径：只对「能作为目录读出的顶层项」取其**直接子项**的 stat size；**顶层文件跳过、不递归**。
+      //     （QA 实测复刻：旧的递归实现会把顶层占位图算进去 → 一旦库里有音频/文本素材就假红。）
+      const thumbsDirBytesSameScope = (root: string): number => {
+        let tops: Dirent[]
+        try {
+          tops = readdirSync(root, { withFileTypes: true })
+        } catch {
+          return 0 // 还没生成过任何缩略图（与产线语义一致）
+        }
+        let total = 0
+        for (const t of tops) {
+          if (!t.isDirectory()) continue // 顶层文件（占位图 / 临时文件）不计 —— 与产线口径一致
+          const dir = join(root, t.name)
+          let files: string[]
+          try {
+            files = readdirSync(dir)
+          } catch {
+            continue
+          }
+          for (const f of files) {
+            try {
+              total += statSync(join(dir, f)).size
+            } catch {
+              /* 正被写入 / 刚被清理 → 跳过 */
+            }
+          }
+        }
+        return total
+      }
+      const thumbsWalked = thumbsDirBytesSameScope(join(lib.path, '.thumbs'))
+      check('S11b 服务层：缓存占用 == 独立实现（与产线同口径）实扫 .thumbs 的字节数（改前比的是 total==assets+thumbs 定义式恒等式，恒真无鉴别力）',
+        u1.thumbsBytes === thumbsWalked,
+        `产线 thumbsBytes=${u1.thumbsBytes} 独立实扫=${thumbsWalked}`)
 
       // 往 .thumbs 里塞 4KB 再读一次：数值必须跟着涨（证明不是写死的常量/缓存）
       const probeHash = join(lib.path, '.thumbs', 'zz-probe-usage')

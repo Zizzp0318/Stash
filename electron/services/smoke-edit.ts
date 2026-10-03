@@ -761,6 +761,7 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     // 原来固定 sleep(3000) 等「reload 后网格渲染完」—— U8 的 6 条断言全靠这一步。
     // 机器一忙 3s 不够 → 夹具没撑起滚动高度 → topBtnFixtureScrollable 及其级联一起红（G12）。
     // 改成有界轮询「网格已渲染且容器**真的滚得动**（maxScroll > 300）」，上限给足 20s。
+    const u8ScrollT0 = Date.now()
     const u8ScrollReady = await waitFor(
       async () =>
         ((await js(
@@ -768,14 +769,17 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
         )) as number) > 300,
       20000
     )
+    const u8ScrollMs = Date.now() - u8ScrollT0 // 诊断：实际等了多久（只增字段，不改判据/阈值）
 
     // 先选一张：批量条要出现，才能验证「浮标让开批量条」不是空断言
     // 原来固定 sleep(700) —— 改成轮询「选中真的生效」（.masonry-card.selected 出现）
     await clickSel('.masonry-card', 0)
+    const u8SelT0 = Date.now()
     const u8SelReady = await waitFor(
       async () => ((await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number) > 0,
       8000
     )
+    const u8SelMs = Date.now() - u8SelT0 // 诊断：实际等了多久（只增字段，不改判据/阈值）
     R.u8_selected = (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
 
     // 滚到最下方（瀑布视图）
@@ -785,6 +789,7 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     // 而 `w.scrollTop = …` 是同步赋值 —— 立刻读会「滚动到了、但浮标还没渲染」→ hasBtn=false（实测踩到）。
     // 所以要等「滚动位置到位 **且** 浮标状态确定（已出现）」，上限 8s；真等不到（产线 bug）则这条轮询为 false、
     // 由 topBtnAppearsOnScroll 的闸门明确变红。
+    const u8ScrollPosT0 = Date.now()
     const u8ScrollPosReady = await waitFor(
       async () =>
         ((await js(
@@ -792,8 +797,11 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
         )) as boolean) === true,
       8000
     )
+    const u8ScrollPosMs = Date.now() - u8ScrollPosT0 // 诊断：实际等了多久（只增字段，不改判据/阈值）
     // 三步轮询的成败必须被消费：存进诊断字段，并各自并入对应断言（G11：超时必须能红）
     R.u8_ready = { scrollReady: u8ScrollReady, selReady: u8SelReady, scrollPosReady: u8ScrollPosReady }
+    // ② 诊断（只增字段，不改任何判据/阈值）：下次 U8 偶发红时，能区分「没等到（耗时≈轮询上限）」还是「等到了但值不对」。
+    R.u8_diag = { scrollMs: u8ScrollMs, selMs: u8SelMs, scrollPosMs: u8ScrollPosMs }
     R.u8_masonry = (await js(`(() => {
       const b = document.querySelector('[data-to-top]')
       const g = document.querySelector('.gallery')

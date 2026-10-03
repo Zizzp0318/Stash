@@ -341,7 +341,9 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       click(cs[0].cx, cs[0].cy, true)
       // 点卡片后先轮询「选择真的生效」（.masonry-card.selected 出现）—— 否则「点空白」这一步的前提
       // 不成立，blankClears 的红会被误判成「取消选择坏了」。原来这里是固定 sleep(300)（G12）。
+      const s11SelT0 = Date.now()
       const s11SelReady = await waitUntil("document.querySelectorAll('.masonry-card.selected').length > 0", 5000)
+      const s11SelWaitMs = Date.now() - s11SelT0 // 诊断：实际等了多久（只增字段，不改判据/阈值）
       const blankRaw = (await js(`(() => {
            const wr = document.querySelector('.grid-wrap').getBoundingClientRect()
            return JSON.stringify({ x: wr.left + 6, y: wr.top + 60 })
@@ -349,13 +351,17 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       const blankPt = (blankRaw ? JSON.parse(blankRaw) : { x: 0, y: 0 }) as { x: number; y: number }
       click(blankPt.x, blankPt.y)
       // 点空白后轮询「选择已清空 + 批量条已消失」（上限 5s）—— 原来固定 sleep(800)
+      const s11ClrT0 = Date.now()
       const s11Cleared = await waitUntil(
         "document.querySelectorAll('.masonry-card.selected').length === 0 && !document.querySelector('.batchbar')",
         5000
       )
+      const s11ClearWaitMs = Date.now() - s11ClrT0 // 诊断：实际等了多久（只增字段，不改判据/阈值）
       R.step11_blankClear = {
         selReady: s11SelReady,
+        selWaitMs: s11SelWaitMs,
         cleared: s11Cleared,
+        clearWaitMs: s11ClearWaitMs,
         selectedAfter: (await selIds()).length,
         batchbarGone: !(await js(`!!document.querySelector('.batchbar')`))
       }

@@ -1200,8 +1200,13 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         const indexed = rowsIn()
         // 独立 DB 口径：按 imported_at 时间窗计（区别于 E1 的 rel_path 计数）
         const indexedByTime = count(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '${sub}/%' AND imported_at >= ${tEnd - 60000}`)
-        check('Q3(A) 计数守恒：sum(added) 恰好 == DB 侧实际入库数（无漏计/多计，含被 maxWait 切在边界的事件）',
-          quiet && sumAdded === indexed && indexed === indexedByTime,
+        // 显式前置（铁律 G11 形态③）：`indexed > 0` 证明「真有一批文件入了库」。
+        // 否则整条事件流哑掉（watcher 又死了 / 流没造出来）时 sumAdded===indexed===indexedByTime===0
+        // 会三 0 相等地通过 —— 计数守恒根本没被验。
+        // `indexed` 来自独立 DB 口径（数该前缀下的行数），与事件的 sumAdded 是两条独立来源，
+        // 正是「这批文件真的进了库」的证据，而不是「把自己算出来的数跟自己比」。
+        check('Q3(A) 计数守恒：sum(added) 恰好 == DB 侧实际入库数（无漏计/多计，含被 maxWait 切在边界的事件；且 indexed>0 防整条流哑掉时 0==0==0 空转）',
+          quiet && indexed > 0 && sumAdded === indexed && indexed === indexedByTime,
           `sumAdded=${sumAdded} indexed=${indexed} indexedByTime=${indexedByTime} N=${N} sumChanged=${sumChanged} batches=${JSON.stringify(ext.map((e) => ({ a: e.added, c: e.changed, r: e.removed, p: e.partial })))}`)
         console.log('[QA-Q3] ' + JSON.stringify({ tEnd, sumAdded, indexed, indexedByTime, N, sumChanged, batches: ext.length }))
       }
@@ -1209,8 +1214,13 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       // ---------- Q4：B 质疑 —— 零计数非 partial flush 在真实场景是否会发生 ----------
       {
         const zeroNonPartial = allExt.filter((e) => !e.partial && e.added === 0 && e.changed === 0 && e.removed === 0)
+        const termCount = allExt.filter((e) => !e.partial).length
+        // 正对照（铁律 G9）：先证明「本次确实捕获到过广播」——至少 1 条，且其中含 ≥1 条 partial=false 的收尾。
+        // 否则「没观测到『零计数非 partial』那条」在**压根没观测到任何广播**（流整条哑掉 / 记录器坏了）时也成立，
+        // 是纯负向、无鉴别力的空转断言。`termCount >= 1` 是必需的：allExt 可能只含 partial 中途 flush。
         check('Q4(B) 全程未观测到「零计数非 partial」广播（flush-before-add 下安全网不可达；若真出现会白触发一次 bumpThumbs）',
-          zeroNonPartial.length === 0, `scanned=${allExt.length} zeroNonPartial=${zeroNonPartial.length} ${JSON.stringify(zeroNonPartial)}`)
+          allExt.length > 0 && termCount >= 1 && zeroNonPartial.length === 0,
+          `scanned=${allExt.length} terminals=${termCount} zeroNonPartial=${zeroNonPartial.length} ${JSON.stringify(zeroNonPartial)}`)
       }
 
       // ---------- Q5：C 质疑 —— 末次 maxWait flush 后流立刻停 → 收尾必须带剩余计数 ----------
