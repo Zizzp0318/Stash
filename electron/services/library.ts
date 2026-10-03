@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, renameSync, rmSync } from 'fs'
 import { join, dirname, basename, relative, isAbsolute, resolve } from 'path'
 import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
+import { subtreeOfPath, validateName } from './paths'
 
 let current: { db: DB; path: string } | null = null
 
@@ -114,24 +115,14 @@ export function deleteLibrary(target: string): void {
 
 // —— 文件夹（与库目录真实文件夹 1:1）——
 
-const BAD_NAME_CHARS = /[\\/:*?"<>|]/
-/** Windows 保留设备名（CON、NUL、COM1…）无法作为目录名 */
-const RESERVED_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i
-
 /**
- * 校验文件夹名。拒绝三类：
- * 1. 空 / `.` / `..` / 路径分隔符等文件系统非法字符 / Windows 保留设备名
- * 2. 结尾是「点或空格」——Windows 会静默裁掉，导致磁盘目录名与索引 path 不一致
- * 3. 名称里带 `/` 或 `\`（防止用重命名把文件夹「搬」到别处）
+ * 校验文件夹名。规则与素材名**完全同一套**（空 / `.` / `..` / 非法字符 / 保留设备名 /
+ * 以点或空格结尾 —— 末者 Windows 会静默裁掉，导致磁盘目录名与索引 path 不一致），
+ * 实现下沉到 `paths.ts` 的 `validateName`。审计 §2.16：此前两处各写一份、连常量都各维护一份，
+ * 是「改一处漏一处 → 两个入口行为不一致」的温床。
  */
 export function validateFolderName(raw: string): string {
-  const name = (raw ?? '').trim()
-  if (!name) throw new Error('ERR_EMPTY_NAME')
-  if (name === '.' || name === '..') throw new Error('ERR_INVALID_NAME')
-  if (BAD_NAME_CHARS.test(name)) throw new Error('ERR_INVALID_NAME')
-  if (RESERVED_NAMES.test(name)) throw new Error('ERR_INVALID_NAME')
-  if (/[. ]$/.test(name)) throw new Error('ERR_INVALID_NAME')
-  return name
+  return validateName(raw)
 }
 
 /**
@@ -148,13 +139,12 @@ function resolveInLib(libPath: string, relPath: string): string {
 
 /**
  * 取某文件夹及其整棵子树的 folders 行。
- * 直接用内存里的 path 前缀比较（我们自己规范化的 `a/b` 形式），
- * 不用 SQL LIKE —— 文件夹名里含 `_` / `%` 时 LIKE 会误匹配。
+ * 过滤规则共用 `paths.ts` 的 `subtreeOfPath`（与 `assets.ts` 的 `subtreeIds` 同一份，审计 §2.16）：
+ * 内存 path 前缀比较，不用 SQL LIKE —— 文件夹名里含 `_` / `%` 时 LIKE 会误匹配。
  */
 function subtreeRows(db: DB, rootPath: string): Array<{ id: number; path: string }> {
   const all = db.prepare('SELECT id, path FROM folders').all() as Array<{ id: number; path: string }>
-  const prefix = rootPath + '/'
-  return all.filter((f) => f.path === rootPath || f.path.startsWith(prefix))
+  return subtreeOfPath(all, rootPath)
 }
 
 /** 在库内创建真实目录并同步索引，relPath 用 / 分隔 */

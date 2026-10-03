@@ -1,15 +1,11 @@
 import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 'fs'
-import { extname, isAbsolute, join, relative } from 'path'
+import { extname, isAbsolute, join } from 'path'
 import { shell } from 'electron'
 import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
 import { importFiles } from './importer'
 import { uniqueName } from './naming'
+import { relFromLib, subtreeOfPath, toRel, validateName } from './paths'
 import type { DB } from './db'
-
-/** 拼接库内相对路径（统一用 / 分隔） */
-function toRel(...segs: string[]): string {
-  return segs.filter(Boolean).join('/')
-}
 
 export interface AssetQuery {
   folderId?: number | null
@@ -59,8 +55,8 @@ function subtreeIds(db: DB, rootId: number): number[] {
   const all = db.prepare('SELECT id, path FROM folders').all() as Array<{ id: number; path: string }>
   const root = all.find((f) => f.id === rootId)
   if (!root) return [rootId]
-  const prefix = root.path + '/'
-  return all.filter((f) => f.path === root.path || f.path.startsWith(prefix)).map((f) => f.id)
+  // 过滤规则与 `library.subtreeRows` 共用同一份（审计 §2.16）
+  return subtreeOfPath(all, root.path).map((f) => f.id)
 }
 
 export function listAssets(q: AssetQuery): { total: number; items: unknown[] } {
@@ -185,24 +181,9 @@ export interface BulkFail {
   error: string
 }
 
-const BAD_FILE_CHARS = /[\\/:*?"<>|]/
-/** Windows 保留设备名当文件名同样会翻车（`CON.png` 这类一并拦掉） */
-const RESERVED_FILE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i
-
-/**
- * 校验素材文件名。比文件夹名宽松一点（允许中间的点），但四类必须拦：
- * 空、`. / ..`、非法字符与保留设备名、以点或空格结尾（Windows 会静默裁掉）。
- * 路径分隔符也在非法字符里，防止用重命名把文件「搬」到别的目录。
- */
-function validateAssetName(raw: string): string {
-  const name = (raw ?? '').trim()
-  if (!name) throw new Error('ERR_EMPTY_NAME')
-  if (name === '.' || name === '..') throw new Error('ERR_INVALID_NAME')
-  if (BAD_FILE_CHARS.test(name)) throw new Error('ERR_INVALID_NAME')
-  if (RESERVED_FILE_NAMES.test(name)) throw new Error('ERR_INVALID_NAME')
-  if (/[. ]$/.test(name)) throw new Error('ERR_INVALID_NAME')
-  return name
-}
+// 素材文件名的校验规则见 `paths.ts` 的 `validateName`（⚠️ 与文件夹名**本同一套规则**：
+// 空 / `.` / `..` / 非法字符与保留设备名 / 以点或空格结尾。旧注释写的「比文件夹名宽松一点」
+// 与实现不符 —— 两侧代码逐行相同。审计 §2.16 已收敛）。
 
 /** `renameAsset` 的结果；`renamedFrom` 非空表示「想要的名字被占了，自动换了一个」 */
 export interface RenameResult {
@@ -232,7 +213,7 @@ export function renameAsset(id: number, rawName: string): RenameResult {
     | undefined
   if (!row) throw new Error('ERR_ASSET_NOT_FOUND')
 
-  const wanted = validateAssetName(rawName)
+  const wanted = validateName(rawName)
   // 名字完全没变 → 什么都不做（连一次多余的磁盘操作都不做）
   if (wanted === row.name) return { id, name: row.name, rel_path: row.rel_path, renamedFrom: null }
 
@@ -440,7 +421,7 @@ export function pastePaths(
   const findRel = db.prepare('SELECT id FROM assets WHERE LOWER(rel_path)=LOWER(?)')
 
   for (const p of paths) {
-    const rel = relative(libPath, p).replace(/\\/g, '/')
+    const rel = relFromLib(libPath, p)
     // 库外路径：relative 返回 `..\xxx`（同盘）或直接回绝对路径（跨盘），两种都要挡住
     const inLib = !!rel && !rel.startsWith('..') && !isAbsolute(rel)
     const row = inLib ? (findRel.get(rel) as { id: number } | undefined) : undefined

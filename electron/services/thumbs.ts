@@ -9,6 +9,7 @@ import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
+import { relFromLib } from './paths'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
@@ -108,7 +109,7 @@ function renameTmp(tmp: string, out: string): void {
 /** ffmpeg 截帧：取 10% 处（不足 1s 取 0s），同时把时长/分辨率写回 assets */
 function extractFrame(abs: string, outPng: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const { db } = requireCurrent()
+    const { db, path: libPath } = requireCurrent()
     // 先跑一次 -i 探测元信息（ffmpeg 打印在 stderr）
     probe(abs)
       .then((info) => {
@@ -119,7 +120,7 @@ function extractFrame(abs: string, outPng: string): Promise<void> {
           if (code === 0 && existsSync(outPng)) {
             // 元信息回写（首次）
             db.prepare('UPDATE assets SET duration_ms=?, width=?, height=? WHERE rel_path=? AND duration_ms IS NULL')
-              .run(Math.round(info.durationMs), info.width, info.height, relOf(abs))
+              .run(Math.round(info.durationMs), info.width, info.height, relFromLib(libPath, abs))
             resolve()
           } else reject(new Error(`ffmpeg exit ${code}`))
         })
@@ -149,11 +150,6 @@ function probe(abs: string): Promise<ProbeInfo> {
     })
     p.on('error', reject)
   })
-}
-
-function relOf(abs: string): string {
-  const libPath = requireCurrent().path
-  return abs.slice(libPath.length + 1).replace(/\\/g, '/')
 }
 
 // —— 占位图（音频/文本）：按类型生成一次，内存缓存 ——

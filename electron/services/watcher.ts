@@ -5,6 +5,7 @@ import { BrowserWindow } from 'electron'
 import { contentHash, EXT_TYPE } from './importer'
 import { ensureFolderRows, mkdirRel } from './library'
 import { uniqueName } from './naming'
+import { relFromLib } from './paths'
 import type { DB } from './db'
 
 let watcher: FSWatcher | null = null
@@ -209,13 +210,9 @@ export function watchLibrary(libPath: string, db: DB): void {
     awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 100 }
   })
 
-  function relOf(abs: string): string {
-    return relative(libPath, abs).replace(/\\/g, '/')
-  }
-
   watcher.on('add', (abs: string) => {
     try {
-      let rel = relOf(abs)
+      let rel = relFromLib(libPath, abs)
       // 我们自己刚放进来的（压缩替换）→ 索引已经改好了，别再插一行重复素材
       if (consumeSuppressed(rel)) return
       // 索引里已有该 rel_path → 不重复插行。
@@ -280,7 +277,7 @@ export function watchLibrary(libPath: string, db: DB): void {
 
   const markMissing = (abs: string) => {
     try {
-      const rel = relOf(abs)
+      const rel = relFromLib(libPath, abs)
       // 旧文件是我们自己删的（压缩替换完成），别把已经改好的那行标成 missing
       if (consumeSuppressed(rel)) return
       // `AND missing=0` 让「标失效」幂等：整目录被删时 chokidar 会**同时**发 unlinkDir（目录）
@@ -303,7 +300,7 @@ export function watchLibrary(libPath: string, db: DB): void {
       // 同样 `AND missing=0`：与 markMissing 一起保证「unlinkDir + 逐文件 unlink」不会被双计（详见 markMissing）
       const info = db
         .prepare('UPDATE assets SET missing=1 WHERE rel_path LIKE ? AND missing=0')
-        .run(relOf(abs) + '/%')
+        .run(relFromLib(libPath, abs) + '/%')
       // 整目录被删会一次标到 N 行 → removed 计 N（提示条上的「删除 N 个」才说得通）
       if (Number(info.changes) > 0) bumpExternal('removed', Number(info.changes))
     } catch {
@@ -327,7 +324,7 @@ export function watchLibrary(libPath: string, db: DB): void {
    */
   const syncChanged = (abs: string) => {
     try {
-      const rel = relOf(abs)
+      const rel = relFromLib(libPath, abs)
       // 我们自己刚写完的（压缩原地替换走 rename；文本编辑走 preview 的写回落库）→ 索引已改好
       if (consumeSuppressed(rel)) return
 

@@ -5,6 +5,7 @@ import { BrowserWindow } from 'electron'
 import { requireCurrent, mkdirRel } from './library'
 import { getSettings } from './config'
 import { uniqueName } from './naming'
+import { toRel } from './paths'
 import type { DB } from './db'
 
 export type AssetType = 'image' | 'video' | 'audio' | 'text'
@@ -32,10 +33,6 @@ export function contentHash(file: string): string {
   } finally {
     closeSync(fd)
   }
-}
-
-function toRel(...segs: string[]): string {
-  return segs.filter(Boolean).join('/')
 }
 
 export interface ImportArgs {
