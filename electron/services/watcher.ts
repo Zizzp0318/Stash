@@ -1,4 +1,4 @@
-import chokidar from 'chokidar'
+import chokidar, { type FSWatcher } from 'chokidar'
 import { basename, extname, join, relative } from 'path'
 import { renameSync, rmSync, statSync } from 'fs'
 import { BrowserWindow } from 'electron'
@@ -7,7 +7,7 @@ import { ensureFolderRows, mkdirRel } from './library'
 import { uniqueName } from './naming'
 import type { DB } from './db'
 
-let watcher: chokidar.FSWatcher | null = null
+let watcher: FSWatcher | null = null
 
 /** 压缩管线写的临时文件前缀（同目录、同盘，见 compress.ts 的 tmpPathFor） */
 const TMP_PREFIX = '.stash-compress-'
@@ -213,7 +213,7 @@ export function watchLibrary(libPath: string, db: DB): void {
     return relative(libPath, abs).replace(/\\/g, '/')
   }
 
-  watcher.on('add', (abs) => {
+  watcher.on('add', (abs: string) => {
     try {
       let rel = relOf(abs)
       // 我们自己刚放进来的（压缩替换）→ 索引已经改好了，别再插一行重复素材

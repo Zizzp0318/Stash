@@ -5,6 +5,21 @@
 // 本次把 4 套（preview / edit / folder / m4）的固定 `sleep` 改成有界轮询时，
 // 统一从这里取，避免出现第 8 份拷贝。
 
+import type { MouseInputEvent } from 'electron'
+
+/**
+ * `sendInputEvent` 的 `modifiers` 形参类型（`MouseInputEvent['modifiers']`）。
+ *
+ * 为什么要单独拎出来：`modifiers` 是**收窄的字符串联合**，直接传 `string[]` 会 TS2322；
+ * 而把它写成 `string[]` 又会丢掉「只允许约定的修饰键名」这层校验。
+ *
+ * ⚠️ 大小写（实测过，别再猜）：官方 d.ts 的联合里**只有小写**（`leftbuttondown` / `isautorepeat` …），
+ * 但 Electron 运行时**大小写都认** —— 探针 `.workbuddy/audit/probe-mods.js` 用 camelCase
+ * (`leftButtonDown`) 与小写 (`leftbuttondown`) 各发一次 `mouseMove`，渲染层两次都拿到 `buttons===1`；
+ * `control` 与 `ctrl` 亦等价。故本项目统一按**官方小写**书写：纯对齐类型，运行行为不变。
+ */
+export type InputModifiers = NonNullable<MouseInputEvent['modifiers']>
+
 /** 渲染层求值器：把一段 JS 表达式丢进页面里求值（与各套件的 `js(code)` 同形）。 */
 export type JsEval = (code: string) => Promise<unknown>
 

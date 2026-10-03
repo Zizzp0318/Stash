@@ -45,9 +45,11 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     rendererLogs.push(message.slice(0, 300))
     if (rendererLogs.length > 40) rendererLogs.shift()
   })
-  const js = async (code: string): Promise<unknown> => {
+  // 泛型化：调用点可写 `js<boolean>(expr)` 拿到收窄类型（与 smoke-watch 的 js 同形）。
+  // 默认 `T = unknown` → 既有的 `await js(...)` 行为不变；返回 `T | null` 表示「脚本出错时是 null」。
+  const js = async <T = unknown>(code: string): Promise<T | null> => {
     try {
-      return await win.webContents.executeJavaScript(code)
+      return (await win.webContents.executeJavaScript(code)) as T
     } catch (e) {
       jsErrors.push({ code: code.replace(/\s+/g, ' ').slice(0, 160), error: String(e).slice(0, 160) })
       return null

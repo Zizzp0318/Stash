@@ -1112,7 +1112,8 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         __t: number
       }
       const drain = (): Promise<boolean> => waitUntil('Date.now()-window.__extLast>1800', 20000)
-      const extDump = (): Promise<QExt[]> => js<QExt[]>('window.__ext')
+      // ⚠️ 返回类型含 `| null`：`js<T>` 在脚本出错时返回 null（4 个调用点都写了 `?? []`，本就按可空用）。
+      const extDump = (): Promise<QExt[] | null> => js<QExt[]>('window.__ext')
       const tl = (ext: QExt[], tEnd: number): string =>
         ext.map((e) => `${e.partial ? 'P' : 'F'}@${e.__t - tEnd}a${e.added}c${e.changed}r${e.removed}`).join(' ')
       const allExt: QExt[] = []

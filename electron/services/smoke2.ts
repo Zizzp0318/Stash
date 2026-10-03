@@ -216,7 +216,7 @@ export async function runSmokeM2(): Promise<void> {
       stats.vidWH === 2 &&
       stats.audDurNull === 0 &&
       result.f3ok === true &&
-      result.cacheHitMs < 500
+      Number(result.cacheHitMs) < 500
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))
   } catch (e) {

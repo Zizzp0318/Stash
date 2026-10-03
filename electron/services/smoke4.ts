@@ -15,7 +15,7 @@ import sharp from 'sharp'
 import { closeCurrent, createLibrary, deleteLibrary, mkdirRel, requireCurrent } from './library'
 import { deleteAssets } from './assets'
 import { importFiles } from './importer'
-import { makeWaitUntil } from './smoke-util'
+import { makeWaitUntil, type InputModifiers } from './smoke-util'
 
 type Rect = { id: number; x: number; y: number; w: number; h: number; cx: number; cy: number }
 
@@ -48,13 +48,13 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
   /** 有界轮询（G4）：共享实现见 smoke-util.ts —— 超时返回 false，调用方必须把结果并入断言/诊断 */
   const waitUntil = makeWaitUntil(js)
   const click = (x: number, y: number, ctrl = false): void => {
-    const m = ctrl ? ['control'] : []
+    const m: InputModifiers = ctrl ? ['control'] : []
     win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(x), y: Math.round(y), modifiers: m })
     win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1, modifiers: m })
     win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1, modifiers: m })
   }
   const drag = (x1: number, y1: number, x2: number, y2: number, ctrl = false): void => {
-    const m = ctrl ? ['control'] : []
+    const m: InputModifiers = ctrl ? ['control'] : []
     win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(x1), y: Math.round(y1), modifiers: m })
     win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(x1), y: Math.round(y1), button: 'left', clickCount: 1, modifiers: m })
     // 分步移动，确保超过拖拽阈值并触发多次 mousemove

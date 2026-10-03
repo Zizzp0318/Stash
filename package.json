@@ -10,6 +10,7 @@
     "predev": "node scripts/clean-vite-tmp.mjs",
     "build": "electron-vite build",
     "postbuild": "node scripts/clean-vite-tmp.mjs",
+    "typecheck": "tsc --noEmit",
     "start": "electron-vite preview",
     "icon": "node scripts/make-icon.mjs",
     "clean:build": "node scripts/clean-build.mjs",

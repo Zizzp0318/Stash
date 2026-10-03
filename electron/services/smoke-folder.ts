@@ -9,7 +9,7 @@ import { closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, r
 import { createTag, setTags } from './assets'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
-import { makeWaitUntil } from './smoke-util'
+import { makeWaitUntil, type InputModifiers } from './smoke-util'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -235,7 +235,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const openCtx = async (path: string): Promise<string> => {
       const p = await rowAt(path)
       if (!p) return 'ROW_NOT_FOUND'
-      const m = []
+      const m: InputModifiers = []
       win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(p.x), y: Math.round(p.y), modifiers: m })
       win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(p.x), y: Math.round(p.y), button: 'right', clickCount: 1, modifiers: m })
       win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(p.x), y: Math.round(p.y), button: 'right', clickCount: 1, modifiers: m })
@@ -449,8 +449,8 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       to: { x: number; y: number },
       opts: { ctrl?: boolean; midway?: () => Promise<unknown>; feedback?: string } = {}
     ): Promise<boolean> => {
-      const downMods = opts.ctrl ? ['control'] : []
-      const moveMods = opts.ctrl ? ['leftButtonDown', 'control'] : ['leftButtonDown']
+      const downMods: InputModifiers = opts.ctrl ? ['control'] : []
+      const moveMods: InputModifiers = opts.ctrl ? ['leftbuttondown', 'control'] : ['leftbuttondown']
       const at = (t: number): { x: number; y: number } => ({
         x: Math.round(from.x + (to.x - from.x) * t),
         y: Math.round(from.y + (to.y - from.y) * t)
@@ -674,7 +674,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       sidebarUi: (await sidebarCounts())['对照'] ?? -1,
       direct: kDirect['对照'] ?? 0,
       treeTotal: kSubtree['对照'] ?? -1,
-      total: parseTotal(await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)),
+      total: parseTotal((await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)) as string | null),
       totalText: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)
     }
     await capture('shot-folder-recursive.png')
@@ -686,7 +686,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     await sleep(900)
     R.k2_filter = {
       totalText: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
-      parsed: parseTotal(await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)),
+      parsed: parseTotal((await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`)) as string | null),
       numerator: dbMatchesUnder('对照', 'png'),
       denominator: kSubtree['对照'] ?? 0
     }
