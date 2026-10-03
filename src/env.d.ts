@@ -1,11 +1,6 @@
 /// <reference types="vite/client" />
 
-declare module '*.vue' {
-  import type { DefineComponent } from 'vue'
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const component: DefineComponent<{}, {}, any>
-  export default component
-}
+// `.vue` 的模块声明在 `shims-vue.d.ts`（必须放在**非模块**的 .d.ts 里才生效，本文件含 export 是模块）。
 
 // 与 electron/preload.ts 保持同构
 export interface StashWinApi {

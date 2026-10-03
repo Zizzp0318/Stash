@@ -15,13 +15,10 @@ const lib = useLibraryStore()
 const assets = useAssetStore()
 const settings = useSettingsStore()
 
-let noticeTimer: ReturnType<typeof setTimeout> | null = null
-function setNotice(n: { kind: 'error' | 'info'; text: string }): void {
-  assets.importNotice = n
-  if (noticeTimer) clearTimeout(noticeTimer)
-  noticeTimer = setTimeout(() => (assets.importNotice = null), n.kind === 'error' ? 10000 : 5000)
-}
-
+// ⚠️ 这里**不再自带一份 `setNotice`**：它与 `assets.notify` 写的是同一个槽位
+// （`assets.importNotice`）却各持一个 timer —— 于是「本地提示刚弹出、紧接着 store 又弹一条」时，
+// 前者的 timer 不会被后者清掉，会提前把提示抹掉（`assets.notify` 只清它自己那个 timer）。
+// 统一走 store 的单槽位 timer，见 stores/assets.ts 的 notify。
 onMounted(async () => {
   // 偏好先读：网格首帧就该是用户选的视图与卡片大小，否则会先按默认排一遍再跳一下
   await settings.init()
@@ -59,7 +56,7 @@ onMounted(async () => {
     // bump 的作用是强制**已缓存**的旧 URL 重取 —— 那件事收尾做一次即可。
     // 若中途也 bump，maxWait 会把「全网格重拉缩略图」从「每批一次」放大成「长拷贝期间每 ~1.4s 一次」。
     assets.bumpThumbs()
-    // 提示只在收尾弹一次（统一走 assets.notify 单槽位 timer；别用本组件里那份重复的 setNotice，两份 timer 会打架）。
+    // 提示只在收尾弹一次（统一走 assets.notify 单槽位 timer；本组件已不再自带重复的 setNotice）。
     // 为什么不在中途弹：每次 notify 都会把 5s 自动消失的计时重置 → 提示条整段拷贝期间常驻、数字乱跳。
     if (n) assets.notify('info', `库在外部被改动了：新增 ${d.added} 个 / 修改 ${d.changed} 个 / 删除 ${d.removed} 个`)
   })
@@ -85,17 +82,14 @@ onMounted(async () => {
     if (r.failed.length) {
       // 文案统一交给 importFailedText：它会按 batch 标记区分「整批提交失败」与「逐文件失败」，
       // 不再出现「1 个文件导入失败（…本批 41 个…）」这种把整批说成单个文件的自相矛盾措辞。
-      setNotice({ kind: 'error', text: importFailedText(r.failed) ?? '导入失败' })
+      assets.notify('error', importFailedText(r.failed) ?? '导入失败')
     } else if (r.added === 0 && r.skipped === 0) {
-      setNotice({ kind: 'info', text: '没有可导入的文件（格式不支持或无有效文件）' })
+      assets.notify('info', '没有可导入的文件（格式不支持或无有效文件）')
     } else {
       // 重名被自动改名也要说出来 —— 不说的话用户只知道「新增 1 个」，
       // 却在瀑布里找不到自己那个文件名，会以为导入错了。
       const renamedNote = r.renamed ? `，${r.renamed} 个因重名已自动改名` : ''
-      setNotice({
-        kind: 'info',
-        text: `导入完成：新增 ${r.added} 个${renamedNote}${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}`
-      })
+      assets.notify('info', `导入完成：新增 ${r.added} 个${renamedNote}${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}`)
     }
   })
 })
