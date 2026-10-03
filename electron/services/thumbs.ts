@@ -10,6 +10,7 @@ import { FFMPEG } from './ffmpeg'
 import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
 import { relFromLib } from './paths'
+import { thumbSinkCondition } from './derived'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
@@ -369,10 +370,15 @@ function pump(): void {
  * 用户报的「有些图片导入进去色板读不出来，要清理并重建才行」就是这条。
  * `genmeta` 的 `backfillMeta` 早就用位标记绕过了同一个坑（见 main.ts `thumb:backfill`
  * 里那段注释），色板这条当时漏了。
+ *
+ * 「哪些字段算欠账」现由 `derived.ts` 的**派生字段注册表**派生（审计 §2.17）——
+ * 见 `thumbSinkCondition`；加派生字段只改注册表，别再手改这里的条件。
  */
 function indexFieldsSinkIds(wantPalette: boolean): Set<number> {
   const { db } = requireCurrent()
-  const cond = wantPalette ? '(width IS NULL OR palette IS NULL)' : 'width IS NULL'
+  // 欠账条件由**派生字段注册表**派生（审计 §2.17）：加派生字段别再手改这条 SQL。
+  // 开关按 F4 的约定判「开」（`!== false`）；色板关着时只剩 `width IS NULL`，与旧实现一致。
+  const cond = thumbSinkCondition({ palette: wantPalette })
   const rows = db
     .prepare(`SELECT id FROM assets WHERE missing=0 AND type='image' AND ${cond}`)
     .all() as Array<{ id: number }>

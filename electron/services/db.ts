@@ -1,6 +1,7 @@
 // 数据库连接管理 + schema 初始化
 // 驱动：node:sqlite（Electron ≥36 内置，无需 native 编译）
 import type { DatabaseSync } from 'node:sqlite'
+import { derivedAdditiveColumns } from './derived'
 
 export type DB = DatabaseSync
 
@@ -152,10 +153,9 @@ function writeSchemaVersion(db: DB): void {
  * 与版本号无关 —— 见 openDatabase 里的说明：它兜的是版本号看不出来的列级损坏。
  */
 function ensureAdditiveColumns(db: DB): void {
-  ensureColumn(db, 'assets', 'note', 'TEXT')
-  ensureColumn(db, 'assets', 'gen_meta', 'TEXT')
-  ensureColumn(db, 'assets', 'gen_state', 'INTEGER DEFAULT 0')
-  ensureColumn(db, 'assets', 'ai_source', 'TEXT')
+  // 列清单由**派生字段注册表**派生（审计 §2.17）：新增派生字段只需改 `derived.ts`，
+  // 别再手写这一串（漏一处就是「缓存命中的素材永远补不上字段」那类 B2 复发型 bug）。
+  for (const { col, decl } of derivedAdditiveColumns()) ensureColumn(db, 'assets', col, decl)
 }
 
 /**

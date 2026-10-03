@@ -4,6 +4,7 @@ import { shell } from 'electron'
 import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
 import { importFiles } from './importer'
 import { uniqueName } from './naming'
+import { derivedCopyCols } from './derived'
 import { relFromLib, subtreeOfPath, toRel, validateName } from './paths'
 import type { DB } from './db'
 
@@ -313,13 +314,17 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; re
   return { moved, renamed, failed }
 }
 
-/** 库内复制时要一起带过去的列（内容属性 + 用户标注），别漏 —— 漏了 note 就会出现「副本没有备注」 */
-const COPY_COLS = [
-  'type', 'ext', 'size', 'width', 'height', 'duration_ms', 'content_hash',
-  'rating', 'is_fav', 'palette', 'exif', 'note',
-  // 副本与原件内容一致（同一个 content_hash），生成参数当然也一样 —— 漏了就会「副本没有提示词」
-  'gen_meta', 'gen_state', 'ai_source'
-] as const
+/**
+ * 库内复制时一起带过去的**非派生**列（素材自身的内容属性 + 用户标注）。
+ *
+ * 派生字段（`width` / `palette` / `duration_ms` / `note` / `gen_meta` …）由
+ * `derivedCopyCols()` 追加 —— 注册表在 `derived.ts`，**新增派生字段不必改这里**
+ * （审计 §2.17；漏一个就会出现「副本没有备注 / 没有提示词」那类事故）。
+ */
+const INTRINSIC_COPY_COLS = ['type', 'ext', 'size', 'content_hash', 'rating', 'is_fav', 'exif']
+
+/** 复制要带的全部列 = 非派生列 + 全部派生列（SELECT 与 INSERT 共用同一顺序，故顺序无关紧要） */
+const COPY_COLS = [...INTRINSIC_COPY_COLS, ...derivedCopyCols()]
 
 /**
  * 库内复制：在目标文件夹生成一份**独立副本**（文件真拷一份，索引行新建）。

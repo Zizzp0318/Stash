@@ -11,6 +11,8 @@ import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
+import { copyAssets } from './assets'
+import { DERIVED_FIELDS, derivedCopyCols } from './derived'
 
 const IMG_N = 30
 const AUDIO_N = 8
@@ -141,6 +143,86 @@ export async function runSmokeM2(): Promise<void> {
     await awaitBatch(assets as never, 'detail')
     result.cacheHitMs = Date.now() - t1
 
+    // 8. 审计 §2.17：派生字段注册表的**跨源不变量**。
+    //    为什么必须有：B2 是「复发型」—— 加一个「生成时顺手回写」的索引字段要同步好几处，
+    //    历史上就漏过第 ⑤ 点（入队欠账条件）。下面三条都**不复用被测代码的判据**，
+    //    而是与「真实表结构 / 真实行为 / 真实复制结果」对照，漂移会变红而不是静默漏字段（铁律 G11）。
+    let d17MissingCols: string[] = []
+    let d17SinkOk = false
+    let d17CopyDiff: string[] = []
+    {
+      // ① 注册表里的每一列都必须真实存在于 assets 表（跨源：注册表 vs `PRAGMA`）
+      const tableCols = (db.prepare('PRAGMA table_info(assets)').all() as Array<{ name: string }>).map(
+        (r) => r.name
+      )
+      d17MissingCols = DERIVED_FIELDS.filter((f) => !tableCols.includes(f.col)).map((f) => f.col)
+      const cols = derivedCopyCols()
+
+      // ⚠️ 注册表与真实表结构一旦不一致，下面那些动态 SQL（`zzz IS NULL` / `SELECT zzz`）会直接抛错、
+      //    把诊断信息冲掉 → 整段包一层 try/catch，异常文本记进 copyDiff（照样红，但红得看得懂）。
+      try {
+        // ② 同步点⑤（入队欠账条件）的**行为**验证：抹掉一张图的 palette，模拟
+        //    「缩略图已缓存、但字段还是 NULL」→ 再跑一次网格批，欠账条件必须把它捞回来补写。
+        //    这正是 B2 的历史根因；把 palette 从注册表的 `sink` 里去掉，这条立刻变红。
+        const victim = db
+          .prepare("SELECT id FROM assets WHERE type='image' AND palette IS NOT NULL ORDER BY id LIMIT 1")
+          .get() as { id: number } | undefined
+        if (victim) {
+          db.prepare('UPDATE assets SET palette=NULL WHERE id=?').run(victim.id)
+          await awaitBatch(assets as never, 'grid')
+          const back = db.prepare('SELECT palette FROM assets WHERE id=?').get(victim.id) as
+            | { palette: string | null }
+            | undefined
+          d17SinkOk = back?.palette != null
+        }
+        result.d17SinkVictim = victim?.id ?? null
+
+        // ③ 同步点③（`COPY_COLS`）的**行为**验证：注册表里的每一列都必须原样带到副本上。
+        //    ⚠️ 必须**先给每个派生列塞上可辨识的值**再复制 —— 否则 `NULL === NULL` 会让「漏列」
+        //    假绿（铁律 G11 的空转形态；`note`/`gen_meta`/`ai_source` 在 m2 里本来都是空的）。
+        //    图片覆盖 width/height/palette/note/gen_state/gen_meta/ai_source，
+        //    视频再补 `duration_ms`（图片没有该项）。
+        d17CopyDiff = []
+        const cases: Array<[string, string]> = [
+          ['image', "type='image' AND palette IS NOT NULL"],
+          ['video', "type='video' AND duration_ms IS NOT NULL"]
+        ]
+        for (const [label, where] of cases) {
+          const pick = db
+            .prepare(`SELECT id FROM assets WHERE ${where} ORDER BY id LIMIT 1`)
+            .get() as { id: number } | undefined
+          if (!pick) {
+            // 显式前置：样本不存在说明夹具变了，必须红（不能静默跳过 → 空转）
+            d17CopyDiff.push(`${label}:无样本（前置不成立）`)
+            continue
+          }
+          db.prepare('UPDATE assets SET note=?, gen_meta=?, ai_source=?, gen_state=3 WHERE id=?').run(
+            `QA-${label}`,
+            '{"generator":"qa"}',
+            'qa-source',
+            pick.id
+          )
+          const srcRow = db
+            .prepare(`SELECT ${cols.join(',')} FROM assets WHERE id=?`)
+            .get(pick.id) as Record<string, unknown>
+          const cp = copyAssets([pick.id])
+          const cpRow = db
+            .prepare(`SELECT ${cols.join(',')} FROM assets ORDER BY id DESC LIMIT 1`)
+            .get() as Record<string, unknown> | undefined
+          if (cp.copied !== 1 || !cpRow) {
+            d17CopyDiff.push(`${label}:复制未发生`)
+            continue
+          }
+          for (const c of cols) {
+            if (String(srcRow[c] ?? '') !== String(cpRow[c] ?? '')) d17CopyDiff.push(`${label}.${c}`)
+          }
+        }
+      } catch (e) {
+        d17CopyDiff.push(`行为验证抛错：${String(e).slice(0, 160)}`)
+      }
+      result.d17 = { missingCols: d17MissingCols, sinkRefilled: d17SinkOk, copyDiff: d17CopyDiff, cols }
+    }
+
     // 7. F3 导入失败文案：用 **真实的** `src/utils/format.ts`（esbuild 打成 CJS 后 require）
     //    为什么打真实模块、而不是在测试里重写一份函数：重写一份就与被测代码脱钩 —— 被测代码坏了
     //    它照样绿（铁律 G11：断言不能脱离/复用被测代码）。esbuild 随 devDependencies 提供、可 require。
@@ -216,7 +298,11 @@ export async function runSmokeM2(): Promise<void> {
       stats.vidWH === 2 &&
       stats.audDurNull === 0 &&
       result.f3ok === true &&
-      Number(result.cacheHitMs) < 500
+      Number(result.cacheHitMs) < 500 &&
+      // 审计 §2.17 跨源不变量：注册表 ↔ 真实表结构 / 欠账条件行为 / 复制结果
+      d17MissingCols.length === 0 &&
+      d17SinkOk &&
+      d17CopyDiff.length === 0
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))
   } catch (e) {

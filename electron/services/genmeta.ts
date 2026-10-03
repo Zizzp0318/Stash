@@ -868,6 +868,9 @@ function broadcast(channel: string, data: unknown): void {
  * 靠「值为空」判断的话，「本来就没有元数据」的图会被**无限次重扫**；
  * 用位标记还能处理「只开了 AI 识别、后开提示词提取」—— 状态位只置了 AI 那一位，
  * 后开的那位没置，backfill 自然会把它们再捞一遍。
+ *
+ * ⚠️ 本段写回的是 `gen_meta` / `ai_source` / `gen_state` / `note` —— 它们都在
+ * `derived.ts` 的**派生字段注册表**里（审计 §2.17），新增派生字段时同步那份声明。
  */
 export async function scanAsset(job: MetaJob): Promise<void> {
   const { db, path: libPath } = requireCurrent()
