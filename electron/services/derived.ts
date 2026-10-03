@@ -37,10 +37,10 @@ export interface DerivedField {
   /**
    * 是否参与**缩略图队列的欠账条件**（`ensureBatch(…, 'grid')` 据此决定要不要重新入队）。
    *
-   * ⚠️ 判据是「缓存命中时写回仍会发生」。反例：`duration_ms` 的写回在 `extractFrame` 内，
-   * 而 `ensureOne` **命中缓存即 return**（`thumbs.ts:43`）—— 把它放进欠账条件只会白排队、
-   * 不会回写。它是**已知欠账**（与 B2 同类），要修得先让 `ensureOne` 支持
-   * 「索引字段缺 → 重新派生」，属独立改动，另行评估，别顺手塞进来。
+   * ⚠️ 判据是「**缓存命中时写回仍会发生**」。`ensureOne` 命中缓存会直接 `return`
+   * （`thumbs.ts:43`），所以凡是标 `sink: true` 的字段，都必须在**入队完成后的写回分支**
+   * 里有一条不依赖「本次真的生成了缩略图」的补写路径 —— 否则它只会白排队、不回写。
+   * 图片：`writeIndexFields`（尺寸 + 色板）；视频：`writeVideoMetaIfPending`（时长 + 分辨率）。
    */
   sink: boolean
   /** 受哪个设置控制；`undefined` = 无开关 */
@@ -72,8 +72,8 @@ export const DERIVED_FIELDS: DerivedField[] = [
     col: 'duration_ms',
     producer: 'thumb',
     types: ['video'],
-    pending: null,
-    sink: false,
+    pending: 'duration_ms IS NULL',
+    sink: true,
     addColumn: null
   },
   {
@@ -114,12 +114,31 @@ export function derivedAdditiveColumns(): Array<{ col: string; decl: string }> {
 /**
  * 缩略图队列的「欠账条件」SQL（`thumbs.ts` 的 `indexFieldsSinkIds` 由它派生）。
  *
- * 开关按 F4 的约定判「开」：`!== false`（未传 = 开）。关掉的开关对应字段不参与条件
- * —— 与旧实现一致：色板关着时只按 `width IS NULL` 判欠账。
+ * **按素材类型分组**：同一组内多个字段的 `pending` 用 `OR` 连，组间再用 `OR` 连，
+ * 每组自带类型限定。于是：
+ *   · 色板开 → `(type='image' AND (width IS NULL OR palette IS NULL)) OR (type='video' AND (duration_ms IS NULL))`
+ *   · 色板关 → `(type='image' AND (width IS NULL))                    OR (type='video' AND (duration_ms IS NULL))`
+ * 与旧实现（只查 `type='image'`）相比，图片语义**逐字未变**，新增的是视频那条欠账。
+ *
+ * 开关按 F4 的约定判「开」：`!== false`（未传 = 开）。
  */
-export function thumbSinkCondition(enabled: Partial<Record<DerivedSetting, boolean>> = {}): string {
-  const preds = DERIVED_FIELDS.filter(
-    (f) => f.sink && f.pending && (f.setting === undefined || enabled[f.setting] !== false)
-  ).map((f) => f.pending as string)
-  return `(${preds.join(' OR ')})`
+export function thumbSinkWhere(enabled: Partial<Record<DerivedSetting, boolean>> = {}): string {
+  const groups = new Map<string, string[]>()
+  for (const f of DERIVED_FIELDS) {
+    if (!f.sink || !f.pending) continue
+    if (f.setting !== undefined && enabled[f.setting] === false) continue
+    const key = f.types.join('|')
+    const arr = groups.get(key)
+    if (arr) arr.push(f.pending)
+    else groups.set(key, [f.pending])
+  }
+  return [...groups.entries()]
+    .map(([key, preds]) => {
+      const types = key.split('|')
+      // types 来自本文件的字面量、不含用户输入 → 拼接进 SQL 安全
+      const typeCond =
+        types.length === 1 ? `type='${types[0]}'` : `type IN (${types.map((t) => `'${t}'`).join(',')})`
+      return `(${typeCond} AND (${preds.join(' OR ')}))`
+    })
+    .join(' OR ')
 }

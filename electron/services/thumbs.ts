@@ -10,7 +10,7 @@ import { FFMPEG } from './ffmpeg'
 import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
 import { relFromLib } from './paths'
-import { thumbSinkCondition } from './derived'
+import { thumbSinkWhere } from './derived'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
@@ -110,7 +110,6 @@ function renameTmp(tmp: string, out: string): void {
 /** ffmpeg 截帧：取 10% 处（不足 1s 取 0s），同时把时长/分辨率写回 assets */
 function extractFrame(abs: string, outPng: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const { db, path: libPath } = requireCurrent()
     // 先跑一次 -i 探测元信息（ffmpeg 打印在 stderr）
     probe(abs)
       .then((info) => {
@@ -119,9 +118,8 @@ function extractFrame(abs: string, outPng: string): Promise<void> {
         const p = spawn(FFMPEG, args, { windowsHide: true })
         p.on('close', (code) => {
           if (code === 0 && existsSync(outPng)) {
-            // 元信息回写（首次）
-            db.prepare('UPDATE assets SET duration_ms=?, width=?, height=? WHERE rel_path=? AND duration_ms IS NULL')
-              .run(Math.round(info.durationMs), info.width, info.height, relFromLib(libPath, abs))
+            // 元信息回写（首次）—— 写法与「命中缓存时补写」共用 `writeVideoMeta`
+            writeVideoMeta(info, abs)
             resolve()
           } else reject(new Error(`ffmpeg exit ${code}`))
         })
@@ -242,6 +240,48 @@ async function writeIndexFields(asset: { id: number; rel_path: string }): Promis
   if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, asset.id)
 }
 
+/**
+ * 把 ffmpeg 探到的时长/分辨率写回（**幂等**：只在 `duration_ms IS NULL` 时写）。
+ *
+ * 抽成一处是为了让两条路径共用同一份写法：① 生成缩略图时由 `extractFrame` 调；
+ * ② 缩略图**命中缓存**时由 `writeVideoMetaIfPending` 调。分头各写一份迟早跑偏。
+ */
+function writeVideoMeta(info: ProbeInfo, abs: string): void {
+  const { db, path: libPath } = requireCurrent()
+  db.prepare('UPDATE assets SET duration_ms=?, width=?, height=? WHERE rel_path=? AND duration_ms IS NULL').run(
+    Math.round(info.durationMs),
+    info.width,
+    info.height,
+    relFromLib(libPath, abs)
+  )
+}
+
+/**
+ * 视频缩略图**命中缓存**时补写时长/分辨率 —— 与图片的 `writeIndexFields` 同属 B2 那族欠账。
+ *
+ * 为什么需要它：`ensureOne` 命中缓存就早退（`thumbs.ts:43`），`extractFrame` 根本不会跑，
+ * 而时长/分辨率原先**只在** `extractFrame` 里写 → `duration_ms` 永远是 NULL。
+ * 典型触发与色板那条一样：素材删掉后**重新导入同一文件**（`content_hash` 相同 →
+ * `.thumbs/{hash}/` 缓存还在），或「该字段的回写是后来才加的」的老库。
+ *
+ * 只 probe、**不截帧**（缩略图本来就在，不需要帧）。失败不重试也不写哨兵 ——
+ * `duration_ms` 仍为 NULL，下次 backfill / 导入会把它再捞回来。
+ */
+async function writeVideoMetaIfPending(asset: { id: number; rel_path: string }): Promise<void> {
+  const { db, path: libPath } = requireCurrent()
+  const row = db.prepare('SELECT duration_ms FROM assets WHERE id=?').get(asset.id) as
+    | { duration_ms: number | null }
+    | undefined
+  if (!row || row.duration_ms != null) return
+  const abs = join(libPath, ...asset.rel_path.split('/'))
+  if (!existsSync(abs)) return
+  try {
+    writeVideoMeta(await probe(abs), abs)
+  } catch {
+    /* 探测失败：保持 NULL，下次再试 */
+  }
+}
+
 /** 图片主色板：取 50px 缩图原始像素，粗量化后取出现最多的 5 个颜色 */
 export async function computePalette(abs: string): Promise<string | null> {
   try {
@@ -345,12 +385,17 @@ function pump(): void {
     }
     ensureOne(job.asset, job.size)
       .then(async (r) => {
-        // 缩略图可用就补写索引字段（尺寸 + 主色板）。
+        // 缩略图可用就补写索引字段。
         // ⚠️ **不要再要求 `r.generated`**（这里原本是 `r?.generated && ...`）：
-        // 缩略图命中缓存的素材同样要补写 —— 否则 palette/width 为空的存量素材永远补不上，
-        // 只能「清理缓存 + 重建」。详见 ensureBatch 里 indexFields 的注释。
-        if (r && job.size === 'grid' && job.asset.type === 'image') {
-          await writeIndexFields(job.asset)
+        // 缩略图命中缓存的素材同样要补写 —— 否则 palette/width（图片）、duration_ms（视频）
+        // 为空的存量素材永远补不上，只能「清理缓存 + 重建」。详见 ensureBatch 里 indexFields 的注释。
+        if (r && job.size === 'grid') {
+          if (job.asset.type === 'image') {
+            await writeIndexFields(job.asset)
+          } else if (job.asset.type === 'video' && !r.generated) {
+            // 生成路径的时长回写已在 `extractFrame` 里做了；只有「命中缓存」这条要在这里补
+            await writeVideoMetaIfPending(job.asset)
+          }
         }
       })
       .catch(() => { /* ignore */ })
@@ -377,10 +422,10 @@ function pump(): void {
 function indexFieldsSinkIds(wantPalette: boolean): Set<number> {
   const { db } = requireCurrent()
   // 欠账条件由**派生字段注册表**派生（审计 §2.17）：加派生字段别再手改这条 SQL。
-  // 开关按 F4 的约定判「开」（`!== false`）；色板关着时只剩 `width IS NULL`，与旧实现一致。
-  const cond = thumbSinkCondition({ palette: wantPalette })
+  // 条件自带素材类型限定（图片：尺寸/色板；视频：时长），见 `thumbSinkWhere`。
+  const where = thumbSinkWhere({ palette: wantPalette })
   const rows = db
-    .prepare(`SELECT id FROM assets WHERE missing=0 AND type='image' AND ${cond}`)
+    .prepare(`SELECT id FROM assets WHERE missing=0 AND (${where})`)
     .all() as Array<{ id: number }>
   return new Set(rows.map((r) => r.id))
 }

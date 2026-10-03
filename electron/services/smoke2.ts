@@ -149,6 +149,7 @@ export async function runSmokeM2(): Promise<void> {
     //    而是与「真实表结构 / 真实行为 / 真实复制结果」对照，漂移会变红而不是静默漏字段（铁律 G11）。
     let d17MissingCols: string[] = []
     let d17SinkOk = false
+    let d17VideoSinkOk = false
     let d17CopyDiff: string[] = []
     {
       // ① 注册表里的每一列都必须真实存在于 assets 表（跨源：注册表 vs `PRAGMA`）
@@ -176,6 +177,22 @@ export async function runSmokeM2(): Promise<void> {
           d17SinkOk = back?.palette != null
         }
         result.d17SinkVictim = victim?.id ?? null
+
+        // ②b 同一欠账的**视频**分支（`duration_ms`）：抹掉时长 → 再跑网格批 → 必须 probe 补回。
+        //     这正是把「已知欠账」修成 `sink: true` 的那一条；把 `duration_ms` 从注册表的
+        //     `sink` 去掉、或去掉泵里的视频分支，这条立刻变红。
+        const vvictim = db
+          .prepare("SELECT id FROM assets WHERE type='video' AND duration_ms IS NOT NULL ORDER BY id LIMIT 1")
+          .get() as { id: number } | undefined
+        if (vvictim) {
+          db.prepare('UPDATE assets SET duration_ms=NULL WHERE id=?').run(vvictim.id)
+          await awaitBatch(assets as never, 'grid')
+          const vback = db.prepare('SELECT duration_ms FROM assets WHERE id=?').get(vvictim.id) as
+            | { duration_ms: number | null }
+            | undefined
+          d17VideoSinkOk = vback?.duration_ms != null
+        }
+        result.d17VideoSinkVictim = vvictim?.id ?? null
 
         // ③ 同步点③（`COPY_COLS`）的**行为**验证：注册表里的每一列都必须原样带到副本上。
         //    ⚠️ 必须**先给每个派生列塞上可辨识的值**再复制 —— 否则 `NULL === NULL` 会让「漏列」
@@ -220,7 +237,7 @@ export async function runSmokeM2(): Promise<void> {
       } catch (e) {
         d17CopyDiff.push(`行为验证抛错：${String(e).slice(0, 160)}`)
       }
-      result.d17 = { missingCols: d17MissingCols, sinkRefilled: d17SinkOk, copyDiff: d17CopyDiff, cols }
+      result.d17 = { missingCols: d17MissingCols, sinkRefilled: d17SinkOk, videoSinkRefilled: d17VideoSinkOk, copyDiff: d17CopyDiff, cols }
     }
 
     // 7. F3 导入失败文案：用 **真实的** `src/utils/format.ts`（esbuild 打成 CJS 后 require）
@@ -302,6 +319,7 @@ export async function runSmokeM2(): Promise<void> {
       // 审计 §2.17 跨源不变量：注册表 ↔ 真实表结构 / 欠账条件行为 / 复制结果
       d17MissingCols.length === 0 &&
       d17SinkOk &&
+      d17VideoSinkOk &&
       d17CopyDiff.length === 0
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))
