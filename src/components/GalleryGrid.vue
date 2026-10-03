@@ -388,6 +388,26 @@ watch(() => lib.info?.path, () => {
   thumbRetried.clear()
 })
 
+/**
+ * 第二条「重新武装」的条件：**应用主动要求全网格重新取图**时把 latch 一并清掉。
+ *
+ * `bumpThumbs()` 会让 `thumbV++`，于是所有 `<img>` 的 URL 都带上新的 `?v=` 重新请求 ——
+ * 也就意味着**磁盘上已经不存在的那张缩略图会再 404 一次**。
+ * 此时若 latch 还占着位（这个 hash 在本会话里早先因一次真实 404 补生成过），
+ * `onImgErr` 里的 `if (thumbRetried.has(key)) return` 会把这次 404 直接挡下 →
+ * **不补生成、不换 URL → 卡片永久停在破图，直到用户重开库**。
+ *
+ * ⚠️ 真实触发路径（**不是**「设置里清理缩略图缓存」——那个动作是「清理**并重建**」，
+ * 紧接的 `backfill` 会把缩略图补回来，刻意避开了 404 窗口）：
+ * `.thumbs/{H}` 被**外部**删掉（用户手动删 / 杀软 / 磁盘清理工具），
+ * 之后再遇到任意一次 `bumpThumbs`（导入完成、外部变更收尾、批量生成完成）。
+ *
+ * 为什么不会成环：`bumpThumbs` 只由**离散的用户动作**触发，`onImgErr` 从不调用它；
+ * 每次 bump 后每个 key 仍然最多补一次。这条与「切库清 latch」是同一个思路 ——
+ * latch 的生命周期应当对齐「应用承诺过的那次全量重新取图」。
+ */
+watch(() => assets.thumbV, () => thumbRetried.clear())
+
 /** 缩略图可视宽度 = 卡片宽度 - 两侧内边距 */
 const thumbW = computed(() => Math.max(0, cardW.value - CARD_PAD * 2))
 

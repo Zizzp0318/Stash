@@ -651,6 +651,56 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       check('U2 缩略图缺失时渲染层会补生成并自动重试（不再永久灰）',
         r.ok && r.srcChanged === true && r.loaded === true && onDisk,
         JSON.stringify(r) + ' onDisk=' + onDisk)
+
+      // ⑦ 机制 1 的回归守卫：**同一 hash 的缩略图「第二次」从磁盘消失后，还能不能自愈？**
+      //
+      //    前置是**确定性**的、不依赖任何竞态：上一步 ⑤ 的 404 必然触发过一次 `onImgErr`，
+      //    而 `onImgErr` 会把该 key 写进 `thumbRetried`（latch 占位）。本步再利用这个已占位状态。
+      //
+      //    真实触发路径：`.thumbs/{H}` 被**外部**删掉（用户手动删 / 杀软 / 磁盘清理工具），
+      //    之后再遇到任意一次 `bumpThumbs`（导入完成 / 外部变更收尾 / 批量生成完成）→
+      //    所有 `<img>` 带上新的 `?v=` 重新请求 → 这张再 404 一次。
+      //    ⚠️ 若 latch 仍占着位，`if (thumbRetried.has(key)) return` 会把它挡下 →
+      //       **不补生成、不换 URL → 卡片永久停在破图，直到用户重开库**（这就是「机制 1」）。
+      //    修法是让 `bumpThumbs`（= 应用主动承诺「全网格重新取图」）把 latch 一并清掉。
+      //
+      //    本步用 `assets.bumpThumbs()` 复刻那条链路的入口；轮询期间**每轮重新查一次 <img>**，
+      //    避免 Vue 重渲染时换掉节点导致拿到的 `naturalWidth` 属于已脱离文档的旧元素。
+      if (existsSync(thumbAbs)) unlinkSync(thumbAbs)
+      const sawMissing = !existsSync(thumbAbs) // 前置：此刻文件确实不在磁盘上
+      const r2 = await js<{ ok: boolean; sawRerender: boolean; loaded: boolean }>(
+        '(async () => {' +
+        ' const sel = \'.card[data-id="' + healId + '"] img\';' +
+        ' const find = () => document.querySelector(sel);' +
+        ' const img0 = find();' +
+        ' if (!img0) return { ok: false, sawRerender: false, loaded: false };' +
+        ' const before = img0.src;' +
+        ' const pinia = document.querySelector("#app").__vue_app__.config.globalProperties.$pinia._s.get("assets");' +
+        ' pinia.bumpThumbs();' + // ← 全网格重新取图（latch 的重新武装点）
+        // 阶段 1：先等 Vue 重渲染把 `src` 换成新的 `?v=` —— 这一步证明「重新请求确实发生了」。
+        // ⚠️ 千万不能一上来就看 `naturalWidth`：此刻 `<img>` 还挂着**上一份已解码的位图**，
+        //    `naturalWidth` 仍是正数，会被立刻误判成「已加载」而在重渲染之前就退出循环
+        //    （本断言的第一个版本就是这么写的，结果是「红得不明不白」：onDisk=false 却 loaded=true）。
+        ' const t1 = Date.now(); let re = false;' +
+        ' while (Date.now() - t1 < 5000) {' +
+        '   const c = find();' +
+        '   if (c && c.src !== before) { re = true; break }' +
+        '   await new Promise((r) => setTimeout(r, 100));' +
+        ' }' +
+        // 阶段 2：`src` 已换新，现在才有意义去问「新的 URL 到底加载出来没有」。
+        //   设置了新 src 之后 `complete` 会变 false、`naturalWidth` 归 0，直到它加载成功或失败。
+        ' let loaded = false; const t2 = Date.now();' +
+        ' while (Date.now() - t2 < 10000) {' +
+        '   const c = find();' +
+        '   if (c && c.complete && c.naturalWidth > 0) { loaded = true; break }' +
+        '   await new Promise((r) => setTimeout(r, 150));' +
+        ' }' +
+        ' return { ok: true, sawRerender: re, loaded };' +
+        '})()')
+      const onDisk2 = existsSync(thumbAbs)
+      check('U2 同一 hash 的缩略图第二次从磁盘消失后仍能自愈（bumpThumbs 会重新武装 latch）',
+        sawMissing && r2.ok === true && r2.sawRerender === true && r2.loaded === true && onDisk2,
+        JSON.stringify(r2) + ' onDisk=' + onDisk2 + ' sawMissing=' + sawMissing)
     }
 
     const fire = (id: number, type: string): Promise<unknown> =>
