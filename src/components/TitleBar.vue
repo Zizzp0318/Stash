@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch, ref } from 'vue'
+import { watch, ref, onBeforeUnmount } from 'vue'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { libErrorText } from '../utils/format'
@@ -20,6 +20,11 @@ watch(keyword, (v) => {
     assets.query.keyword = kw
     await assets.refresh()
   }, 300)
+})
+
+// 组件卸载时清掉待触发的 debounce —— 否则它会在卸载后仍然跑一次 `assets.refresh()`
+onBeforeUnmount(() => {
+  if (timer) clearTimeout(timer)
 })
 
 /**

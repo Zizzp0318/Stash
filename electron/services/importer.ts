@@ -1,10 +1,11 @@
-import { copyFileSync, readSync, closeSync, openSync, renameSync, statSync } from 'fs'
+import { copyFileSync, readSync, closeSync, openSync, statSync } from 'fs'
 import { basename, extname, join } from 'path'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { requireCurrent, mkdirRel } from './library'
 import { getSettings } from './config'
 import { uniqueName } from './naming'
+import { moveFileSync } from './fsutil'
 import { toRel } from './paths'
 import type { DB } from './db'
 
@@ -176,7 +177,9 @@ export function importFiles(args: ImportArgs): { importId: number } {
         const name = uniqueName(destDir, origName)
         const dest = join(destDir, name)
 
-        if (mode === 'move') renameSync(src, dest)
+        // ⚠️ 用 `moveFileSync`，别裸调 `renameSync`：跨盘（库在 D:、源在 C:）时 rename 必失败
+        // （EXDEV），「移动导入」会直接报错，而库里移动却好好的 —— 同一动作两个入口行为不一致。
+        if (mode === 'move') moveFileSync(src, dest)
         else copyFileSync(src, dest)
         if (name !== origName) renamed++
 

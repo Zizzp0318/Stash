@@ -118,6 +118,7 @@ async function copyColor(c: string): Promise<void> {
 
 onBeforeUnmount(() => {
   if (colorTimer) clearTimeout(colorTimer)
+  if (noteTimer) clearTimeout(noteTimer)
 })
 
 const dimsText = computed(() => {
@@ -237,6 +238,8 @@ async function removeTag(tagId: number): Promise<void> {
 const editingNote = ref(false)
 const noteDraft = ref('')
 const noteCopied = ref(false)
+/** 「已复制」对勾的复位定时器；卸载时清掉，别让它对着已卸载的组件写状态 */
+let noteTimer: ReturnType<typeof setTimeout> | null = null
 const noteInput = ref<HTMLTextAreaElement | null>(null)
 
 function beginEditNote(): void {
@@ -285,7 +288,8 @@ async function copyNote(): Promise<void> {
     ta.remove()
   }
   noteCopied.value = true
-  window.setTimeout(() => (noteCopied.value = false), 1500)
+  if (noteTimer) clearTimeout(noteTimer)
+  noteTimer = setTimeout(() => (noteCopied.value = false), 1500)
 }
 </script>
 

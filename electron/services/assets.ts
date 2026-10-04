@@ -5,8 +5,9 @@ import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
 import { importFiles } from './importer'
 import { uniqueName } from './naming'
 import { derivedCopyCols } from './derived'
+import { moveFileSync } from './fsutil'
 import { relFromLib, subtreeOfPath, toRel, validateName } from './paths'
-import type { DB } from './db'
+import { escapeLike, type DB } from './db'
 
 export interface AssetQuery {
   folderId?: number | null
@@ -33,16 +34,10 @@ export interface AssetQuery {
 const SORTABLE = new Set(['imported_at', 'name', 'size', 'rating'])
 
 /**
- * 转义 LIKE 的通配符。
- *
- * 不转义的话，用户搜 `100%` 会变成「以 100 开头」、搜 `a_b` 会匹配到 `axb`
- * —— 搜索框看起来「不精确」，但很难联想到是通配符问题。
- * `\` 自身必须一起转义，否则用户输入的 `\` 会让后面的字符意外获得转义语义。
- * 配套 SQL 必须写 `ESCAPE '\'`，否则反斜杠会被当作普通字符。
+ * 转义 LIKE 的通配符 —— 实现在 `db.ts`（`escapeLike`），与 `watcher.ts` 的目录删除共用同一份
+ * （不转义时：搜 `100%` 变成「以 100 开头」、搜 `a_b` 会匹配到 `axb`；删 `报告_2024/` 会把
+ * `报告X2024/` 下的素材也标成 missing）。配套 SQL 必须写 `ESCAPE '\'`。
  */
-function escapeLike(s: string): string {
-  return s.replace(/[\\%_]/g, (c) => `\\${c}`)
-}
 
 /**
  * 某文件夹及其整棵子树的文件夹 id（含自身）。
@@ -144,8 +139,11 @@ export function bulkUpdate(ids: number[], patch: { rating?: number; isFav?: bool
       updated = Number(db.prepare(`UPDATE assets SET rating=? WHERE id IN (${ph})`).run(r, ...ids).changes)
     }
     if (patch.isFav != null) {
-      updated = Number(
-        db.prepare(`UPDATE assets SET is_fav=? WHERE id IN (${ph})`).run(patch.isFav ? 1 : 0, ...ids).changes
+      // 取 max 而不是「后写的覆盖前写的」：两条 UPDATE 命中**同一批 id**，行数本该相同；
+      // 取 max 后，即便将来某条语句的 `changes` 语义变了，返回值也不会莫名其妙变小。
+      updated = Math.max(
+        updated,
+        Number(db.prepare(`UPDATE assets SET is_fav=? WHERE id IN (${ph})`).run(patch.isFav ? 1 : 0, ...ids).changes)
       )
     }
     db.exec('COMMIT')
@@ -160,17 +158,9 @@ export function bulkUpdate(ids: number[], patch: { rating?: number; isFav?: bool
 export { uniqueName } from './naming'
 
 /**
- * 搬动单个文件。同库内基本都在同一卷，rename 即可；
- * 遇到挂载点 / 卷不同 / 文件被占用时退化为复制 + 删除。
+ * 搬动单个文件 —— 实现在 `fsutil.ts`（`moveFileSync`），与导入的「移动」模式共用同一份。
+ * 分头各写一份正是「同一个动作两个入口行为不一致」的温床（审计 §2.16 / §2.18）。
  */
-function moveFile(src: string, dest: string): void {
-  try {
-    renameSync(src, dest)
-  } catch {
-    copyFileSync(src, dest)
-    unlinkSync(src)
-  }
-}
 
 function errMsg(e: unknown): string {
   return String((e as Error).message ?? e)
@@ -299,7 +289,7 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; re
         const name = uniqueName(destDir, row.name)
         if (name !== row.name) renamed++
         const dest = join(destDir, name)
-        moveFile(src, dest)
+        moveFileSync(src, dest)
         upd.run(folder.id, toRel(folder.path, name), name, row.id)
         moved++
       } catch (e) {

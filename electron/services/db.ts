@@ -6,6 +6,17 @@ import { derivedAdditiveColumns } from './derived'
 export type DB = DatabaseSync
 
 /**
+ * 转义 SQL `LIKE` 的通配符（`\` `%` `_`），配合 `ESCAPE '\'` 使用。
+ *
+ * 为什么必须有：路径/名字里含 `_` 或 `%` 时（`报告_2024`、`100%.png`），`_` 匹配任意单字符、
+ * `%` 匹配任意串 → 前缀查询会**误匹配别的路径**。真实后果：删掉 `报告_2024/` 会把
+ * `报告X2024/` 下的素材也标成 missing。搜索（`assets.ts`）与目录删除（`watcher.ts`）都用它。
+ */
+export function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`)
+}
+
+/**
  * 当前库 schema 版本号（**单一真相源**）。
  *
  * 库是一个可被任意版本软件打开的普通目录，索引 `.stash` 里必须能回答两个问题：

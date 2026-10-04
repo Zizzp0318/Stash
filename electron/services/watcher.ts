@@ -6,7 +6,7 @@ import { contentHash, EXT_TYPE } from './importer'
 import { ensureFolderRows, mkdirRel } from './library'
 import { uniqueName } from './naming'
 import { relFromLib } from './paths'
-import type { DB } from './db'
+import { escapeLike, type DB } from './db'
 
 let watcher: FSWatcher | null = null
 
@@ -298,9 +298,11 @@ export function watchLibrary(libPath: string, db: DB): void {
   const markDirMissing = (abs: string) => {
     try {
       // 同样 `AND missing=0`：与 markMissing 一起保证「unlinkDir + 逐文件 unlink」不会被双计（详见 markMissing）
+      // ⚠️ `escapeLike` 不能省：目录名含 `_`/`%` 时（`报告_2024`），未转义的 LIKE 会把
+      // `报告X2024/` 下的素材一并标成 missing（审计 §2.18；与「子树比较不用 LIKE 通配」的约定同源）。
       const info = db
-        .prepare('UPDATE assets SET missing=1 WHERE rel_path LIKE ? AND missing=0')
-        .run(relFromLib(libPath, abs) + '/%')
+        .prepare("UPDATE assets SET missing=1 WHERE rel_path LIKE ? ESCAPE '\\' AND missing=0")
+        .run(escapeLike(relFromLib(libPath, abs)) + '/%')
       // 整目录被删会一次标到 N 行 → removed 计 N（提示条上的「删除 N 个」才说得通）
       if (Number(info.changes) > 0) bumpExternal('removed', Number(info.changes))
     } catch {
