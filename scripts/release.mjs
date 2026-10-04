@@ -193,13 +193,14 @@ function changelogFor(tag) {
   // 直接把整个脚本变成 SyntaxError（node --check 抓到过，但当时命令链用的分号，推送照旧执行了）
   const git = (args) => {
     let last = null
-    for (let i = 0; i < 4; i++) {
+    // 实测：EBUSY 是**成串**出现的（同一分钟里能连撞数次），4 次 300ms 退避不够 —— 加大到 8 次 500ms。
+    for (let i = 0; i < 8; i++) {
       try {
         return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' })
       } catch (e) {
         last = e
         if (!String(e).includes('EBUSY')) break
-        const until = Date.now() + 300 * (i + 1)
+        const until = Date.now() + 500 * (i + 1)
         while (Date.now() < until) {
           /* 同步退避（照 rmWithRetry 的样式，冒烟脚本里不值得引入异步） */
         }
@@ -219,10 +220,19 @@ function changelogFor(tag) {
       .split('\n')
       .filter(Boolean)
       .slice(0, 20)
-    if (!lines.length) return ''
+    if (!lines.length) {
+      console.warn('      ⚠️ 本版更新的提交列表为空 —— Release 正文会缺这一段')
+      return ''
+    }
     return '### 本版更新\n\n' + lines.map((l) => `- ${l}`).join('\n') + '\n'
-  } catch {
-    return '' // git 出问题时宁缺毋滥，别让整次发布失败
+  } catch (e) {
+    // 仍然「宁缺毋滥」（别让整次发布失败），但**必须喊出来**：静默吞掉的话，Release 正文会
+    // 悄悄少一段「本版更新」，只有事后人工比对才发现（v0.1.2 / v0.1.3 都踩过，只能手工 PATCH 补）。
+    console.warn(
+      `      ⚠️ 生成本版更新失败（${String(e).slice(0, 60)}）→ Release 正文会缺这段，` +
+        '发布后请照 RELEASE.md H5 手工 PATCH 补上'
+    )
+    return ''
   }
 }
 
@@ -318,7 +328,7 @@ InvokeAI / NovelAI / Midjourney**，并识别 C2PA 与国内 AIGC 标识。
 
 ### 验证情况
 
-打包产物跑过完整自检：\`--smoke-preview\` 90 项断言全过（\`failed: []\`），覆盖 ffmpeg 转码与派生、
+打包产物跑过完整自检：\`--smoke-preview\` 92 项断言全过（\`failed: []\`），覆盖 ffmpeg 转码与派生、
 sharp 图片处理、Range 流式、真实播放与图片预览 —— 等于把「原生依赖在 asar 里解包对不对」实测了一遍。
 
 ${changelogFor(TAG)}
