@@ -3,14 +3,14 @@
 //       图片宽高/主色板回写、视频时长回写 → 二次调用全命中缓存
 import { app } from 'electron'
 import { spawn } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
-import { ensureBatch } from './thumbs'
+import { ensureBatch, retestLegacyDims } from './thumbs'
 import { copyAssets } from './assets'
 import { DERIVED_FIELDS, derivedCopyCols } from './derived'
 
@@ -299,6 +299,98 @@ export async function runSmokeM2(): Promise<void> {
       }
     }
 
+    // 9. 方向（缺陷 2）：竖屏素材的索引宽高必须是**显示尺寸**，且与缩略图真实形状一致。
+    //    为什么单开一个库：这里要导入「带 EXIF 旋转的图 / 带 display matrix 的视频」，
+    //    若塞进上面的库会改掉 imgWH===IMG_N 等既有断言的计数。新库把影响面隔离干净。
+    //    为什么断言「索引比例 == 缩略图比例」：卡片高度 = thumbW * (height/width) 用的是**索引**尺寸，
+    //    而用户眼睛看到的是缩略图 —— 只有两者同形，卡片才不会歪。这条不变量才是那个 bug 本身。
+    let orientOk = false
+    let migrateOk = false
+    {
+      const oLib = createLibrary({ name: 'orient-lib', parentDir: dir })
+      const oDir = join(dir, 'orient-src')
+      mkdirSync(oDir)
+      // 图片夹具：1200x900 + EXIF Orientation=6 → 显示应为竖屏 900x1200
+      const o6 = join(oDir, 'o6.jpg')
+      await sharp({ create: { width: 1200, height: 900, channels: 3, background: { r: 200, g: 80, b: 60 } } })
+        .jpeg()
+        .withMetadata({ orientation: 6 })
+        .toFile(o6)
+      // 正对照：Orientation=1 的横图**不该**被交换
+      const o1 = join(oDir, 'o1.jpg')
+      await sharp({ create: { width: 1200, height: 900, channels: 3, background: { r: 60, g: 80, b: 200 } } })
+        .jpeg()
+        .withMetadata({ orientation: 1 })
+        .toFile(o1)
+      // 视频夹具：1920x1080 + display_rotation 90 → 显示应为竖屏 1080x1920
+      // ⚠️ `-metadata:s:v:0 rotate=90`（老 API）在本机 ffmpeg 6.1.1 上写不进去，必须用
+      //    输入选项 `-display_rotation 90`（实测见 .workbuddy/audit/probe-orient.mjs）
+      const vBase = join(oDir, 'vbase.mp4')
+      await runFfmpeg(['-y', '-f', 'lavfi', '-i', 'testsrc=duration=2:size=1920x1080:rate=10', '-pix_fmt', 'yuv420p', vBase])
+      const vRot = join(oDir, 'vrot.mp4')
+      await runFfmpeg(['-y', '-display_rotation', '90', '-i', vBase, '-c', 'copy', vRot])
+
+      const oFolder = mkdirRel('方向')
+      await new Promise<void>((resolve) => {
+        importFiles({ paths: [o6, o1, vRot], folderId: oFolder.id, mode: 'copy', onDone: () => resolve() })
+      })
+      const odb = requireCurrent().db
+      const oRows = odb
+        .prepare('SELECT id, name, type, content_hash, rel_path FROM assets')
+        .all() as Array<{ id: number; name: string; type: string; content_hash: string; rel_path: string }>
+      await awaitBatch(oRows as never, 'grid')
+      const oById = new Map(oRows.map((r) => [r.name, r]))
+      const idxDims = (name: string): { w: number; h: number } => {
+        const r = oById.get(name)!
+        const row = odb.prepare('SELECT width, height FROM assets WHERE id=?').get(r.id) as { width: number; height: number }
+        return { w: row.width, h: row.height }
+      }
+      // 读磁盘上缩略图的真实尺寸（不复用被测代码的判据）。
+      // ⚠️ 用 `sharp(readFileSync(...))` 而非 `sharp(path)`：后者会在临时目录里留下未释放的
+      //    文件句柄，末尾 `rmSync(dir)` 会 EPERM（与 B3 同族）。读进内存则读完即关。
+      const thumbDims = async (name: string): Promise<{ w: number; h: number }> => {
+        const r = oById.get(name)!
+        const m = await sharp(readFileSync(join(oLib.path, '.thumbs', r.content_hash, 'grid.webp'))).metadata()
+        return { w: m.width ?? 0, h: m.height ?? 0 }
+      }
+      const ratio = (d: { w: number; h: number }): number => d.h / d.w
+      const i6 = idxDims('o6.jpg')
+      const t6 = await thumbDims('o6.jpg')
+      const i1 = idxDims('o1.jpg')
+      const t1 = await thumbDims('o1.jpg')
+      const iv = idxDims('vrot.mp4')
+      const tv = await thumbDims('vrot.mp4')
+      result.orient = { i6, t6, i1, t1, iv, tv }
+      orientOk =
+        // 竖屏图（EXIF 6）：索引与缩略图都必须 h > w，且比例一致
+        i6.h > i6.w && t6.h > t6.w && Math.abs(ratio(i6) - ratio(t6)) < 0.05 &&
+        // 竖屏视频（display matrix 90）：同上
+        iv.h > iv.w && tv.h > tv.w && Math.abs(ratio(iv) - ratio(tv)) < 0.05 &&
+        // 正对照：Orientation=1 的横图仍是横屏（h < w），没被误交换
+        i1.w > i1.h && Math.abs(ratio(i1) - ratio(t1)) < 0.05
+
+      // 存量迁移：手工写错尺寸 + dims_rev=1 → retestLegacyDims 清空 → 走一次 backfill 重测回正确值
+      odb.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('dims_rev','1')").run()
+      const o6id = oById.get('o6.jpg')!.id
+      odb.prepare('UPDATE assets SET width=1200, height=900 WHERE id=?').run(o6id) // 模拟「老代码写错的横屏值」
+      const r1 = retestLegacyDims()
+      const afterClear = odb.prepare('SELECT width FROM assets WHERE id=?').get(o6id) as { width: number | null }
+      const revAfter = (odb.prepare("SELECT value FROM meta WHERE key='dims_rev'").get() as { value: string }).value
+      await awaitBatch(oRows as never, 'grid')
+      const afterFix = odb.prepare('SELECT width, height FROM assets WHERE id=?').get(o6id) as { width: number; height: number }
+      const r2 = retestLegacyDims() // 幂等：第二次不该再清
+      const rev2 = (odb.prepare("SELECT value FROM meta WHERE key='dims_rev'").get() as { value: string }).value
+      result.migrate = { cleared: r1.cleared, widthAfterClear: afterClear.width, revAfter, afterFix, clearedAgain: r2.cleared, rev2 }
+      migrateOk =
+        r1.cleared === true &&
+        afterClear.width === null &&
+        revAfter === '2' &&
+        afterFix.width === 900 &&
+        afterFix.height === 1200 &&
+        r2.cleared === false &&
+        rev2 === '2'
+    }
+
     result.ok =
       imp.added === paths.length &&
       // 独立 DB 口径不变量：added 必须恰好等于**另一条连接**看到的库里实际新增行数
@@ -320,7 +412,10 @@ export async function runSmokeM2(): Promise<void> {
       d17MissingCols.length === 0 &&
       d17SinkOk &&
       d17VideoSinkOk &&
-      d17CopyDiff.length === 0
+      d17CopyDiff.length === 0 &&
+      // 缺陷 2：方向（索引尺寸 = 显示尺寸且与缩略图同形）+ 存量迁移
+      orientOk &&
+      migrateOk
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))
   } catch (e) {

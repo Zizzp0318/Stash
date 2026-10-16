@@ -1,11 +1,11 @@
-import { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync, unlinkSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, rmSync, statSync, unlinkSync } from 'fs'
 import { extname, isAbsolute, join } from 'path'
 import { shell } from 'electron'
 import { requireCurrent, mkdirRel, pruneUnlinkedTags } from './library'
 import { importFiles } from './importer'
 import { uniqueName } from './naming'
 import { derivedCopyCols } from './derived'
-import { moveFileSync } from './fsutil'
+import { moveFileSync, renameWithShortRetrySync } from './fsutil'
 import { relFromLib, subtreeOfPath, toRel, validateName } from './paths'
 import { escapeLike, type DB } from './db'
 
@@ -235,13 +235,16 @@ export function renameAsset(id: number, rawName: string): RenameResult {
   }
 
   const newAbs = join(dirAbs, name)
-  renameSync(oldAbs, newAbs)
+  // 物理改名：短重试（同 `library.renameFolder` 的因，见 `fsutil.isTransientRenameError`）。
+  // 这里**不改成 async**：冒烟 `smoke-edit` 是同步调用 `renameAsset` 的（改 async 要把整片调用点
+  // 都改成 await，改动面远超本工单），故用同步版短重试 `renameWithShortRetrySync`（约 170ms 上限）。
+  renameWithShortRetrySync(oldAbs, newAbs)
   const newRel = toRel(dirRel, name)
   try {
     db.prepare('UPDATE assets SET name=?, rel_path=? WHERE id=?').run(name, newRel, id)
   } catch (e) {
     try {
-      renameSync(newAbs, oldAbs)
+      renameWithShortRetrySync(newAbs, oldAbs, { attempts: 2, delays: [0] })
     } catch {
       /* 回滚物理也失败，只能把错误抛出去 */
     }

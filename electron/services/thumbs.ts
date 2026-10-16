@@ -2,10 +2,10 @@
 // 图片: sharp → webp（两级尺寸）；视频: ffmpeg 截帧 → sharp 缩放；
 // 音频/文本: 生成占位图。缓存: {库目录}/.thumbs/{hash}/{size}.webp
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync } from 'fs'
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { BrowserWindow } from 'electron'
-import sharp from 'sharp'
+import sharp, { type Sharp, type Metadata } from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
@@ -14,6 +14,32 @@ import { thumbSinkWhere } from './derived'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
+
+/**
+ * 把「库内原文件」读进内存后交给 sharp，**不要** `sharp(abs)` 直接按路径打开。
+ *
+ * 为什么（实测，见 `.workbuddy/audit/probe-inflight-rename.mjs`）：libvips 按文件名打开一个文件后，
+ * 在整个（异步的）解码过程中会**持有该文件的句柄**。此刻若用户去重命名这个文件所在的**文件夹**，
+ * Windows 直接拒绝 → `EPERM: operation not permitted, rename '…' -> '…'`（与用户截图逐字一致）。
+ * 这正是「重命名偶发失败」的根因：开库/导入时缩略图队列在后台跑，用户恰好在某个 job 处理
+ * 「该文件夹内」某文件时改了文件夹名。实测三连：
+ *   `sharp(abs)` 进行中 rename 目录 → EPERM；完成后 → OK；cache.files=0 也救不了；
+ *   换成 `sharp(readFileSync(abs))`（同步读入后源文件立即关闭）进行中 rename 目录 → **OK**。
+ *
+ * ⚠️ 大文件（几十~上百 MB）读进内存有代价，超过阈值就**保留按路径打开**、只依赖
+ * `fsutil.renameWithRetry` 的重试兜底（大图本来就少见，且生成耗时长、与用户改名撞上的概率更低）。
+ */
+const READ_INTO_MEMORY_MAX_BYTES = 64 * 1024 * 1024
+
+/** 打开一个库内原文件给 sharp：正常大小走内存（避免持句柄），超大文件按路径（省内存） */
+function openSource(abs: string): Sharp {
+  try {
+    if (statSync(abs).size <= READ_INTO_MEMORY_MAX_BYTES) return sharp(readFileSync(abs))
+  } catch {
+    /* stat 失败就退回按路径打开，让 sharp 自己去报错 */
+  }
+  return sharp(abs)
+}
 
 /**
  * 并发数与质量**每次用时现读设置**，不做模块级常量。
@@ -52,7 +78,7 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
 
   try {
     if (asset.type === 'image') {
-      await sharp(abs)
+      await openSource(abs)
         .rotate() // 按 EXIF 方向摆正
         .toColourspace('srgb') // HDR 广色域（HEIC 等）转 sRGB，避免缩略图偏灰
         // 注意：`animated` 是 sharp 的**输入选项**（`sharp(input, { animated })`），
@@ -131,6 +157,35 @@ function extractFrame(abs: string, outPng: string): Promise<void> {
 
 interface ProbeInfo { durationMs: number; width: number; height: number }
 
+/**
+ * 从 ffmpeg `-i` 的 banner 里抠出**旋转角（度）**，没有则 `null`。
+ *
+ * 两种写法都要认（不同 ffmpeg 版本/来源输出不同，实测见 `.workbuddy/audit/probe-orient.mjs`）：
+ *   · 现代输出：`displaymatrix: rotation of 90.00 degrees`（`-display_rotation` 产物）
+ *   · 老式标签：`rotate          : 90`（部分手机/老工具写进 metadata 的 rotate tag）
+ */
+function parseRotation(stderr: string): number | null {
+  const m1 = /displaymatrix:\s*rotation of\s*(-?[\d.]+)\s*degrees/i.exec(stderr)
+  if (m1) return Number(m1[1])
+  const m2 = /rotate\s*:\s*(-?[\d.]+)/i.exec(stderr)
+  if (m2) return Number(m2[1])
+  return null
+}
+
+/**
+ * 是否「四分一转」（±90 或 ±270，即显示时需要把宽高对调）。
+ *
+ * ⚠️ 判据取**模 180 ≈ 90**、**不看正负号**：`displaymatrix: rotation of 90` 与 `rotate : -90`
+ * 两种写法的正负约定相反（实测 `-display_rotation 90` → `rotation of 90.00`，
+ * `-display_rotation -90` → `rotation of -90.00`），但都代表同一个「竖过来」。180° 是上下颠倒、
+ * 不换宽高。容差 2° 兜住 89.9/90.1 这类浮点写法。
+ */
+function isQuarterTurn(deg: number | null): boolean {
+  if (deg == null) return false
+  const a = ((deg % 180) + 180) % 180
+  return Math.abs(a - 90) <= 2
+}
+
 function probe(abs: string): Promise<ProbeInfo> {
   return new Promise((resolve, reject) => {
     const p = spawn(FFMPEG, ['-i', abs], { windowsHide: true })
@@ -141,11 +196,18 @@ function probe(abs: string): Promise<ProbeInfo> {
       const dim = /Stream.*Video:.*?,\s*(\d+)x(\d+)/.exec(stderr)
       if (!dur) { reject(new Error('probe: no duration')); return }
       const durationMs = (+dur[1] * 3600 + +dur[2] * 60 + +dur[3]) * 1000 + +`${dur[4]}`.padEnd(3, '0')
-      resolve({
-        durationMs,
-        width: dim ? +dim[1] : 0,
-        height: dim ? +dim[2] : 0
-      })
+      // 显示尺寸：banner 里的 `1920x1080` 是**编码尺寸**，忽略 display matrix 旋转。
+      // 而 `extractFrame` 截出的帧 ffmpeg **默认已应用旋转**（实测：1920x1080 旋转 90° 的素材，
+      // 带旋转的截帧是 1080x1920）。两边不一致 → 卡片按横屏排版。命中四分一转就交换宽高，
+      // 让索引尺寸与缩略图同形。
+      let width = dim ? +dim[1] : 0
+      let height = dim ? +dim[2] : 0
+      if (width > 0 && height > 0 && isQuarterTurn(parseRotation(stderr))) {
+        const t = width
+        width = height
+        height = t
+      }
+      resolve({ durationMs, width, height })
     })
     p.on('error', reject)
   })
@@ -204,15 +266,40 @@ async function generatePlaceholder(key: string, type: string): Promise<string> {
 }
 
 // —— 图片元数据 + 主色回写 ——
+
+/**
+ * 取图片的**显示尺寸**（已按 EXIF 方向摆正），写进索引的就是这个。
+ *
+ * 为什么不能直接用 `metadata().width/height`（缺陷 2 的根因）：那两个字段是 **EXIF 旋转前**的
+ * 原始像素尺寸。手机竖拍存成 4032×3024 + `Orientation=6`，`metadata()` 报 4032×3024（横），
+ * 而缩略图管线走了 `.rotate()` → 输出是竖的 —— 两边不一致，瀑布流卡片就按横屏排版（用户看到的 bug）。
+ * 实测（`.workbuddy/audit/probe-orient.mjs`）：`metadata().autoOrient` = `{900,1200}`（竖），
+ * 正是缩略图的真实形状；`orientation=1` 的横图 autoOrient 与原始宽高一致（正对照，没被误交换）。
+ *
+ * 取法：优先用 sharp 的 `autoOrient`（sharp 0.35.4 实测提供）；它缺失时按
+ * `orientation ∈ {5,6,7,8}`（这四种需要转置/旋转 90°）手动交换宽高；都没有就保持原样。
+ */
+function orientedDims(m: Metadata): { width: number; height: number } {
+  const ao = m.autoOrient as { width?: number; height?: number } | undefined
+  if (ao && typeof ao.width === 'number' && typeof ao.height === 'number' && ao.width > 0 && ao.height > 0) {
+    return { width: ao.width, height: ao.height }
+  }
+  const w = m.width ?? 0
+  const h = m.height ?? 0
+  const o = m.orientation ?? 1
+  // 5/6/7/8 都是「需要转过 90°/270°」的方向，显示时宽高对调
+  const swap = o === 5 || o === 6 || o === 7 || o === 8
+  return swap ? { width: h, height: w } : { width: w, height: h }
+}
+
 async function writeImageMeta(asset: { id: number; rel_path: string }): Promise<void> {
   const { db } = requireCurrent()
   const row = db.prepare('SELECT width FROM assets WHERE id=?').get(asset.id) as { width: number | null } | undefined
   if (!row || row.width != null) return // 已写过
   const abs = join(requireCurrent().path, ...asset.rel_path.split('/'))
   try {
-    const meta = await sharp(abs).metadata()
-    db.prepare('UPDATE assets SET width=?, height=? WHERE id=?')
-      .run(meta.width ?? 0, meta.height ?? 0, asset.id)
+    const { width, height } = orientedDims(await openSource(abs).metadata())
+    db.prepare('UPDATE assets SET width=?, height=? WHERE id=?').run(width, height, asset.id)
   } catch { /* HEIC 之外解析失败忽略 */ }
 }
 
@@ -285,7 +372,7 @@ async function writeVideoMetaIfPending(asset: { id: number; rel_path: string }):
 /** 图片主色板：取 50px 缩图原始像素，粗量化后取出现最多的 5 个颜色 */
 export async function computePalette(abs: string): Promise<string | null> {
   try {
-    const { data, info } = await sharp(abs)
+    const { data, info } = await openSource(abs)
       .rotate()
       .toColourspace('srgb')
       .resize(50, 50, { fit: 'inside' })
@@ -428,6 +515,44 @@ function indexFieldsSinkIds(wantPalette: boolean): Set<number> {
     .prepare(`SELECT id FROM assets WHERE missing=0 AND (${where})`)
     .all() as Array<{ id: number }>
   return new Set(rows.map((r) => r.id))
+}
+
+/**
+ * 「尺寸重测」的版本号（存 `meta.dims_rev`）。当前 = 2。
+ *
+ * v1 → v2 修的语义：`width/height` 从「EXIF 旋转前的原始像素尺寸 / 视频编码尺寸」改为
+ * **显示尺寸**（图片按 `autoOrient`、视频按 display matrix 交换宽高）。存量库里已写错的尺寸
+ * 不会自动重算 —— `writeImageMeta` 有 `if (row.width != null) return`、`writeVideoMeta` 的条件是
+ * `duration_ms IS NULL`，两者都「写过就不再碰」。所以必须显式清一次、让它们落回欠账条件被重测。
+ */
+const DIMS_REV = 2
+
+/**
+ * 版本化的一次性「尺寸重测」（幂等）。
+ *
+ * 做法：若 `meta.dims_rev` 还不到 `DIMS_REV`，就把**全部图片/视频**的 `width/height` 置空
+ * （视频的 `duration_ms` 也一并置空，让它落回 `thumbSinkWhere` 的欠账条件被重新入队 ——
+ * 视频的宽高是在 probe 时与时长一起写回的，不置空时长就进不了补写分支）。
+ * 随后**已有的** `thumb:backfill` 机制自然重测：全量 `SELECT … WHERE missing=0` → `ensureBatch(rows,'grid')`
+ * → `ensureOne` 命中缩略图缓存 → `generated:false` → 泵的补写分支（`writeIndexFields` /
+ * `writeVideoMetaIfPending`）把新尺寸补上。
+ *
+ * 触发点：`main.ts` 的 `thumb:backfill` handler（所有「开库」路径都会经过它）。无库时直接返回。
+ *
+ * ⚠️ **刻意的取舍**：视频的 `duration_ms` 会被短暂清空 → 卡片上的时长角标暂时消失，重测后恢复。
+ * 这是为了让视频宽高也能被重测（宽高与时长同一条 UPDATE 写回）。一次性、代价可接受。
+ */
+export function retestLegacyDims(): { cleared: boolean; rev: number } {
+  if (!getLibrary()) return { cleared: false, rev: DIMS_REV } // 无库：幂等直接返回
+  const { db } = requireCurrent()
+  const row = db.prepare("SELECT value FROM meta WHERE key='dims_rev'").get() as { value: string } | undefined
+  // 读不到 / 非数字一律当 0（最老）—— 老库没有这个键，必须当「需要重测」
+  const stored = row && /^\d+$/.test(row.value) ? Number(row.value) : 0
+  if (stored >= DIMS_REV) return { cleared: false, rev: stored }
+  db.prepare("UPDATE assets SET width=NULL, height=NULL WHERE type IN ('image','video')").run()
+  db.prepare("UPDATE assets SET duration_ms=NULL WHERE type='video'").run()
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('dims_rev',?)").run(String(DIMS_REV))
+  return { cleared: true, rev: DIMS_REV }
 }
 
 /** 批量生成（入队，立即返回）。onDone 在**这一批**全部完成时回调（冒烟测试用） */

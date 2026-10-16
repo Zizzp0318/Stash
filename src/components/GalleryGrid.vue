@@ -780,6 +780,8 @@ const ASSET_ERR: Record<string, string> = {
   // 重名不再报错（会自动加 ` (n)`），这条是兜底：万一哪天后端又改成拒绝，提示也得能读懂
   ERR_ASSET_EXISTS: '该文件夹下已存在同名文件',
   ERR_ASSET_MISSING: '磁盘上找不到该文件，请重新打开库以同步',
+  // 该文件正被占用（缩略图生成中 / 预览播放 / 其它程序读取）→ rename 被系统拒绝
+  ERR_FOLDER_BUSY: '该文件正被占用（可能正在预览/播放，或被其它程序读取），请稍后重试',
   ERR_ASSET_NOT_FOUND: '素材不存在（可能已被外部删除）'
 }
 function assetErrText(code?: string): string {

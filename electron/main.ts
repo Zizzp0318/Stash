@@ -28,7 +28,7 @@ import { runSmokeMeta } from './services/smoke-meta'
 import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
 import { runSmokeWatch } from './services/smoke-watch'
-import { ensureThumb, ensureBatch, SIZES, type ThumbSize } from './services/thumbs'
+import { ensureThumb, ensureBatch, retestLegacyDims, SIZES, type ThumbSize } from './services/thumbs'
 
 /**
  * 删库的**唯一收口入口**：删的是「当前正在监听的库」时，先停掉 chokidar 再删目录。
@@ -390,6 +390,10 @@ function bootstrap(): void {
     ipcMain.handle('thumb:backfill', (_e, { size }) =>
       wrap(() => {
         const s: ThumbSize = size in SIZES ? size : 'grid'
+        // 存量尺寸重测（幂等、一次性）：老库里写的是「EXIF 旋转前 / 忽略旋转」的尺寸，
+        // 先清空让它们落回欠账条件，下面的 ensureBatch 才会把它们重新纳入并补写成**显示尺寸**。
+        // 放这里而不是缩略图队列内部：所有「开库」路径都会调本 handler，挂这里最省事。
+        retestLegacyDims()
         const rows = librarySvc.getDatabase()
           .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE missing=0')
           .all() as Array<never>

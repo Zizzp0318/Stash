@@ -9,6 +9,7 @@ import { closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, r
 import { createTag, setTags } from './assets'
 import { importFiles } from './importer'
 import { ensureBatch } from './thumbs'
+import { renameWithRetry } from './fsutil'
 import { makeWaitUntil, type InputModifiers } from './smoke-util'
 
 function sleep(ms: number): Promise<void> {
@@ -161,7 +162,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
 
     // ==================== E. 重命名顶层：整棵子树都要跟着走 ====================
     step("E")
-    const renamed = renameFolder(f1.id, '已重命名')
+    const renamed = await renameFolder(f1.id, '已重命名')
     R.e_renameTop = {
       result: renamed,
       oldGone: !onDisk('一级'),
@@ -177,7 +178,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
 
     // ==================== F. 重命名中间层 ====================
     step("F")
-    const ren2 = renameFolder(byPath('已重命名/二级')!.id, '中层改名')
+    const ren2 = await renameFolder(byPath('已重命名/二级')!.id, '中层改名')
     R.f_renameMid = {
       result: ren2,
       folderPaths: folderPaths(),
@@ -706,6 +707,44 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     await capture('shot-folder-leaf.png')
     step(`K2 parent=${JSON.stringify(R.k2_parent)} filter=${JSON.stringify(R.k2_filter)} leaf=${JSON.stringify(R.k2_leaf)}`)
 
+    // ==================== L. 重命名重试助手（缺陷 1）====================
+    // 用**可注入的假 renameFn** 确定性造 EPERM（真实占用无法确定性复现，铁律 G13/G11）：
+    //   ① 前两次抛 EPERM、第三次成功 → 断言最终成功**且只尝试了 3 次**
+    //   ② 始终抛 EPERM → 断言抛 ERR_FOLDER_BUSY**且尝试次数 == 上限**
+    //   ③ EXDEV（非瞬时）→ 断言**立即抛、只尝试 1 次**（不会白等）
+    // 删掉重试逻辑后：① 会抛出 EPERM（threw 非空）、② 的尝试次数会变成 1 → 三条全红。
+    step('L')
+    {
+      const eperm = (): never => {
+        const e = new Error('EPERM: operation not permitted, rename') as NodeJS.ErrnoException
+        e.code = 'EPERM'
+        throw e
+      }
+      let callsA = 0
+      let threwA: string | null = null
+      try {
+        await renameWithRetry('a', 'b', {
+          attempts: 6, delays: [0, 0, 0, 0, 0],
+          renameFn: () => { callsA++; if (callsA < 3) eperm() }
+        })
+      } catch (e) { threwA = String((e as Error).message ?? e) }
+      let callsB = 0
+      let threwB: string | null = null
+      try {
+        await renameWithRetry('a', 'b', { attempts: 4, delays: [0, 0, 0], renameFn: () => { callsB++; eperm() } })
+      } catch (e) { threwB = String((e as Error).message ?? e) }
+      let callsC = 0
+      let threwC: string | null = null
+      try {
+        await renameWithRetry('a', 'b', {
+          attempts: 4, delays: [0, 0, 0],
+          renameFn: () => { callsC++; const e = new Error('EXDEV: cross-device link') as NodeJS.ErrnoException; e.code = 'EXDEV'; throw e }
+        })
+      } catch (e) { threwC = String((e as Error).message ?? e) }
+      R.l_retry = { callsA, threwA, callsB, threwB, callsC, threwC }
+      step(`L retry=${JSON.stringify(R.l_retry)}`)
+    }
+
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
     const c = R.c_import as { added: number[]; relPaths: string[]; tagLinks: number }
@@ -753,6 +792,10 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
     const k2l = (R.k2_leaf ?? {}) as {
       clicked?: boolean; active?: string | null; cards?: number[]; expect?: number[]; parentExpect?: number[]
+    }
+    const lRetry = (R.l_retry ?? {}) as {
+      callsA?: number; threwA?: string | null; callsB?: number; threwB?: string | null
+      callsC?: number; threwC?: string | null
     }
 
     R.checks = {
@@ -867,7 +910,20 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       leafFolderStaysDirect: k2l?.clicked === true && k2l?.active === '对照/目标' &&
         (k2l?.cards ?? []).join('|') === (k2l?.expect ?? []).join('|') &&
         (k2l?.expect?.length ?? 0) > 0 &&
-        (k2l?.parentExpect?.length ?? 0) > (k2l?.expect?.length ?? 0)
+        (k2l?.parentExpect?.length ?? 0) > (k2l?.expect?.length ?? 0),
+
+      // L 重命名重试助手（缺陷 1）：注入假 renameFn 确定性验证
+      // ① 前两次 EPERM、第三次成功 → 不抛错 + 恰好 3 次（删掉重试会变成 1 次且抛错 → 红）
+      renameRetrySucceeds: lRetry?.threwA === null && lRetry?.callsA === 3,
+      // ② 始终 EPERM → 抛 ERR_FOLDER_BUSY + 尝试次数 == 上限 4（删掉重试会变成 1 次 → 红）
+      renameRetryBusy: /ERR_FOLDER_BUSY/.test(lRetry?.threwB ?? '') && lRetry?.callsB === 4,
+      // ②b 裸码契约（QA 在渲染层实测否证过带后缀的写法）：耗尽时 message 必须**恰好**是
+      //     'ERR_FOLDER_BUSY'。渲染层两张映射表是**精确查表**，带任何后缀都会变死键 →
+      //     用户看到原始 `EPERM …+完整路径`。谁再往 message 加后缀，这条 `===` 立刻变红
+      //     （用 startsWith/正则就照不出来，所以**必须** `===`）。同步版走同一个 busyRenameError，一并覆盖。
+      renameRetryBareCode: lRetry?.threwB === 'ERR_FOLDER_BUSY',
+      // ③ EXDEV 非瞬时 → 立即抛、只尝试 1 次（不白等）
+      renameRetryNonTransient: /EXDEV/.test(lRetry?.threwC ?? '') && lRetry?.callsC === 1
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

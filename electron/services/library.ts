@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, renameSync, rmSync } from 'fs'
+import { existsSync, mkdirSync, rmSync } from 'fs'
 import { join, dirname, basename, relative, isAbsolute, resolve } from 'path'
 import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
 import { subtreeOfPath, validateName } from './paths'
+import { renameWithRetry } from './fsutil'
 
 let current: { db: DB; path: string } | null = null
 
@@ -177,8 +178,17 @@ export function mkdirChild(parentPath: string, rawName: string): { id: number; p
  * 重命名文件夹：物理目录先改名，成功后再在同一事务里同步
  * folders 子树的 path 与 assets.rel_path（否则素材会指向不存在的老路径）。
  * 索引写失败则把物理目录名改回去，避免磁盘与索引不一致。
+ *
+ * ⚠️ **异步**（返回 Promise）：正向改名走 `renameWithRetry` 的有界重试 —— Windows 上只要该目录内
+ * 任一文件此刻被打开（我们自己的缩略图生成中、资源管理器生成缩略图、杀软扫描、索引器……），
+ * `renameSync(目录)` 就会抛 `EPERM`（实测见 `.workbuddy/audit/probe-libvips-rename.mjs`）。
+ * 这类占用多半是瞬时的，重试几次通常就好了；重试期间 `await` 让出主进程，界面不卡。
+ *
+ * ⚠️ **rename 之后的 DB 事务必须仍留在同一个同步块内、中间不得再有 await**：
+ * 一旦事务里出现 await，事件循环里别的 IPC 就可能插进这半开的事务读到中间态。
+ * 所以本函数的形状是：`await` 物理改名（事务外）→ 同步的 `BEGIN…COMMIT`（一个 await 都没有）。
  */
-export function renameFolder(id: number, rawName: string): { id: number; path: string; folders: number; assets: number } {
+export async function renameFolder(id: number, rawName: string): Promise<{ id: number; path: string; folders: number; assets: number }> {
   const { db, path: libPath } = requireCurrent()
   const name = validateFolderName(rawName)
   const row = db.prepare('SELECT id, path, name FROM folders WHERE id=?').get(id) as
@@ -200,7 +210,8 @@ export function renameFolder(id: number, rawName: string): { id: number; path: s
   }
   if (!existsSync(oldAbs)) throw new Error('ERR_FOLDER_MISSING')
 
-  renameSync(oldAbs, newAbs)
+  // 物理改名：有界重试（占用常见且多为瞬时），事务外
+  await renameWithRetry(oldAbs, newAbs)
 
   // 父先子后更新，避免 UNIQUE(path) 出现暂时冲突
   const sub = subtreeRows(db, row.path).sort((a, b) => a.path.length - b.path.length)
@@ -234,9 +245,11 @@ export function renameFolder(id: number, rawName: string): { id: number; path: s
     db.exec('COMMIT')
   } catch (e) {
     db.exec('ROLLBACK')
-    // 索引没改成 → 物理目录名也改回去，保持两边一致
+    // 索引没改成 → 物理目录名也改回去，保持两边一致。
+    // 回滚是 best-effort，用**短重试**（2~3 次）：此刻目录刚被我们改过名，几乎没有占用来源，
+    // 但保险起见仍给它一次瞬时占用的机会；失败也只是「磁盘目录名没改回来」，不影响抛出的原错误。
     try {
-      renameSync(newAbs, oldAbs)
+      await renameWithRetry(newAbs, oldAbs, { attempts: 3, delays: [0, 80] })
     } catch {
       /* 回滚物理也失败，只能把错误抛出去 */
     }

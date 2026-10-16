@@ -92,6 +92,8 @@ const FOLDER_ERR: Record<string, string> = {
   ERR_FOLDER_EXISTS: '同级下已存在同名文件夹',
   ERR_FOLDER_NOT_FOUND: '文件夹不存在（可能已被外部删除）',
   ERR_FOLDER_MISSING: '磁盘上找不到该目录，请重新打开库以同步',
+  // 目录内某文件正被占用（缩略图生成中 / 资源管理器或杀软正在读 / 正在预览播放）→ rename 被系统拒绝
+  ERR_FOLDER_BUSY: '该文件夹正被占用（可能有文件正在预览/播放，或被其它程序读取），请稍后重试',
   ERR_PROTECTED_FOLDER: '该目录受保护，不能操作',
   ERR_OUTSIDE_LIBRARY: '路径超出库目录',
   ERR_NO_LIBRARY: '未打开任何库'
