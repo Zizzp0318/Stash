@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
+import { unwatchLibrary } from './watcher'
 import { closeCurrent, createLibrary, deleteLibrary, requireCurrent } from './library'
 import { createTag, listAssets, setTags, updateAsset } from './assets'
 import { importFiles } from './importer'
@@ -670,13 +671,23 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
   } finally {
     R.jsErrors = jsErrors
     if (jsErrors.length) R.rendererLogs = rendererLogs.filter((l) => /error|Error|warn|Warn/.test(l)).slice(-8)
+    // ⚠️ 删库前先停 chokidar：它还持有库目录句柄，Windows 上会让 rmSync 抛 ENOTEMPTY/EPERM，
+    // 于是 `deleteLibrary` 失败 → 库目录留在临时目录里 → 外层的 rmSync 必然也失败。
+    // 这是 `main.ts` 的 `deleteLibrarySafely` 早就写死的纪律，`smoke-folder.ts` 也已对齐，这里补齐。
+    unwatchLibrary()
     try {
       if (libPath && existsSync(join(libPath, '.stash'))) deleteLibrary(libPath)
     } catch (e) {
       R.cleanupError = String(e)
     }
     closeCurrent()
-    if (dir) rmSync(dir, { recursive: true, force: true })
+    // 临时目录清理失败只记录、不抛 —— 这一段夹在「结果 JSON」与 `app.exit(0)` 之间，
+    // 一旦抛出就把整轮结论一起吞掉（表现为「无结论地挂死」，只能靠外部超时杀；QA 本轮就被这个卡住）。
+    try {
+      if (dir) rmSync(dir, { recursive: true, force: true })
+    } catch (e) {
+      R.cleanupError = `${R.cleanupError ? `${R.cleanupError}；` : ''}临时目录清理失败：${String((e as Error).message ?? e)}`
+    }
     console.log('[SMOKE-SEARCH] ' + JSON.stringify(R))
     app.exit(0)
   }

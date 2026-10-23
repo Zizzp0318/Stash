@@ -94,6 +94,11 @@ const FOLDER_ERR: Record<string, string> = {
   ERR_FOLDER_MISSING: '磁盘上找不到该目录，请重新打开库以同步',
   // 目录内某文件正被占用（缩略图生成中 / 资源管理器或杀软正在读 / 正在预览播放）→ rename 被系统拒绝
   ERR_FOLDER_BUSY: '该文件夹正被占用（可能有文件正在预览/播放，或被其它程序读取），请稍后重试',
+  // 删除进行到一半被系统拒绝（目录里有文件被别的程序独占）。**文件可能已经被删掉一部分**，
+  // 所以文案必须说清「已删的已标记失效」，不能让用户以为「删除失败 = 什么都没发生」。
+  ERR_FOLDER_DELETE_PARTIAL:
+    '删除被中断：部分文件已被删除（可能有文件正被其它程序占用）。已删除的条目已在索引中标记失效，' +
+    '请关闭占用该文件夹的程序后重试',
   ERR_PROTECTED_FOLDER: '该目录受保护，不能操作',
   ERR_OUTSIDE_LIBRARY: '路径超出库目录',
   ERR_NO_LIBRARY: '未打开任何库'
@@ -253,13 +258,35 @@ async function commitDraft(): Promise<void> {
       const target = lib.folderById.get(renameId)
       if (!target) return cancelDraft()
       if (target.name === name) return clearDraft(seq) // 名字没变，什么都不做
+      // 哪些「正在被预览的素材」落在这棵子树里 —— 改名会 destroy 它们的媒体读流，
+      // 所以只有这些素材需要重载一次（见 stores/assets 的 `mediaRev`）。
+      // 必须在改名**之前**取：改完 lib.items / detail 里的 rel_path 都已经换成新路径了。
+      const prefix = `${target.path}/`
+      const affectedPreviewIds: number[] = []
+      if (assets.detail && assets.detail.rel_path.startsWith(prefix)) affectedPreviewIds.push(assets.detail.id)
+      const overlayRow = assets.previewId != null ? assets.items.find((i) => i.id === assets.previewId) : undefined
+      if (overlayRow && overlayRow.rel_path.startsWith(prefix) && !affectedPreviewIds.includes(overlayRow.id)) {
+        affectedPreviewIds.push(overlayRow.id)
+      }
       const r = await window.stash.folder.rename(renameId, name)
       if (!r.ok) throw new Error(r.error ?? '重命名失败')
       clearDraft(seq)
       // 重命名会改动该子树的 rel_path，列表刷新一次拿新路径
       await lib.loadMeta()
       await assets.refresh()
-      assets.notify('info', `已重命名为「${name}」`)
+      // 详情栏也要重拉：素材 id 没变但 rel_path 变了，`stash://media/{id}` 在主进程按 id 查库解析，
+      // 重拉能拿到新的 rel_path / 尺寸等展示字段（与 App.vue 的 onExternal 同一条路径）。
+      await assets.reloadDetail()
+      // 只有「媒体流被我们 destroy 掉」的素材才 bump 版本号 —— 它会让 `<video>`/`<img>` 换 URL 重载。
+      // 注意**不要**把这件事做成「rel_path 变了就重载」：外部变更也会改 rel_path 对象，
+      // 那会把正在播的视频每隔 ~1.4s 打回 0 秒（QA 实测过的回归）。
+      for (const id of affectedPreviewIds) assets.bumpMedia(id)
+      assets.notify(
+        'info',
+        affectedPreviewIds.length
+          ? `已重命名为「${name}」（其中的预览已停止并重新加载）`
+          : `已重命名为「${name}」`
+      )
     } else if (parentId != null) {
       const parent = lib.folderById.get(parentId)
       if (!parent) return cancelDraft()

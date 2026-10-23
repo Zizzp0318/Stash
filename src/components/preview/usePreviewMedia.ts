@@ -6,6 +6,7 @@
 //   所以要先问 `preview.info`：直出就给地址；要派生就先 `ensure` + 监听进度，
 //   等派生文件就绪后再把地址交给媒体元素；unsupported 则交给 UI 显示回退。
 import { ref, watch, type Ref } from 'vue'
+import { useAssetStore } from '../../stores/assets'
 import type { StashAssetRow, StashPreviewInfo } from '../../env'
 
 export type PreviewStatus = 'loading' | 'ready' | 'deriving' | 'unsupported' | 'error'
@@ -104,9 +105,27 @@ export function usePreviewMedia(asset: Ref<StashAssetRow | null>) {
     }
   }
 
+  /**
+   * 装载时机 = 「换了素材」**或**「这个素材的媒体被我们主动作废了」。
+   *
+   * ⚠️ getter 必须返回**标量**（字符串），**绝不能返回数组/对象**：
+   *   数组每次求值都是新引用，`Object.is` 恒不等 → 只要 getter 被重算就会 `load()`
+   *   （Vue 在依赖变化时会重算，而 `assets.detail` 每次 IPC 都是新对象，`App.vue` 的
+   *   `onExternal → reloadDetail()` 在长拷贝期间每 ~1.4s 就会换一次）→ `<video :src>` 被换成
+   *   新 URL → 正在播的视频从头开始（QA 实测：外部变更后 ct 2.01s→0、paused=true）。
+   *
+   * ⚠️ 依赖里**不要放 `rel_path`**：`stash://media/{id}` 是按 id 查库解析路径的，`rel_path` 变了
+   *   URL 也不变；而 rel_path 在与播放无关的场景也会变。真正「必须重载」的只有
+   *   `library.renameFolder`（那条路径会 destroy 该子树的读流）—— 由调用方 `bumpMedia(id)` 表达。
+   */
   watch(
-    () => asset.value?.id,
-    (id) => {
+    () => {
+      const a = asset.value
+      if (!a) return ''
+      return `${a.id}|${useAssetStore().mediaRevOf(a.id)}`
+    },
+    () => {
+      const id = asset.value?.id
       if (id != null) void load(id)
     },
     { immediate: true }

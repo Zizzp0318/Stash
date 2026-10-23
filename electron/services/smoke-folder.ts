@@ -1,15 +1,30 @@
 // 文件夹管理冒烟：多级新建 / 重命名（子树 path 与 assets.rel_path 同步）/ 物理删除（不进回收站）
 // 前半段直接调服务层核对磁盘与数据库，后半段用真实鼠标/键盘事件驱动侧栏右键菜单走一遍 UI。
+// 末尾 M 段是「重命名一个**正在被我们自己预览**的文件夹」（用户报的「一级文件夹改不了名」的原形）：
+// 必须先把 preview 的读流放掉，否则 Windows 上 rename(目录) 恒 EPERM。
 import { app, BrowserWindow } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs'
+import { spawn } from 'child_process'
+import { randomFillSync } from 'crypto'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
-import { closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, renameFolder, requireCurrent } from './library'
+import {
+  closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, openLibrary, renameFolder, requireCurrent
+} from './library'
 import { createTag, setTags } from './assets'
 import { importFiles } from './importer'
-import { ensureBatch } from './thumbs'
+import { ensureBatch, ensureThumb, pumpState } from './thumbs'
 import { renameWithRetry } from './fsutil'
+import {
+  __testForceNullFolderId, isWatching, reconcileLibrary, suspendWatchingAsync, unwatchLibrary, watchLibrary,
+  watchedDirCount, whenWatcherReady
+} from './watcher'
+import {
+  __testAddUnclosableStream, activeMediaStreamCount, clearMediaSuppression, mediaSuppressionActivations,
+  releaseMediaUnderAsync, serveMedia, suppressMediaUnder
+} from './preview'
+import { lastRenameIsolation, watcherActive, watcherSuspensions } from './handles'
 import { makeWaitUntil, type InputModifiers } from './smoke-util'
 
 function sleep(ms: number): Promise<void> {
@@ -50,6 +65,14 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
 
   const abs = (rel: string): string => join(libPath, ...rel.split('/'))
   const onDisk = (rel: string): boolean => existsSync(abs(rel))
+  /** readdir 的安全版：目录不存在/被占用时返回空数组（诊断探针用） */
+  const readdirSyncSafely = (p: string): string[] => {
+    try {
+      return readdirSync(p).sort()
+    } catch {
+      return []
+    }
+  }
   const folderRows = (): Array<{ id: number; parent_id: number | null; path: string; name: string }> =>
     D().prepare('SELECT id, parent_id, path, name FROM folders ORDER BY path').all() as never
   const folderPaths = (): string[] => folderRows().map((f) => f.path).sort()
@@ -66,9 +89,32 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       return String((e as Error).message ?? e)
     }
   }
+  /**
+   * 同 `nah`，但接受**异步**操作（`deleteFolder` 现在是 async：错误在 Promise 里，
+   * 用同步版 `nah` 会得到 `NO_ERROR` —— 那会让 B 段「隐藏目录受保护」变成假绿）。
+   */
+  const nahAsync = async (fn: () => Promise<unknown>): Promise<string> => {
+    try {
+      await fn()
+      return 'NO_ERROR'
+    } catch (e) {
+      return String((e as Error).message ?? e)
+    }
+  }
   const step = (s: string): void => console.log('[SMOKE-FOLDER-STEP] ' + s)
   const importTo = (paths: string[], folderId: number): Promise<{ added: number }> =>
     new Promise((resolve) => importFiles({ paths, folderId, mode: 'copy', onDone: (x) => resolve(x) }))
+
+  /** 造一张**内容唯一**的小 PNG（每张色彩/尺寸都不同 → content_hash 不同，不会被导入去重） */
+  const makePng = async (seed: number): Promise<Buffer> =>
+    sharp({
+      create: {
+        width: 24 + (seed % 5),
+        height: 24,
+        channels: 3,
+        background: { r: (seed * 23) % 256, g: (seed * 47) % 256, b: (seed * 91) % 256 }
+      }
+    }).png().toBuffer()
 
   try {
     // 先等渲染层的 bootstrap() 跑完（它可能在最近列表里自动开库，会把我们的手柄换掉）
@@ -110,7 +156,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       dup: nah(() => mkdirChild('一级', '二级')),
       missingParent: nah(() => mkdirChild('不存在的父级', 'x')),
       // 隐藏目录受保护：即使被塞进 folders 表也不允许当普通文件夹删掉
-      protectedDir: nah(() => deleteFolder(Number(thumbsId)))
+      protectedDir: await nahAsync(() => deleteFolder(Number(thumbsId)))
     }
     D().prepare('DELETE FROM folders WHERE id=?').run(thumbsId)
 
@@ -188,10 +234,34 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
 
     // ==================== G. 删除整棵子树：物理删除 + 索引清理 + 缓存回收 ====================
+    //
+    // ⚠️ QA 第四轮点出这里以前是**假绿**：G 紧接 F 段改名之后「零等待」就删，而那一刻
+    // 根本没有监听器（冒烟从没启过），删含子目录的目录当然成功。
+    // 现在**先真起监听器并等 ready**，让这条断言真的覆盖「watcher 在场时删含子目录的文件夹」——
+    // 那正是会抛 ENOTEMPTY 且文件已被删光（无回收站）的高危场景。
     step("G")
+    watchLibrary(libPath, D())
+    const gReady = await whenWatcherReady(15000)
+    const suspBeforeG = watcherSuspensions()
     const thumbsBeforeDelete = thumbDirsOnDisk()
-    const del = deleteFolder(byPath('已重命名')!.id)
+    // ⚠️ 自己 catch：不隔离时 rmSync 会抛 ENOTEMPTY（且文件已被删光）。
+    // 让异常冒到最外层的话，整轮只剩一个 `R.error`、所有具名断言消失 —— 那不是可归档的红。
+    let del: Awaited<ReturnType<typeof deleteFolder>> | null = null
+    let delErr: string | null = null
+    try {
+      del = await deleteFolder(byPath('已重命名')!.id)
+    } catch (e) {
+      delErr = String((e as Error).message ?? e)
+    }
     R.g_delete = {
+      delErr,
+      // 数据丢失探针：报错但文件已经没了（= 用户看到的「点了删除，图没了」）
+      filesAlreadyGone: delErr !== null && readdirSyncSafely(abs('已重命名/中层改名/三级')).length === 0,
+      watcherReady: gReady,
+      suspDelta: watcherSuspensions() - suspBeforeG,
+      watchingAfter: isWatching(),
+      // 「半状态」探针：文件没了但空目录还在（rmSync 中途抛 ENOTEMPTY 的痕迹）
+      leftoverDirs: ['已重命名', '已重命名/中层改名', '已重命名/中层改名/三级'].filter((p) => onDisk(p)),
       result: del,
       diskGone: !onDisk('已重命名'),
       foldersLeft: folderPaths(),
@@ -200,7 +270,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       orphanTagLinks: (D().prepare('SELECT count(*) AS c FROM asset_tags').get() as { c: number }).c,
       tagsLeft: (D().prepare('SELECT count(*) AS c FROM tags').get() as { c: number }).c,
       // 自动清理掉的标签名 —— 唯一那个标签挂在被删的素材上，应当随素材一起消失
-      prunedTags: del.pruned.map((p) => p.name),
+      prunedTags: (del?.pruned ?? []).map((p) => p.name),
       thumbsBeforeDelete,
       thumbsLeft: thumbDirsOnDisk(),
       // 对照组必须毫发无伤
@@ -745,6 +815,831 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       step(`L retry=${JSON.stringify(R.l_retry)}`)
     }
 
+    // ==================== M. 重命名「正在被我们预览」的文件夹（本工单的 bug 形态）====================
+    // 用户报的现象：一级文件夹一直改不了名，弹「该文件夹正被占用…请稍后重试」。
+    // 根因是**我们自己**：详情栏默认展开，选中素材就有一个 `createReadStream(原文件)` 开着
+    // （`stash://media/{id}` → preview.streamBody），Windows 上目录内任一文件被打开 → rename EPERM。
+    //
+    // 这条断言必须**端到端**，而且要真的把流开在盘上（不能 mock）：
+    //   ① 造一个几 MB 的图（小文件一次就读完了，句柄会自己关掉 → 断言会变成空转）；
+    //   ② 走真正的 `serveMedia()` 拿 Response，`getReader()` 读一块**就停**（背压把流挂在盘上）；
+    //   ③ 前置断言「此刻登记表里确实有 ≥1 个活跃流」—— 否则后面的「释放成 0」是拿 0 比 0（G11）；
+    //   ④ `await renameFolder(...)`，断言改名成功 + 磁盘换成新名 + 索引同步；
+    //   ⑤ 断言流真的被销毁（登记表 0 + 读者只能拿到 done/错误），而不是「恰好自己跑完了」。
+    // 注入验证：把 `library.renameFolder` 里的释放那两行去掉 → 这条必红（rename 会耗尽重试抛
+    // ERR_FOLDER_BUSY，整个套件 catch 到 R.error），实测记录见 `.workbuddy/audit/`。
+    step('M')
+    {
+      /**
+       * 整段包在 60s 总闸门里：**冒烟绝不允许因为被测链路卡死而"无结论地"挂死**（G4）。
+       * 实测（注入验证：去掉 library 里的释放/抑制）时，第 5 次 `serveMedia` 会长时间不返回 ——
+       * 那不是产品的错，但那会让整轮只留下一个超时退出码。加了闸门之后，同样的注入态会
+       * 稳定表现为「renameError=ERR_FOLDER_BUSY → renameWhilePreviewing 红 + ok=false」，可读可归档。
+       */
+      const mBody = async (): Promise<Record<string, unknown>> => {
+        // 抑制窗口的机制自检（先做，避免与下面那条长驻流互相干扰）：
+        // 窗口内必须拒（409），窗口过期后必须恢复（200）——「窗口永不失效」会让预览永久黑屏。
+        const mFolder = mkdirChild('', '预览中改名')
+        const mAbs = abs('预览中改名')
+        // 箭头函数里 `dir`（外层 `string | null`）的收窄会丢，这里显式取一次并断言
+        const workDir = dir
+        if (!workDir) throw new Error('M 段需要临时目录')
+        const bigDir = join(workDir, 'bigsrc')
+        mkdirSync(bigDir, { recursive: true })
+        const BIG = 'big.png'
+        const bigPath = join(bigDir, BIG)
+        {
+          // 随机像素 → PNG 压不动 → 几 MB，保证一次 read 读不完
+          const w = 1400
+          const h = 1400
+          const raw = Buffer.alloc(w * h * 3)
+          randomFillSync(raw)
+          await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).png().toFile(bigPath)
+        }
+        await importTo([bigPath], mFolder.id)
+        const mId = (D().prepare('SELECT id FROM assets WHERE folder_id=?').get(mFolder.id) as { id: number }).id
+        const mRelBefore = (D().prepare('SELECT rel_path FROM assets WHERE id=?').get(mId) as { rel_path: string }).rel_path
+
+        // —— D2 用：**另一个子树**里也放一个素材。改名 A 之后 B 的流必须还活着 ——
+        // 一条断言同时锁两件事：① 释放按子树收敛（不是「释放全部」）；② `renameFolder` 不误伤无关素材的播放。
+        const bFolder = mkdirChild('', '旁观者')
+        const bAbs = abs('旁观者')
+        const big2Path = join(bigDir, 'big2.png')
+        {
+          const w = 900
+          const h = 900
+          const raw = Buffer.alloc(w * h * 3)
+          randomFillSync(raw)
+          await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).png().toFile(big2Path)
+        }
+        await importTo([big2Path], bFolder.id)
+        const bId = (D().prepare('SELECT id FROM assets WHERE folder_id=?').get(bFolder.id) as { id: number }).id
+        const serveB = async (): Promise<Response> => serveMedia(new Request(`stash://media/${bId}`), String(bId))
+        const serveThis = async (): Promise<Response> => serveMedia(new Request(`stash://media/${mId}`), String(mId))
+        /**
+         * 有界地取一次状态码并立刻 cancel 掉响应体。
+         * ⚠️ 每个 await 都要有界（G4）：注入验证（去掉释放）时「流还开着」这种态下，
+         * `serveMedia` 的某一步会长时间不返回 —— 那会让整轮冒烟**无结论地挂死**，
+         * 而我们要的是「这条断言变红」。5s 上限对本地文件服务足够宽松。
+         */
+        const serveStatus = async (): Promise<number | null> => {
+          const r = await Promise.race([serveThis(), sleep(5000).then(() => null)])
+          if (!r) return null
+          await Promise.race([(r.body?.cancel() ?? Promise.resolve()).catch(() => undefined), sleep(2000)])
+          return r.status
+        }
+
+        // —— ① 抑制窗口：开 → 409 → 过期 → 200 ——
+        suppressMediaUnder(mAbs, 300)
+        const blockedStatus = await serveStatus()
+        await sleep(450) // 等窗口自动过期（G4：这里是在测「过期」这个时间语义，不是等状态）
+        const afterExpireStatus = await serveStatus()
+        clearMediaSuppression() // 万一上面的等待不够，别把抑制带进后面的真实改名
+
+        // —— ② 把流真的打开并读一块（不读完 → 句柄挂在盘上）——
+        const resp = await Promise.race([serveThis(), sleep(5000).then(() => null)])
+        const reader = resp?.body?.getReader() ?? null
+        const firstChunk = reader ? await Promise.race([reader.read(), sleep(5000).then(() => null)]) : null
+        // 首块字节数也是判据：> 0 才说明「字节真的从磁盘流出来了」（句柄确实开着），
+        // 否则「登记表里有一条」可能只是个还没读到数据的空壳。
+        const firstBytes = firstChunk?.value?.byteLength ?? 0
+        const openBefore = activeMediaStreamCount(mAbs)
+        // —— D2：B 子树也开一条流（读一块后停住，句柄挂在盘上）——
+        const respB = await Promise.race([serveB(), sleep(5000).then(() => null)])
+        const readerB = respB?.body?.getReader() ?? null
+        const firstChunkB = readerB ? await Promise.race([readerB.read(), sleep(5000).then(() => null)]) : null
+        const bystanderOpenBefore = activeMediaStreamCount(bAbs)
+        const bystanderFirstBytes = firstChunkB?.value?.byteLength ?? 0
+
+        const suppressBefore = mediaSuppressionActivations()
+        const tRename = Date.now()
+        step(`M-stream open before=${openBefore} firstBytes=${firstBytes} bystander=${bystanderOpenBefore}/${bystanderFirstBytes}`)
+
+        // —— ③ 前置：此刻必须有活跃流，否则后面的「释放为 0」是 0===0 的空转 ——
+        // 这里**自己 catch** 而不是让异常冒到最外层：让「改名失败」表现为一条具名断言为红
+        // （带 ERR_FOLDER_BUSY 原文），而不是整轮只有一个 R.error。
+        let renamedM: { id: number; path: string; folders: number; assets: number } | null = null
+        let renameError: string | null = null
+        // 15s 护栏：renameWithRetry 的预算 ≈3.3s，再长就说明卡住了 ——
+        // 冒烟**绝不允许**因为被测链路卡死而整轮无结论地挂着（G4 有界）。
+        const renamed = await Promise.race([
+          renameFolder(mFolder.id, '已改名').then(
+            (r) => ({ r, e: null as string | null }),
+            (e) => ({ r: null, e: String((e as Error).message ?? e) })
+          ),
+          sleep(15000).then(() => ({ r: null, e: 'TIMEOUT' }))
+        ])
+        renamedM = renamed.r
+        renameError = renamed.e
+        const renameMs = Date.now() - tRename
+        const suppressDelta = mediaSuppressionActivations() - suppressBefore
+        step(`M-rename 完成：error=${renameError ?? 'null'} ms=${renameMs} suppressDelta=${suppressDelta}`)
+        const openAfter = activeMediaStreamCount(abs('已改名'))
+        // 同时数旧路径：改名**失败**时目录还叫旧名，只数新路径会恒为 0（那会让这条判据失去鉴别力）。
+        const openAfterOld = activeMediaStreamCount(mAbs)
+
+        // —— D2：B 子树的流必须还活着（计数 + 真的还能读出字节）——
+        const bystanderAfter = activeMediaStreamCount(bAbs)
+        let bystanderReadAlive = false
+        let bystanderRead = 'not-read'
+        if (readerB) {
+          const rb = await Promise.race([
+            readerB.read().then(
+              (r) => ({ kind: 'ok' as const, r }),
+              (e) => ({ kind: 'err' as const, e })
+            ),
+            sleep(3000).then(() => ({ kind: 'timeout' as const }))
+          ])
+          if (rb.kind === 'ok') {
+            bystanderRead = rb.r.done ? 'done' : `chunk:${rb.r.value?.byteLength ?? 0}`
+            bystanderReadAlive = !rb.r.done && (rb.r.value?.byteLength ?? 0) > 0
+          } else if (rb.kind === 'err') {
+            bystanderRead = 'ERR:' + String((rb.e as Error).message ?? rb.e).slice(0, 60)
+          } else {
+            bystanderRead = 'timeout'
+          }
+        }
+        step(`M-bystander after=${bystanderAfter} read=${bystanderRead}`)
+
+        // —— D3：`releaseMediaUnderAsync` 的 300ms 上限必须**真的**在起作用 ——
+        // 造「B 子树的一条真流 + 一条永不 close 的流」，直接量释放耗时（机制断言）：
+        //   · 上限被改成 0 → 耗时塌到 <250ms（根本没在等）→ red
+        //   · 上限被删掉（直接 await 全部 close）→ 永远不返回 → 这里 3s 闸门给 -1 → red
+        // ⚠️ 刻意**不**在「有卡住的流在场」时再调 `serveMedia`：实测那样会把主进程事件循环挂死
+        //    （假流留登记表里时，后续 serveMedia 的异步续体会卡住，ticker 停摆；见 `.workbuddy/audit/g14/folder4~9.log`），
+        //    而冒烟绝不允许无结论挂死（G4）。
+        const detachStuck = __testAddUnclosableStream(join(bAbs, 'stuck.bin'))
+        const tRelease = Date.now()
+        const releasedCount = await Promise.race([
+          releaseMediaUnderAsync(bAbs),
+          sleep(3000).then(() => -1)
+        ])
+        const releaseMs = Date.now() - tRelease
+        detachStuck()
+        step(`M-release cap: count=${releasedCount} ms=${releaseMs}`)
+        if (readerB) await Promise.race([readerB.cancel().catch(() => undefined), sleep(2000)])
+
+        // —— ④ 流必须是被销毁的：再读一次只能拿到 done 或错误 ——
+        // ⚠️ 必须给 `read()` 加**超时**：注入验证（去掉释放）时流还开着且停在背压上，
+        // 没有新数据也没有错误 → `await reader.read()` 会**永远挂着**，整轮冒烟无结论地挂死。
+        // 超时既保住「有界」（G4），也能把「流还活着」这件事如实记成 `readAfter='timeout'`。
+        let streamKilled = false
+        let readAfter: string = 'not-read'
+        if (reader) {
+          const r2 = await Promise.race([
+            reader.read().then(
+              (r) => ({ kind: 'ok' as const, r }),
+              (e) => ({ kind: 'err' as const, e })
+            ),
+            sleep(2000).then(() => ({ kind: 'timeout' as const }))
+          ])
+          if (r2.kind === 'timeout') {
+            readAfter = 'timeout'
+            streamKilled = false // 还能继续挂着 = 流没被销毁
+          } else if (r2.kind === 'err') {
+            readAfter = 'ERR:' + String((r2.e as Error).message ?? r2.e).slice(0, 60)
+            streamKilled = true // 被 destroy 的流会以错误终结
+          } else {
+            readAfter = r2.r.done ? 'done' : `chunk:${r2.r.value?.byteLength ?? 0}`
+            streamKilled = r2.r.done === true
+          }
+          await Promise.race([reader.cancel().catch(() => undefined), sleep(2000)])
+        }
+
+        step(`M-stream killed=${streamKilled} readAfter=${readAfter}`)
+        // —— ⑤ 改名结束后抑制必须已解除，否则预览会永久 409 ——
+        // 只在**改名成功**时才查：失败时路径没变，没有「新路径」可查；
+        // 而且实测在「流还开着」的注入态下这次请求会卡住（会让整段闸门超时）。
+        const reopenStatus = renamedM ? await serveStatus() : null
+        step(`M-reopen status=${reopenStatus}`)
+
+        return {
+          blockedStatus,
+          afterExpireStatus,
+          openBefore,
+          firstBytes,
+          openAfter,
+          openAfterOld,
+          renameMs,
+          suppressDelta,
+          bystanderOpenBefore,
+          bystanderFirstBytes,
+          bystanderAfter,
+          bystanderRead,
+          bystanderReadAlive,
+          releasedCount,
+          releaseMs,
+          readAfter,
+          streamKilled,
+          renameError,
+          renamedPath: renamedM?.path ?? null,
+          oldGone: !onDisk('预览中改名'),
+          fileOnDisk: onDisk(`已改名/${BIG}`),
+          dbRel: (D().prepare('SELECT rel_path FROM assets WHERE id=?').get(mId) as { rel_path: string }).rel_path,
+          relBefore: mRelBefore,
+          reopenStatus
+        }
+      }
+
+      const raced = await Promise.race([
+        mBody().then((v) => ({ finished: true as const, v })),
+        sleep(60000).then(() => ({ finished: false as const }))
+      ])
+      R.m_previewRename = raced.finished ? raced.v : { timeout: true }
+      step(`M ${JSON.stringify(R.m_previewRename)}`)
+    }
+
+    // ==================== M2. 真实 watcher 在场时改顶层目录（第三轮根因：chokidar 逐目录句柄）====================
+    //
+    // 用户报的「一级文件夹永远改不了名」，第三轮实测根因是**我们自己的目录监听器**：
+    // chokidar 在 Windows 上逐目录建 `fs.watch`，只要某个**子目录**上挂着句柄，改它**祖先目录**的名就必 EPERM
+    // （`.workbuddy/audit/probe-watch-shape.mts`：顶层目录只含文件 → OK；含 1 个 / 11 个子目录 → EPERM；
+    //   停 watcher → 全 OK）。上一轮只修了「释放预览读流」，所以用户环境里仍然失败。
+    //
+    // 本段必须**端到端**且**真实 watcher 在场**：
+    //   ① 造与用户库同构的形状（顶层目录 + 子目录 + 真导入的文件）；
+    //   ② 真 `watchLibrary()` 并等 chokidar ready（用户在 dev 里就是长开着监听）；
+    //   ③ 记录一个**诊断**基线：此时裸 `renameSync` 一个同形的物理目录是否真的被挡（本机能否复现）；
+    //   ④ `renameFolder` 顶层目录 → 必须成功，索引与磁盘同步；
+    //   ⑤ 恢复自证：改名后往新目录里写一个外部文件，watcher 必须还能索引到它（监听器真恢复了）；
+    //      再让缩略图泵给它出图（泵真恢复了），并核对「重挂没有产生重复 watcher」（目录数不变）。
+    //   ⑥ 第 2 级隔离的**确定性**覆盖：注入一个「watcher 还在就抛 EPERM、watcher 停了就真改名」的 renameFn，
+    //      强制走到「停监听器再试」这一步，断言它确实成功、确实停/重挂过。
+    //      —— 注入验证：把 `library.renameFolder` 里 `suspendWatcherForRename()` 那段删掉 → ⑥ 立刻变红。
+    step('M2')
+    {
+      const workDir = dir
+
+      /** 有界轮询 DB（G4）：超时返回 false，调用方必须把结果并入断言 */
+      const waitDbRow = async (rel: string, ms: number): Promise<boolean> => {
+        const t0 = Date.now()
+        while (Date.now() - t0 < ms) {
+          if (D().prepare('SELECT id FROM assets WHERE rel_path=?').get(rel)) return true
+          await sleep(200)
+        }
+        return false
+      }
+
+      const m2Body = async (): Promise<Record<string, unknown>> => {
+        if (!workDir) throw new Error('M2 段需要临时目录')
+
+        // ③ 诊断基线用的物理目录。**必须在 `watchLibrary` 之前建好**：
+        // chokidar 只给「启动时扫描到的 + 之后通过事件发现的」目录挂 watch，
+        // 建晚了那一刻它还没挂上句柄 → 探针会假报「未复现」（第一版就踩了这个坑）。
+        // 内含一个文件是为了贴近用户库的形状（纯空目录在部分分支上不会被逐层挂 watch）。
+        const probeDir = join(libPath, '__m2_probe__')
+        mkdirSync(join(probeDir, 'sub'), { recursive: true })
+        // ⚠️ 扩展名必须是**非素材**（.bin）：chokidar 的 watch 是按目录挂的，与文件类型无关，
+        // 但盲窗对账会按 `EXT_TYPE` 过滤 —— 用 .png 的话这个探针文件本身会被对账「补」进索引，
+        // 凭空多出一行素材 + 一个 folders 行（第一版实测：M2 之后对账日志报「补回 1 个」）。
+        writeFileSync(join(probeDir, 'sub', 'x.bin'), Buffer.from([0x00, 0x01, 0x02]))
+
+        // ① 用户库同构形状：顶层目录 + 3 个子目录 + 每个 3 个真文件
+        const top = mkdirChild('', '隔离测试')
+        for (let d = 0; d < 3; d++) {
+          const sub = mkdirChild('隔离测试', `层${d}`)
+          const paths: string[] = []
+          for (let k = 0; k < 3; k++) {
+            const p = join(workDir, `iso-${d}-${k}.png`)
+            writeFileSync(p, await makePng(d * 3 + k))
+            paths.push(p)
+          }
+          await importTo(paths, sub.id)
+        }
+
+        // ② 真 watcher（用户 dev 实例长开着的那个）
+        watchLibrary(libPath, D())
+        await sleep(1500) // chokidar 逐目录建立 watch 需要一轮扫描，太短测不到占用
+        const watchingBefore = isWatching()
+
+        // ③ 诊断基线（**不并入断言**）：此刻裸 renameSync 一个同形的物理目录是否真的被挡？
+        // 若为 'OK'，说明本机这一刻没复现出占用 —— 那么 ④ 的「成功」就不足以证明隔离链有鉴别力，
+        // 而要靠 ⑥（注入）来覆盖。这条只进报告，不让它变红（环境差异不该判产品坏）。
+        let baselineRaw = 'n/a'
+        try {
+          renameSync(probeDir, `${probeDir}_x`)
+          baselineRaw = 'OK(未复现占用)'
+          renameSync(`${probeDir}_x`, probeDir) // 没被挡 → 改回去，保持目录结构
+        } catch (e) {
+          baselineRaw = String((e as NodeJS.ErrnoException).code ?? e)
+        }
+        // ⚠️ 探针目录**留到本段最后再删**：它在 watchLibrary 之前就存在，所以 `watchedBefore`
+        // 把它（和它的 sub）算在内；若在这里就删掉，`watchedAfter` 会凭空少 2 → 「目录数不变」的
+        // 判据变成假红（第一版实测就是这么红的）。
+
+        const watchedBefore = watchedDirCount()
+        const pumpBefore = pumpState()
+        const trailBefore = lastRenameIsolation()
+
+        // ④ 改名
+        const tRename = Date.now()
+        let err: string | null = null
+        let renamed: { id: number; path: string; folders: number; assets: number } | null = null
+        try {
+          renamed = await renameFolder(top.id, '隔离测试-改')
+        } catch (e) {
+          err = String((e as Error).message ?? e)
+        }
+        const renameMs = Date.now() - tRename
+        const trail = lastRenameIsolation()
+        const watchingAfter = isWatching()
+        const pumpAfterRename = pumpState()
+
+        // ⑤ 恢复自证：先等重挂后的 chokidar ready（否则写入会被 ignoreInitial 吞掉，这不是产品缺陷），
+        // 再写一个外部文件 → 必须被索引；再让泵给它出缩略图。
+        // ⚠️ 只在**改名成功**时做：改名失败（注入验证态）时新目录根本不存在，写它会抛 ENOENT，
+        // 整轮就只剩一个 `R.error`、看不到具名红（本段第一版实测就是这样，改后才有可归档的红）。
+        let externalIndexed = false
+        let thumbUrl: string | null = null
+        let thumbErr: string | null = null
+        if (err === null) {
+          await sleep(1500)
+          const extRel = '隔离测试-改/层0/外部新增.png'
+          try {
+            writeFileSync(abs(extRel), await makePng(99))
+            externalIndexed = await waitDbRow(extRel, 10000)
+            if (externalIndexed) {
+              const row = D().prepare('SELECT id FROM assets WHERE rel_path=?').get(extRel) as { id: number }
+              const r = await Promise.race([ensureThumb(row.id, 'grid'), sleep(10000).then(() => null)])
+              thumbUrl = r ? r.url : null
+              if (!r) thumbErr = 'TIMEOUT'
+            }
+          } catch (e) {
+            thumbErr = String((e as Error).message ?? e)
+          }
+        } else {
+          thumbErr = 'SKIPPED(改名失败)'
+        }
+        const watchedAfter = watchedDirCount()
+        const pumpAfter = pumpState()
+        const isoRow = D().prepare('SELECT rel_path FROM assets WHERE rel_path=?').get('隔离测试-改/层0/iso-0-0.png') as
+          | { rel_path: string }
+          | undefined
+
+        // ⑥ 注入：强制走第 2 级隔离（watcher 在场就 EPERM，watcher 被停掉才放行到真 renameSync）
+        const injTop = mkdirChild('', '注入隔离')
+        const injSub = mkdirChild('注入隔离', '子')
+        const injSrc = join(workDir, 'inj.png')
+        writeFileSync(injSrc, await makePng(123))
+        await importTo([injSrc], injSub.id)
+        if (!isWatching()) {
+          watchLibrary(libPath, D())
+          await sleep(1500)
+        }
+        const eperm = (): never => {
+          const e = new Error('EPERM: operation not permitted, rename') as NodeJS.ErrnoException
+          e.code = 'EPERM'
+          throw e
+        }
+        const injectedRename = (from: string, to: string): void => {
+          if (watcherActive()) eperm() // watcher 还在 = 句柄还在 = Windows 会拒
+          renameSync(from, to) // watcher 已停 = 放行（与真实语义一致）
+        }
+        const suspBefore = watcherSuspensions()
+        let injErr: string | null = null
+        try {
+          await renameFolder(injTop.id, '注入隔离-改', {
+            renameAttempts: 2,
+            renameDelays: [0],
+            renameFn: injectedRename
+          })
+        } catch (e) {
+          injErr = String((e as Error).message ?? e)
+        }
+        const injTrail = lastRenameIsolation()
+
+        // 清理探针目录（放在所有观测量之后，理由见 ③ 结尾）
+        try {
+          rmSync(probeDir, { recursive: true, force: true })
+          rmSync(`${probeDir}_x`, { recursive: true, force: true })
+        } catch { /* ignore */ }
+
+        return {
+          baselineRaw,
+          watchingBefore,
+          watchingAfter,
+          watchedBefore,
+          watchedAfter,
+          pumpBefore,
+          pumpAfterRename,
+          pumpAfter,
+          err,
+          renamedPath: renamed?.path ?? null,
+          renameMs,
+          oldGone: !onDisk('隔离测试'),
+          newOnDisk: onDisk('隔离测试-改/层0/iso-0-0.png'),
+          dbRel: isoRow?.rel_path ?? null,
+          externalIndexed,
+          thumbUrl,
+          thumbErr,
+          trail,
+          trailBefore: trailBefore?.successAt ?? null,
+          injection: {
+            err: injErr,
+            suspDelta: watcherSuspensions() - suspBefore,
+            trail: injTrail,
+            diskNew: onDisk('注入隔离-改/子/inj.png'),
+            watching: isWatching()
+          }
+        }
+      }
+
+      // 60s 总闸门（G4）：注入态下任何一环卡住，都要给出可归档的红，而不是无结论挂死
+      const raced = await Promise.race([
+        m2Body().then((v) => ({ finished: true as const, v })),
+        sleep(60000).then(() => ({ finished: false as const }))
+      ])
+      R.m2_watcherRename = raced.finished ? raced.v : { timeout: true }
+      step(`M2 ${JSON.stringify(R.m2_watcherRename)}`)
+    }
+
+    // ==================== N. 盲窗对账 / 删除隔离 / 4 处顺序与边界契约（QA 第四轮）====================
+    //
+    // QA 第四轮用自设计注入证明这些点**生产套件抓不住**，逐条补：
+    //   ① **盲窗对账**：停监听 → 重挂到 ready 之间的文件会被 `ignoreInitial` 静默吞掉
+    //      （窗口随库规模线性增长，305 目录 1540ms），全库没有第二个「磁盘 → 索引」入口。
+    //      这里用注入的 renameFn **确定性**造出盲窗：第一次尝试时先往目标目录写 3 个文件再抛 EPERM
+    //      （此刻 chokidar 的 `awaitWriteFinish` 800ms 还没到，紧接着就停监听器 → 事件被彻底丢掉）。
+    //   ② **对账幂等**：连跑两次，第二次 `inserted=0` 且行数不变。
+    //   ③ **E2 恢复顺序契约**：`restore-watcher` 必须排在 `resume-pump` 之前（拆成两个 step 才测得出）。
+    //   ④ **E3 非忙错误不该升级隔离**：注入 EXDEV → 不许白停一次 watcher（`suspDelta===0`），错误原样上抛。
+    //   ⑤ **E4 失败路径也要恢复状态**：三级全失败后泵必须已恢复、监听器必须还在。
+    //   ⑥ **并发同 id 改名**：双击回车不能泄漏裸 ENOENT（串行锁 + 二次读行早返回）。
+    step('N')
+    {
+      const workDir = dir
+      const nBody = async (): Promise<Record<string, unknown>> => {
+        if (!workDir) throw new Error('N 段需要临时目录')
+        const countAssets = (): number => (D().prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
+        /** 有界轮询：这些 rel_path 是否全部进了索引（G4） */
+        const waitAllRows = async (rels: string[], ms: number): Promise<boolean> => {
+          const t0 = Date.now()
+          while (Date.now() - t0 < ms) {
+            const hit = rels.every((r) => !!D().prepare('SELECT id FROM assets WHERE rel_path=?').get(r))
+            if (hit) return true
+            await sleep(200)
+          }
+          return false
+        }
+        const eperm = (): never => {
+          const e = new Error('EPERM: operation not permitted, rename') as NodeJS.ErrnoException
+          e.code = 'EPERM'
+          throw e
+        }
+        /** 一次「改名失败」调用的统一收口：把异常转成字符串，绝不冒到最外层 */
+        const tryRename = async (
+          id: number,
+          name: string,
+          opts: { renameAttempts?: number; renameDelays?: number[]; renameFn?: (f: string, t: string) => void }
+        ): Promise<string | null> => {
+          try {
+            await renameFolder(id, name, opts)
+            return null
+          } catch (e) {
+            return String((e as Error).message ?? e)
+          }
+        }
+
+        // 监听器必须在场且 ready（M2 段结束时是挂着的；这里确认一次，避免依赖段间状态）
+        if (!isWatching()) watchLibrary(libPath, D())
+        const readyBefore = await whenWatcherReady(15000)
+
+        // ① 盲窗对账
+        const bw = mkdirChild('', '盲窗测试')
+        const bwSub = mkdirChild('盲窗测试', '层0')
+        const bwSrc = join(workDir, 'bw-base.png')
+        writeFileSync(bwSrc, await makePng(201))
+        await importTo([bwSrc], bwSub.id)
+        const assetsBefore = countAssets()
+        const windowPng = await makePng(202)
+        let wroteWindowFiles = false
+        /**
+         * 注入：**只要监听器还在就抛 EPERM**，停了才放行到真 `renameSync`。
+         *
+         * ⚠️ 第一版写成「只在第一次抛 EPERM，之后放行」，结果第二次就真改成功了 ——
+         * 因为 `盲窗测试` 这个目录是**监听器启动之后**才建的，chokidar 还没来得及给它挂 watch
+         * （实测日志：steps 里根本没有 `suspend-watcher`，`restoreIdx=-1` 直接红）。
+         * 必须像 M2 的注入那样「按 watcher 是否在场」来决定，才能**确定性**走到停监听器那一步。
+         */
+        const bwInjected = (from: string, to: string): void => {
+          if (watcherActive()) {
+            if (!wroteWindowFiles) {
+              wroteWindowFiles = true
+              // 真实盲窗形态：文件落在磁盘上，但监听器紧接着被停掉、重挂时被 ignoreInitial 吞掉
+              for (let i = 0; i < 3; i++) writeFileSync(join(from, '层0', `窗口内-${i}.png`), windowPng)
+            }
+            eperm() // 逼出「升级隔离 → 停监听器」这条路径
+          }
+          renameSync(from, to)
+        }
+        const bwErr = await tryRename(bw.id, '盲窗测试-改', {
+          renameAttempts: 2,
+          renameDelays: [0],
+          renameFn: bwInjected
+        })
+        const bwTrail = lastRenameIsolation()
+        const windowRels = [0, 1, 2].map((i) => `盲窗测试-改/层0/窗口内-${i}.png`)
+        const windowIndexed = await waitAllRows(windowRels, 20000)
+        const assetsAfterWindow = countAssets()
+
+        // ② 对账幂等：此刻应当都补完了 → 连跑两次都应为 0 插入、行数不变
+        const rc1 = await reconcileLibrary(D(), libPath)
+        const rc2 = await reconcileLibrary(D(), libPath)
+        const assetsAfterReconcile = countAssets()
+
+        // ③ E2 恢复顺序契约（用上面那次**真的升级过隔离**的轨迹）
+        const steps = bwTrail?.steps ?? []
+        const iRestore = steps.indexOf('restore-watcher')
+        const iResume = steps.indexOf('resume-pump')
+
+        // ④ E3：非瞬时错误（EXDEV）不该升级隔离
+        const ex = mkdirChild('', '异常测试')
+        const exSub = mkdirChild('异常测试', '子')
+        const exSrc = join(workDir, 'ex.png')
+        writeFileSync(exSrc, await makePng(210))
+        await importTo([exSrc], exSub.id)
+        const suspBeforeEx = watcherSuspensions()
+        const exErr = await tryRename(ex.id, '异常测试-改', {
+          renameAttempts: 3,
+          renameDelays: [0, 0],
+          renameFn: () => {
+            const e = new Error('EXDEV: cross-device link not permitted') as NodeJS.ErrnoException
+            e.code = 'EXDEV'
+            throw e
+          }
+        })
+        const exSuspDelta = watcherSuspensions() - suspBeforeEx
+        const exStillOnDisk = onDisk('异常测试/子/ex.png')
+
+        // ⑤ E4：三级全失败后，状态必须已恢复
+        const fl = mkdirChild('', '失败测试')
+        const flSub = mkdirChild('失败测试', '子')
+        const flSrc = join(workDir, 'fl.png')
+        writeFileSync(flSrc, await makePng(220))
+        await importTo([flSrc], flSub.id)
+        const flErr = await tryRename(fl.id, '失败测试-改', {
+          renameAttempts: 1,
+          renameDelays: [],
+          renameFn: () => eperm()
+        })
+        const pumpAfterFailure = pumpState()
+        const watchingAfterFailure = isWatching()
+
+        // ⑥ 并发同 id 改名（双击回车）：两次都不许抛出、第二次必须是早返回
+        const cc = mkdirChild('', '并发测试')
+        const ccSub = mkdirChild('并发测试', '子')
+        const ccSrc = join(workDir, 'cc.png')
+        writeFileSync(ccSrc, await makePng(230))
+        await importTo([ccSrc], ccSub.id)
+        const ccRes = await Promise.all([
+          renameFolder(cc.id, '并发-改').then(
+            (r) => ({ r, e: null as string | null }),
+            (e) => ({ r: null, e: String((e as Error).message ?? e) })
+          ),
+          renameFolder(cc.id, '并发-改').then(
+            (r) => ({ r, e: null as string | null }),
+            (e) => ({ r: null, e: String((e as Error).message ?? e) })
+          )
+        ])
+        const ccPaths = folderPaths().filter((p) => p.startsWith('并发'))
+        const ccRows = (D().prepare("SELECT count(*) AS c FROM folders WHERE name='并发-改'").get() as { c: number }).c
+
+        return {
+          readyBefore,
+          bwErr,
+          bwSteps: steps,
+          windowIndexed,
+          assetsBefore,
+          assetsAfterWindow,
+          assetsAfterReconcile,
+          reconcile1: rc1.inserted,
+          reconcile2: rc2.inserted,
+          reconcileScanned: rc2.scanned,
+          restoreIdx: iRestore,
+          resumeIdx: iResume,
+          exErr,
+          exSuspDelta,
+          exStillOnDisk,
+          flErr,
+          pumpAfterFailure,
+          watchingAfterFailure,
+          ccErr: [ccRes[0].e, ccRes[1].e],
+          ccFolders: [ccRes[0].r?.folders ?? -1, ccRes[1].r?.folders ?? -1],
+          ccPaths,
+          ccRows,
+          ccDisk: onDisk('并发-改/子/cc.png')
+        }
+      }
+
+      // 90s 总闸门（G4）：本段要等两次 ready + 多次轮询，给足但仍必须有界
+      const raced = await Promise.race([
+        nBody().then((v) => ({ finished: true as const, v })),
+        sleep(90000).then(() => ({ finished: false as const }))
+      ])
+      R.n_contracts = raced.finished ? raced.v : { timeout: true }
+      step(`N ${JSON.stringify(R.n_contracts)}`)
+    }
+
+    // ==================== O. 残余三项：NOT NULL 不许静默 / 对账分片 / 删除中断收口（QA 第五轮）====================
+    //
+    // 三条都是 QA 用自设计注入证明「现实现抓不住/不够」的点：
+    //   ① **A**：`INSERT OR IGNORE` 会连 `folder_id NOT NULL` 违反一起静默吞掉
+    //      （无异常、无 warn、`changes=0` 被当成"已存在"）→ 换成 `ON CONFLICT(rel_path) DO NOTHING` 后
+    //      必须**真的抛错**并由调用方 warn。这里用测试缝把 folder_id 置 null 来验证「不再静默」。
+    //   ② **B**：对账最坏情况（首次全量）是同步 DFS + 同步 SQLite，会把主进程冻 4.3s（3900 文件）。
+    //      这里造 2000 个「磁盘有、库里没有」的文件（= 最坏路径：每行都要算 hash + 插入），
+    //      用心跳法量**最大让位间隔**；再验证「中途切库立刻中止」。
+    //   ③ **C**：外部进程用**独占锁**持有目录里某个文件 → rmSync 必失败（且文件已被删掉一部分）。
+    //      必须收口成：报明确错误码 + 已消失的行 `missing=1`（不许留「DB 说存在、卡片照常」）。
+    step('O')
+    {
+      const workDir = dir
+      const oBody = async (): Promise<Record<string, unknown>> => {
+        if (!workDir) throw new Error('O 段需要临时目录')
+        const countAssets = (): number => (D().prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
+        const msg = (e: unknown): string => String((e as Error).message ?? e)
+
+        // —— ① A：NOT NULL 违反必须留痕（不许静默） ——
+        const nn = mkdirChild('', 'NOTNULL测试')
+        mkdirChild('NOTNULL测试', '子')
+        // 只写磁盘、不进索引 → 对账会尝试插入它（正是我们要观察的那一条路径）
+        writeFileSync(abs('NOTNULL测试/子/孤儿.png'), await makePng(241))
+        const nnWarns: string[] = []
+        const origWarn = console.warn
+        let nnRes: { inserted: number; aborted: boolean } | null = null
+        let nnErr: string | null = null
+        const seamPrev = __testForceNullFolderId(true)
+        console.warn = (...args: unknown[]): void => {
+          nnWarns.push(args.map((x) => String(x)).join(' '))
+          ;(origWarn as (...a: unknown[]) => void)(...args)
+        }
+        try {
+          nnRes = await reconcileLibrary(D(), libPath)
+        } catch (e) {
+          nnErr = msg(e)
+        } finally {
+          __testForceNullFolderId(seamPrev)
+          console.warn = origWarn
+        }
+        const nnRow = D().prepare('SELECT id FROM assets WHERE rel_path=?').get('NOTNULL测试/子/孤儿.png')
+        const nnWarned = nnWarns.some((w) => /孤儿\.png/.test(w) && /NOT NULL|folder_id/i.test(w))
+        // 这条孤儿文件只用来触发 NOT NULL，**用完就删**：留着的话它会在后面的对账里被正常补进索引
+        // （测试缝已关），让 `bigInserted` 变成 2001 —— 断言会因夹具而红，而不是因产品（实测过一次）。
+        rmSync(abs('NOTNULL测试/子/孤儿.png'), { force: true })
+        void nn
+
+        // —— ② B1：分片让位（2000 个「库里没有」的文件 = 最坏路径） ——
+        //
+        // ⚠️ **必须先停监听器再铺文件**（第一版没停，实测 bigInserted=0 / bigMaxGap=1353ms 而红）：
+        // 监听器在场时，2000 条 add 事件会在对账让位的那一刻被 chokidar **一次性**投递，
+        // 2000 次 hash+INSERT 挤在同一个宏任务里 → 心跳量到的是「watcher 批量插入」的间隔，
+        // 不是「对账分片」的间隔；而且文件已被 watcher 抢先索引，对账 inserted=0、断言恒假。
+        // 停掉之后才等于 QA 描述的真实触发场景：**用户关着 App 往库里拷了一批文件**。
+        mkdirChild('', '大库测试') // 顶层目录（名字空是非法名，别写成 mkdirChild('大库测试','')）
+        await suspendWatchingAsync()
+        const bigData = await makePng(250)
+        const BIG_N = 2000
+        for (let i = 0; i < BIG_N; i++) writeFileSync(abs(`大库测试/b-${i}.png`), bigData)
+        const gaps: number[] = []
+        let lastTick = Date.now()
+        const ticker = setInterval(() => {
+          const now = Date.now()
+          gaps.push(now - lastTick)
+          lastTick = now
+        }, 10)
+        const tBig = Date.now()
+        const bigRes = await reconcileLibrary(D(), libPath)
+        clearInterval(ticker)
+        const bigMs = Date.now() - tBig
+        const maxGap = gaps.length ? Math.max(...gaps) : -1
+        // 挂回监听器：C 段要验证「删除前确实 suspend 过」，B2 之后也要靠它
+        watchLibrary(libPath, D())
+        await whenWatcherReady(15000)
+        void bigData
+
+        // —— ③ C：外部独占锁 → 删除中断的收口 ——
+        const dp = mkdirChild('', '删除中断测试')
+        const dpSub1 = mkdirChild('删除中断测试', '子1')
+        const dpSub2 = mkdirChild('删除中断测试', '子2')
+        const dpPaths: string[] = []
+        for (let i = 0; i < 3; i++) {
+          const p = join(workDir, `dp-${i}.png`)
+          writeFileSync(p, await makePng(260 + i))
+          dpPaths.push(p)
+        }
+        await importTo(dpPaths.slice(0, 2), dpSub1.id)
+        await importTo(dpPaths.slice(2), dpSub2.id)
+        const lockedRel = '删除中断测试/子2/dp-2.png'
+        const lockedAbs = abs(lockedRel)
+        const marker = join(workDir, 'lock-ready.txt')
+        // PowerShell 以**独占**方式（share=None）打开该文件 —— Node 的 fs.open 做不到这一点
+        // （libuv 打开时带 FILE_SHARE_DELETE），QA 第四轮就是用这招拿到确定性的 EBUSY。
+        const lockScript =
+          `$ErrorActionPreference='Stop';` +
+          `$f=[IO.File]::Open('${lockedAbs.replace(/'/g, "''")}','Open','ReadWrite','None');` +
+          `Set-Content -Path '${marker.replace(/'/g, "''")}' -Value 'ok';` +
+          `Start-Sleep -Seconds 40; $f.Close()`
+        const lockProc = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', lockScript], {
+          windowsHide: true
+        })
+        let lockReady = false
+        for (let i = 0; i < 60; i++) {
+          if (existsSync(marker)) {
+            lockReady = true
+            break
+          }
+          await sleep(200)
+        }
+        const suspBeforeDp = watcherSuspensions()
+        let dpErr: string | null = null
+        try {
+          await deleteFolder(dp.id)
+        } catch (e) {
+          dpErr = msg(e)
+        }
+        const suspDp = watcherSuspensions() - suspBeforeDp
+        // 关掉独占进程（否则后面的清理会一直被挡）
+        try {
+          lockProc.kill()
+        } catch {
+          /* ignore */
+        }
+        await sleep(300)
+        const dpRows = D()
+          .prepare('SELECT rel_path, missing FROM assets WHERE rel_path LIKE ?')
+          .all('删除中断测试/%') as Array<{ rel_path: string; missing: number }>
+        const goneRows = dpRows.filter((r) => !existsSync(abs(r.rel_path)))
+        const aliveRows = dpRows.filter((r) => existsSync(abs(r.rel_path)))
+        const goneMarked = goneRows.length > 0 && goneRows.every((r) => r.missing === 1)
+        const aliveUntouched = aliveRows.every((r) => r.missing === 0)
+        const dpFilesGone = dpPaths.some((p, i) => i < 2 && !existsSync(join(libPath, '删除中断测试/子1', `dp-${i}.png`)))
+
+        // —— ④ B2：对账中途切库 → 立刻中止、不报错 ——
+        // 再铺 800 个文件（同样先停监听器，理由见 B1），保证对账有足够时长跑到中途
+        await suspendWatchingAsync()
+        for (let i = 0; i < 800; i++) writeFileSync(abs(`大库测试/m-${i}.png`), bigData)
+        const running = reconcileLibrary(D(), libPath) // 故意不 await
+        await sleep(30) // 让它先跑几片
+        const lib2 = createLibrary({ name: 'switchlib', parentDir: workDir }) // 切库 → 关闭旧连接
+        let abortRes: { inserted: number; aborted: boolean } | null = null
+        let abortErr: string | null = null
+        try {
+          abortRes = await Promise.race([running, sleep(20000).then(() => null)])
+        } catch (e) {
+          abortErr = msg(e)
+        }
+        // 切回主库并确认「中止后能自愈」：再跑一次必须跑完（aborted=false）
+        openLibrary(libPath)
+        watchLibrary(libPath, D())
+        await whenWatcherReady(15000)
+        let recoverRes: { inserted: number; aborted: boolean } | null = null
+        try {
+          recoverRes = await reconcileLibrary(D(), libPath)
+        } catch {
+          /* 记在下面 */
+        }
+        void lib2
+
+        return {
+          nnErr,
+          nnInserted: nnRes?.inserted ?? -1,
+          nnRowExists: !!nnRow,
+          nnWarned,
+          nnWarnSample: nnWarns.slice(0, 3),
+          bigFiles: BIG_N,
+          bigInserted: bigRes.inserted,
+          bigMs,
+          bigTicks: gaps.length,
+          bigMaxGap: maxGap,
+          lockReady,
+          dpErr,
+          suspDp,
+          dpRowCount: dpRows.length,
+          dpGoneRows: goneRows.length,
+          dpAliveRows: aliveRows.length,
+          goneMarked,
+          aliveUntouched,
+          dpFilesGone,
+          abortErr,
+          abortHandled: abortRes !== null,
+          abortFlag: abortRes?.aborted ?? null,
+          abortInserted: abortRes?.inserted ?? -1,
+          recoverAborted: recoverRes?.aborted ?? null,
+          assetsTotal: countAssets()
+        }
+      }
+
+      // 150s 总闸门（G4）：2000+800 个文件 + PowerShell 起停，给足但仍必须有界
+      const raced = await Promise.race([
+        oBody().then((v) => ({ finished: true as const, v })),
+        sleep(150000).then(() => ({ finished: false as const }))
+      ])
+      R.o_residuals = raced.finished ? raced.v : { timeout: true }
+      step(`O ${JSON.stringify(R.o_residuals)}`)
+    }
+
+
+
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
     const c = R.c_import as { added: number[]; relPaths: string[]; tagLinks: number }
@@ -759,6 +1654,8 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       diskGone: boolean; foldersLeft: string[]; assetsLeft: string[]; orphanTagLinks: number
       tagsLeft: number; prunedTags: string[]
       thumbsBeforeDelete: number; thumbsLeft: number; siblingIntact: boolean
+      watcherReady?: boolean; suspDelta?: number; watchingAfter?: boolean; leftoverDirs?: string[]
+      delErr?: string | null; filesAlreadyGone?: boolean
     }
     const h1 = R.h1_result as { rowsAfter: string[]; onDiskAfter: boolean; dbPaths: string[] }
     const h2 = R.h2_result as { rowsAfter: string[]; oldGone: boolean; newOnDisk: boolean; dbPaths: string[] }
@@ -796,6 +1693,116 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const lRetry = (R.l_retry ?? {}) as {
       callsA?: number; threwA?: string | null; callsB?: number; threwB?: string | null
       callsC?: number; threwC?: string | null
+    }
+    const mpr = (R.m_previewRename ?? {}) as {
+      blockedStatus?: number; afterExpireStatus?: number; openBefore?: number; openAfter?: number
+      firstBytes?: number
+      openAfterOld?: number
+      readAfter?: string; streamKilled?: boolean; renamedPath?: string | null; oldGone?: boolean
+      fileOnDisk?: boolean; dbRel?: string; relBefore?: string; reopenStatus?: number | null
+      renameMs?: number; suppressDelta?: number; bystanderOpenBefore?: number; bystanderFirstBytes?: number
+      bystanderAfter?: number; bystanderRead?: string; bystanderReadAlive?: boolean
+      releasedCount?: number; releaseMs?: number
+      renameError?: string | null
+    }
+    const n = (R.n_contracts ?? {}) as {
+      timeout?: boolean
+      readyBefore?: boolean
+      bwErr?: string | null
+      bwSteps?: string[]
+      windowIndexed?: boolean
+      assetsBefore?: number
+      assetsAfterWindow?: number
+      assetsAfterReconcile?: number
+      reconcile1?: number
+      reconcile2?: number
+      reconcileScanned?: number
+      restoreIdx?: number
+      resumeIdx?: number
+      exErr?: string | null
+      exSuspDelta?: number
+      exStillOnDisk?: boolean
+      flErr?: string | null
+      pumpAfterFailure?: { paused: boolean; running: number; queued: number }
+      watchingAfterFailure?: boolean
+      ccErr?: Array<string | null>
+      ccFolders?: number[]
+      ccPaths?: string[]
+      ccRows?: number
+      ccDisk?: boolean
+    }
+    const o = (R.o_residuals ?? {}) as {
+      timeout?: boolean
+      nnErr?: string | null
+      nnInserted?: number
+      nnRowExists?: boolean
+      nnWarned?: boolean
+      nnWarnSample?: string[]
+      bigFiles?: number
+      bigInserted?: number
+      bigMs?: number
+      bigTicks?: number
+      bigMaxGap?: number
+      lockReady?: boolean
+      dpErr?: string | null
+      suspDp?: number
+      dpRowCount?: number
+      dpGoneRows?: number
+      dpAliveRows?: number
+      goneMarked?: boolean
+      aliveUntouched?: boolean
+      dpFilesGone?: boolean
+      abortErr?: string | null
+      abortHandled?: boolean
+      abortFlag?: boolean | null
+      abortInserted?: number
+      recoverAborted?: boolean | null
+      assetsTotal?: number
+    }
+    const m2 = (R.m2_watcherRename ?? {}) as {
+      timeout?: boolean
+      baselineRaw?: string
+      watchingBefore?: boolean
+      watchingAfter?: boolean
+      watchedBefore?: number
+      watchedAfter?: number
+      pumpBefore?: { paused: boolean; running: number; queued: number }
+      pumpAfterRename?: { paused: boolean; running: number; queued: number }
+      pumpAfter?: { paused: boolean; running: number; queued: number }
+      err?: string | null
+      renamedPath?: string | null
+      renameMs?: number
+      oldGone?: boolean
+      newOnDisk?: boolean
+      dbRel?: string | null
+      externalIndexed?: boolean
+      thumbUrl?: string | null
+      thumbErr?: string | null
+      trail?: {
+        steps?: string[]
+        directAttempted?: boolean
+        directFailed?: boolean
+        pumpPaused?: boolean
+        pumpResumed?: boolean
+        watcherSuspended?: boolean
+        watcherRestarted?: boolean
+        successAt?: string | null
+        failed?: boolean
+      } | null
+      trailBefore?: string | null
+      injection?: {
+        err?: string | null
+        suspDelta?: number
+        diskNew?: boolean
+        watching?: boolean
+        trail?: {
+          steps?: string[]
+          successAt?: string | null
+          watcherSuspended?: boolean
+          watcherRestarted?: boolean
+          failed?: boolean
+        } | null
+      }
     }
 
     R.checks = {
@@ -923,7 +1930,132 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       //     （用 startsWith/正则就照不出来，所以**必须** `===`）。同步版走同一个 busyRenameError，一并覆盖。
       renameRetryBareCode: lRetry?.threwB === 'ERR_FOLDER_BUSY',
       // ③ EXDEV 非瞬时 → 立即抛、只尝试 1 次（不白等）
-      renameRetryNonTransient: /EXDEV/.test(lRetry?.threwC ?? '') && lRetry?.callsC === 1
+      renameRetryNonTransient: /EXDEV/.test(lRetry?.threwC ?? '') && lRetry?.callsC === 1,
+
+      // —— M. 重命名「正在被我们预览」的文件夹（用户报的「一级文件夹改不了名」的原形）——
+      // 前置 `openBefore >= 1` 是**不可省的**：没有它，「改名后登记表为 0」就成了 0===0 的空转（G11）。
+      // 注入验证（实测记录见 `.workbuddy/audit/g14-m-inject-folder.log`）：把 `library.renameFolder`
+      // 里 `releaseMediaUnderAsync` + `suppressMediaUnder` 两行去掉 → 这条立刻变红，
+      // 且 `renameError` 就是用户看到的 `ERR_FOLDER_BUSY`。
+      renameWhilePreviewing: (mpr.openBefore ?? 0) >= 1 && (mpr.firstBytes ?? 0) > 0 && mpr.renameError === null &&
+        mpr.renamedPath === '已改名' &&
+        mpr.oldGone === true && mpr.fileOnDisk === true &&
+        mpr.relBefore === '预览中改名/big.png' && mpr.dbRel === '已改名/big.png' &&
+        (mpr.openAfter ?? -1) === 0 && (mpr.openAfterOld ?? -1) === 0,
+      // 释放是**真的**发生了：读流被销毁（后续 read 只能拿到 done/错误），而不是恰好自己跑完了
+      renameReleasesStream: mpr.streamKilled === true,
+      // 抑制窗口本身有效：窗口内拒（409）、过期后恢复（200）。
+      // 「窗口开了不失效」会让预览永久黑屏，「窗口根本不生效」会让渲染层立刻把句柄重开 → 改名再次 EPERM。
+      suppressWindowWorks: mpr.blockedStatus === 409 && mpr.afterExpireStatus === 200,
+      // 改名动作结束必须已解除抑制（成功 → 按新路径重取；失败 → 继续允许预览）
+      suppressClearedAfterRename: mpr.reopenStatus === 200,
+      // D1 **接线**断言（不是行为断言）：`library.renameFolder` 改名前必须真的开过一次抑制窗口。
+      // 为什么必须单独锁：`suppressWindowWorks` 是直接调 `suppressMediaUnder` 测机制，
+      // 把 renameFolder 里那行调用删掉它照样绿（QA 的 D1 注入实测）。
+      renameSuppressionWired: (mpr.suppressDelta ?? 0) === 1,
+      // D2 释放必须**按子树收敛**：改 A 之后，无关子树 B 的流要还活着（计数 + 还能读出字节）。
+      // 把 `collectStreamsUnder` 的子树判断去掉（改成释放全部）→ 这条红。
+      releaseIsSubtreeScoped: (mpr.bystanderOpenBefore ?? 0) >= 1 && (mpr.bystanderFirstBytes ?? 0) > 0 &&
+        (mpr.bystanderAfter ?? 0) >= 1 && mpr.bystanderReadAlive === true,
+      // D3a **有界**：A 子树里有一条真流在场时，rename 必须成功且远小于重试预算（3.3s）就收尾。
+      renameCompletesBounded: mpr.renameError === null && (mpr.renameMs ?? 1e9) >= 0 && (mpr.renameMs ?? 1e9) < 2000,
+      // D3b **上限真的在起作用**（机制断言）：一条真流 + 一条「永不 close」的流，
+      // 释放必须在上限内返回（≥250ms 说明它**确实等了**那个卡住的流，<2000ms 说明等到上限就放弃）。
+      // 上限改成 0 → 耗时 <250ms → 红；上限删掉（直接 await 全部 close）→ 3s 闸门 → -1 → 红。
+      releaseCapBounded: (mpr.releasedCount ?? 0) >= 2 && (mpr.releaseMs ?? 1e9) >= 250 && (mpr.releaseMs ?? 1e9) < 2000,
+
+      // —— M2. 真实 watcher 在场时改顶层目录（第三轮根因：chokidar 在 Windows 上逐目录建 fs.watch，
+      //        子目录上的句柄会挡住**祖先目录**改名；上一轮只修了媒体读流，所以用户环境里仍然失败）——
+      //
+      // 判据刻意写成「最终成功 + 状态恢复」，而**不是**「必须走到第 2 级隔离」：
+      // 直改就成功的环境（本机这一刻没复现出占用）里，这条也必须绿 —— 否则断言会变成
+      // 「只有慢机器才能通过」的伪条件。第 2 级隔离的覆盖交给下面两条（接线断言 + 注入断言）。
+      watcherPresentRenameOk: m2?.timeout !== true && m2?.watchingBefore === true && m2?.err === null &&
+        m2?.renamedPath === '隔离测试-改' && m2?.oldGone === true && m2?.newOnDisk === true &&
+        m2?.dbRel === '隔离测试-改/层0/iso-0-0.png' && m2?.watchingAfter === true,
+      // 接线断言（不是行为断言）：隔离链**确实被执行过** —— 每一步都只有真走到那行代码才会置位。
+      // 注意 `directAttempted` 会先被置位再试，所以这条同时能抓「整段隔离被绕开」的回归
+      // （例如有人把 rename 直接写成 `renameWithRetry(oldAbs,newAbs)` 而不进隔离块）。
+      watcherIsolationWired: m2?.trail?.directAttempted === true && m2?.trail?.pumpPaused === true &&
+        m2?.trail?.pumpResumed === true && m2?.trail?.failed === false &&
+        (m2?.trail?.steps ?? []).includes('media-release') &&
+        (m2?.trail?.steps ?? []).includes('pump-pause') &&
+        (m2?.trail?.steps ?? []).includes('probe-rename'),
+      // 恢复自证（幂等/可恢复）：改名结束后
+      //   ① watcher 还能索引外部新增文件（不是「停完就再也没挂回去」）；
+      //   ② 缩略图泵还能出图（不是「暂停完就永久停掉」，用户会看到一片灰卡片）；
+      //   ③ 泵状态回到「未暂停」；
+      //   ④ 重挂**没有留下重复 watcher**（目录数与改名前的同一棵树相等；漏掉旧 close 会接近翻倍）。
+      watcherRestoredAfterRename: m2?.externalIndexed === true && !!m2?.thumbUrl &&
+        m2?.pumpAfter?.paused === false && (m2?.watchedBefore ?? 0) > 0 &&
+        m2?.watchedAfter === m2?.watchedBefore,
+      // 第 2 级隔离的**确定性**覆盖（注入）：强制「watcher 在场就 EPERM」，只有停掉监听器才能通过。
+      // 若有人删掉 `suspendWatcherForRename()` 那段，这里会抛 ERR_FOLDER_BUSY → 立刻变红。
+      watcherIsolationEscalates: m2?.injection?.err === null && m2?.injection?.trail?.successAt === 'after-unwatch' &&
+        m2?.injection?.trail?.watcherSuspended === true && m2?.injection?.trail?.watcherRestarted === true &&
+        (m2?.injection?.suspDelta ?? 0) >= 1 && m2?.injection?.diskNew === true &&
+        m2?.injection?.watching === true,
+
+      // —— N. QA 第四轮：盲窗对账 / 删除隔离 / 4 处顺序与边界契约 ——
+      //
+      // 删除隔离（G 段，**真实 watcher 已 ready** 才删）：磁盘整棵没了 + 没有「文件没了空目录还在」的半状态
+      // + 确实停过监听器（suspDelta>=1）+ 删完监听器还在。
+      // 注入验证：把 `deleteFolderUnlocked` 里的 `suspendWatcherForRename()` 去掉 → suspDelta=0，
+      // 且 rmSync 抛 ENOTEMPTY（文件已删光、目录留着）→ leftoverDirs 非空 → 这条红。
+      deleteFolderIsolated: g?.watcherReady === true && (g?.suspDelta ?? 0) >= 1 && g?.watchingAfter === true &&
+        (g?.leftoverDirs ?? ['x']).length === 0 && g?.diskGone === true && g?.siblingIntact === true,
+      // 盲窗对账：注入态下 3 个「窗口内写入」的文件必须全部被补进索引，且总行数 == 改名前 + 3。
+      // 注入验证：去掉 finally 里的 `reconcileAfterWindow()` → windowIndexed=false、行数少 3 → 红。
+      blindWindowReconciled: n?.bwErr === null && n?.windowIndexed === true &&
+        (n?.assetsAfterWindow ?? -1) === (n?.assetsBefore ?? -2) + 3,
+      // 对账幂等：连着再跑两次 `reconcileLibrary`，都不该再插入行、行数也不许变。
+      // （同时钉住「已有行一律跳过、不算 hash、不动用户字段」这条契约。）
+      reconcileIdempotent: n?.reconcile1 === 0 && n?.reconcile2 === 0 &&
+        (n?.assetsAfterReconcile ?? -1) === (n?.assetsAfterWindow ?? -2) &&
+        (n?.reconcileScanned ?? 0) > 0,
+      // E2 恢复顺序契约：`restore-watcher` 必须排在 `resume-pump` 之前。
+      // 把 finally 里两段对调 → 这条红（以前两件事合成一个 step，是测不出来的）。
+      restoreOrderContract: (n?.restoreIdx ?? -1) >= 0 && (n?.resumeIdx ?? -1) >= 0 &&
+        (n?.restoreIdx ?? 99) < (n?.resumeIdx ?? -2),
+      // E3 非忙错误不该升级隔离：EXDEV 必须原样上抛，且**不许白停一次监听器**（suspDelta 必须为 0）。
+      // 把 `isBusyRenameError(e)` 改成恒真 → suspDelta=1（白开一次 1.5s 盲窗）→ 这条红。
+      nonBusyErrorSkipsWatcher: /EXDEV/.test(n?.exErr ?? '') && n?.exSuspDelta === 0 &&
+        n?.exStillOnDisk === true,
+      // E4 失败路径也要恢复状态：三级全失败（ERR_FOLDER_BUSY）之后泵必须已恢复、监听器必须还在。
+      // 只在成功路径查泵的实现下，这条会红。
+      failurePathRestoresState: n?.flErr === 'ERR_FOLDER_BUSY' &&
+        n?.pumpAfterFailure?.paused === false && n?.watchingAfterFailure === true,
+      // 并发同 id 改名（双击回车）：两次都不许抛出（尤其不许泄漏裸 ENOENT），
+      // 且磁盘/索引只改一次（folders 表里只有一个「并发-改」，第二次是早返回 folders=0）。
+      concurrentRenameNoLeak: (n?.ccErr ?? ['x', 'x']).every((e) => e === null) &&
+        (n?.ccPaths ?? []).join('|') === '并发-改|并发-改/子' && n?.ccRows === 1 &&
+        n?.ccDisk === true && (n?.ccFolders ?? [-1, -2]).some((x) => x === 0),
+
+      // —— O. 残余三项（QA 第五轮）——
+      //
+      // A：`ON CONFLICT(rel_path) DO NOTHING` 之后，`folder_id NOT NULL` 违反必须**真的抛错并留痕**，
+      // 不许像 `INSERT OR IGNORE` 那样静默吞掉（无异常、无 warn、changes=0 被当成"已存在"）。
+      // 判据三条一起：对账本身不抛（被单文件 catch 住了）、该行**没有**入库、warn 里带 rel_path 与 NOT NULL。
+      // 注入验证：把 SQL 改回 `INSERT OR IGNORE` → nnWarned=false（零痕迹）→ 这条红。
+      notNullViolationNotSilent: o?.nnErr === null && o?.nnRowExists === false && o?.nnWarned === true,
+      // B1：最坏路径（2000 个「库里没有」的文件，每行都要算 hash+插入）必须分片让位：
+      // 心跳法量到的**最大间隔**不得超过 120ms（同步实现实测 4300~4900ms 整段冻住）。
+      // 注入验证：把让位检查点去掉（改回同步 readdirSync）→ bigMaxGap 上千 ms → 红。
+      reconcileYieldsPromptly: o?.bigInserted === 2000 && (o?.bigTicks ?? 0) > 5 &&
+        (o?.bigMaxGap ?? 1e9) >= 0 && (o?.bigMaxGap ?? 1e9) <= 120,
+      // B2：对账跑到一半用户切库 → 必须**立刻中止**（aborted=true）、不抛错、不写坏数据；
+      // 并且切回原库后能再跑一次完整对账（aborted=false）= 中止后自愈。
+      // 注入验证：把 `isDbAlive` 检查点删掉 → 拿已关闭的连接继续跑，abortFlag 为 false → 红。
+      reconcileAbortsOnSwitch: o?.abortErr === null && o?.abortHandled === true &&
+        o?.abortFlag === true && o?.recoverAborted === false,
+      // C：外部**独占锁**（share=None，Node 的 fs.open 做不到）下删除必须收口：
+      // ① 报**明确错误码**（不是裸 EBUSY/EPERM/ENOTEMPTY，也不是假装成功）；
+      // ② 磁盘上已消失的行 `missing=1`（不许留「DB 说存在、卡片照常」）；
+      // ③ 还活着的行保持 missing=0（不许一刀切把整个子树标记失效）。
+      // 注入验证：去掉删除失败分支里的 `markMissingOnDisk` → goneMarked=false → 红。
+      deletePartialMarksMissing: o?.lockReady === true && (o?.suspDp ?? 0) >= 1 &&
+        o?.dpErr === 'ERR_FOLDER_DELETE_PARTIAL' && !/EBUSY|EPERM|ENOTEMPTY/i.test(o?.dpErr ?? '') &&
+        (o?.dpGoneRows ?? 0) >= 1 && o?.goneMarked === true && o?.aliveUntouched === true
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {
@@ -932,13 +2064,24 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
   } finally {
     R.jsErrors = jsErrors
     if (jsErrors.length) R.rendererLogs = rendererLogs.filter((l) => /error|Error|warn|Warn/.test(l)).slice(-8)
+    // ⚠️ 先停 chokidar 再删目录：它还持有库目录的句柄，Windows 上会让 rmSync 抛 EPERM
+    // （与 main.ts 的 `deleteLibrarySafely` 同一条纪律；H 段的 library.open 已经把 watcher 挂上了）。
+    // 不停的话，`deleteLibrary` 会静默失败，紧接着的 rmSync(dir) 抛出去 —— 而它抛在 finally 里，
+    // 会把下面的结果 JSON 与 `app.exit(0)` 一起吞掉（整轮冒烟"无结论地"挂死，只能靠超时杀）。
+    unwatchLibrary()
     try {
       if (libPath && existsSync(join(libPath, '.stash'))) deleteLibrary(libPath)
     } catch (e) {
       R.cleanupError = String(e)
     }
     closeCurrent()
-    if (dir) rmSync(dir, { recursive: true, force: true })
+    // 临时目录清理失败只记录、不抛：它不影响本轮断言的结论，
+    // 而抛在 finally 里会让整轮报告消失（见上）。
+    try {
+      if (dir) rmSync(dir, { recursive: true, force: true })
+    } catch (e) {
+      R.cleanupError = `${R.cleanupError ? `${R.cleanupError}；` : ''}临时目录清理失败：${String((e as Error).message ?? e)}`
+    }
     console.log('[SMOKE-FOLDER] ' + JSON.stringify(R))
     app.exit(0)
   }

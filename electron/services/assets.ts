@@ -235,6 +235,12 @@ export function renameAsset(id: number, rawName: string): RenameResult {
   }
 
   const newAbs = join(dirAbs, name)
+  // ⚠️ 这里**刻意不释放**该素材的预览读流（曾经加过，是回归，别再加回来）：
+  //   ① 「文件」改名本来就不被句柄挡住 —— 探针 [a2] 实测 `renameSync(被打开的文件) = OK`
+  //      （Windows 的 EPERM 只针对**目录**，那才是 `library.renameFolder` 要处理的问题）；
+  //   ② 释放会把正在播的视频打断：`<video>` 的 `stash://media/{id}` 不变、旧 fd 依然可读，
+  //      干净版行为就是**继续播**（QA 对照实测：干净版 ct=4.16s 连续播，释放版 ct=0 跳回开头）；
+  //   ③ 「孤儿流」不是问题：流有自己的 close 时机，且改名后按 id 解析到的是新路径。
   // 物理改名：短重试（同 `library.renameFolder` 的因，见 `fsutil.isTransientRenameError`）。
   // 这里**不改成 async**：冒烟 `smoke-edit` 是同步调用 `renameAsset` 的（改 async 要把整片调用点
   // 都改成 await，改动面远超本工单），故用同步版短重试 `renameWithShortRetrySync`（约 170ms 上限）。
@@ -253,7 +259,12 @@ export function renameAsset(id: number, rawName: string): RenameResult {
   return { id, name, rel_path: newRel, renamedFrom }
 }
 
-/** 批量移动到库内目标文件夹：物理文件 + 索引同步（rel_path / folder_id / name 一起改） */
+/** 批量移动到库内目标文件夹：物理文件 + 索引同步（rel_path / folder_id / name 一起改）  *
+ * ⚠️ **本函数不在 `library.withFolderWriteLock` 的串行闸门里，前提是它全程同步**：
+ * 从读行到 `BEGIN…COMMIT` 中间一个 await 都没有，因此不会被事件循环切成两半、
+ * 也不可能与并发的改名/删除交错。**将来谁给它加 await（比如改成异步哈希），这个前提立刻失效** ——
+ * 那时必须一起纳入那把锁，否则就会出现「移动到一半，目标文件夹被改名/删除」的错位。
+ */
 export function moveAssets(ids: number[], folderId: number): { moved: number; renamed: number; failed: BulkFail[] } {
   const { db, path: libPath } = requireCurrent()
   const failed: BulkFail[] = []
@@ -292,6 +303,9 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; re
         const name = uniqueName(destDir, row.name)
         if (name !== row.name) renamed++
         const dest = join(destDir, name)
+        // 搬动同样**不释放**预览读流（理由见 `renameAsset` 那段）：
+        // 同盘 rename / 跨盘「拷贝+删源」都不受影响（探针 `probe-media-delete.mjs`：打开中 unlink 也 OK），
+        // 释放只会把正在播的素材打断。
         moveFileSync(src, dest)
         upd.run(folder.id, toRel(folder.path, name), name, row.id)
         moved++

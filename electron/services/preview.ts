@@ -20,11 +20,12 @@
 // 绝不用 canPlayType 猜。白名单内的文件一律直出原文件，省掉一次转码。
 import { spawn } from 'child_process'
 import {
-  createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync
+  createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
+  type ReadStream
 } from 'fs'
 import { stat } from 'fs/promises'
 import { Readable } from 'stream'
-import { join } from 'path'
+import { isAbsolute, join, relative, resolve } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
@@ -32,6 +33,7 @@ import { getSettings } from './config'
 import { contentHash } from './importer'
 import { requireCurrent } from './library'
 import { ensureBatch } from './thumbs'
+import { MEDIA_SUPPRESS_MS, type MediaHandleGuard } from './handles'
 
 export type PreviewKind = 'image' | 'video' | 'audio' | 'text'
 /** 派生方式，UI 拿它显示「正在转码…」这类文案 */
@@ -579,6 +581,233 @@ export function writeText(id: number, text: string, baseMtime?: number): TextWri
   return { bytes: st.size, mtime: Math.floor(st.mtimeMs), hash, name: row.rel_path.split('/').pop() ?? '' }
 }
 
+// ==================== 媒体句柄登记 / 释放 / 抑制 ====================
+//
+// 这一段是「重命名一级文件夹必定失败」这个 bug 的修复核心。
+//
+// 根因（2026-10-16 实测，探针 `.workbuddy/audit/probe-media-rename.mjs`，别凭印象改）：
+//   `stash://media/{id}` 走 `streamBody()` 的 `createReadStream(abs)` 把**原文件**流式送出去；
+//   详情栏（`DetailPanel.vue`）对视频/音频就渲染这个 URL，浮层同理 —— 也就是说
+//   **只要详情栏里选中了一个素材，它的原文件就被我们自己的进程打开着**。
+//   而 Windows 上「目录内有文件被打开」会让 `renameSync(该目录)` 抛 EPERM：
+//     · 流打开中 → `renameSync(父目录)` = EPERM            （探针 [a]）
+//     · 同一个被打开**文件**改名 = OK                        （探针 [a2]，所以修的重心是「目录」）
+//     · `rs.destroy()` + 等 'close'（实测 1ms）→ rename = OK （探针 [b]）
+//     · `rs.destroy()` 后**同一 tick** → EPERM（0/20）        （探针 [c1]/[c4]）
+//     · `rs.destroy()` 后**下一个 setImmediate** → EPERM（0/20）（探针 [c2]/[c4]）
+//     · `rs.destroy()` 后**下一个 setTimeout(0)** → OK         （探针 [c3]）
+//   → 结论一：**只 destroy 不够**，必须等 'close'（或至少让出一轮宏任务），
+//     所以改名路径用 `releaseMediaUnderAsync()`；同步调用点只能 `release()`，
+//     靠 `renameWithShortRetrySync` 的 50ms 让位兜底。
+//   → 结论二：destroy 之后渲染层会**立刻重开**同一个 URL（探针 [d]：重开耗时 0ms，
+//     且立刻重新占住目录 → rename 又 EPERM）。所以必须有一个**抑制窗口**，
+//     在改名期间拒绝该子树下的媒体请求；否则「释放 → 重开 → 失败」无限循环。
+//
+// 为什么登记表按绝对路径分组：释放的粒度是「这棵子树」（重命名一级目录要放掉它里面所有素材），
+// 而 serveMedia 只知道本次要服务的那个绝对路径 —— 前缀匹配是最直接的对应关系。
+
+/** 活跃的媒体读流：key = 规范化后的绝对路径（win32 小写，见 `handleKeyOf`） */
+const openMediaStreams = new Map<string, Set<ReadStream>>()
+
+/**
+ * 路径归一化：Windows 上路径大小写不敏感（`C:\A` 与 `c:\a` 是同一个目录），
+ * 登记表若按原样字符串分组，大小写差异会让「释放」漏掉本该释放的流。
+ * 非 win32 保持原样（Linux 上大小写敏感，压平反而会误伤）。
+ */
+function handleKeyOf(absPath: string): string {
+  const abs = resolve(absPath)
+  return process.platform === 'win32' ? abs.toLowerCase() : abs
+}
+
+/**
+ * `candidate` 是否就是 `root` 或位于其子树内。
+ * 一律走 `path.relative` 判断，不做 `startsWith` 手工前缀算术（MEMORY.md A4）——
+ * 否则 `D:\a\bc` 会被判成 `D:\a\b` 的子路径。
+ */
+function isSameOrUnder(candidate: string, root: string): boolean {
+  if (candidate === root) return true
+  const rel = relative(root, candidate)
+  return !!rel && !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/** 登记一个流，并在它 close / error 时自行摘除（不摘会一路泄漏到进程退出） */
+function trackMediaStream(absPath: string, rs: ReadStream): void {
+  const key = handleKeyOf(absPath)
+  let set = openMediaStreams.get(key)
+  if (!set) {
+    set = new Set<ReadStream>()
+    openMediaStreams.set(key, set)
+  }
+  const bucket = set
+  bucket.add(rs)
+
+  // `close` 与 `error` 都挂上：fs.ReadStream 出错后通常仍会 emit 'close'（emitClose 默认 true），
+  // 但**不能指望**它 —— 摘除动作做成幂等，谁先到都行。
+  const drop = (): void => {
+    bucket.delete(rs)
+    if (!bucket.size && openMediaStreams.get(key) === bucket) openMediaStreams.delete(key)
+  }
+  rs.once('close', drop)
+  rs.once('error', drop)
+}
+
+/** 收集「该路径本身或其子树下」当前所有活跃流 */
+function collectStreamsUnder(absPath: string): ReadStream[] {
+  const root = handleKeyOf(absPath)
+  const out: ReadStream[] = []
+  for (const [key, set] of openMediaStreams) {
+    if (!isSameOrUnder(key, root)) continue
+    for (const rs of set) out.push(rs)
+  }
+  return out
+}
+
+/**
+ * 同步释放：只 `destroy()`，**不等**句柄真的关掉。
+ * 给「活在同步上下文里」的调用点用（`assets.renameAsset` / `moveAssets`，
+ * 它们在 `BEGIN…COMMIT` 里，一个 await 都不能有）。
+ * ⚠️ 探针 [c1]/[c2]：destroy 后同一 tick / 下一个 setImmediate 都还是 EPERM，
+ * 所以同步上下文只能靠 `renameWithShortRetrySync` 的 50ms 让位兜底（那些场景改的是**文件**，
+ * 而文件改名本来就不被句柄挡住 —— 探针 [a2] —— 真正需要等 close 的是「目录」）。
+ */
+export function releaseMediaUnder(absPath: string): number {
+  // ⚠️ 当前**没有同步调用点**：`assets.renameAsset` / `moveAssets` 里那两个调用已按 QA 回归证据移除
+  // （改的是文件，探针 [a2] 证明不被句柄挡住；释放只会把正在播的素材打断）。
+  // 保留它是作为注册表原语（`releaseMediaUnderAsync` 复用同一套收集逻辑），别再往同步上下文里加调用点。
+  const victims = collectStreamsUnder(absPath)
+  for (const rs of victims) rs.destroy()
+  return victims.length
+}
+
+/**
+ * 异步释放：destroy + 等所有流 `close`。
+ * 这是 `library.renameFolder` 用的那个「够用」的版本 —— 探针 [b] 实测 close 只需 1ms，
+ * 等它比「把重试预算加长」正确得多（长驻流面前重试永远打不过，那只是兜底而非修复）。
+ *
+ * 300ms 上限兜底：万一某个流因为消费端卡住而迟迟不 close，也不能把重命名悬死
+ * （此后还有 `renameWithRetry` 自己的重试）。
+ */
+export async function releaseMediaUnderAsync(absPath: string): Promise<number> {
+  const victims = collectStreamsUnder(absPath)
+  if (!victims.length) return 0
+  // 先挂监听再 destroy：destroy 的 close 走后续 tick，但不要赌，顺序上先订阅更稳
+  const closedAll = Promise.all(
+    victims.map(
+      (rs) =>
+        new Promise<void>((done) => {
+          if (rs.closed) return done()
+          rs.once('close', () => done())
+          rs.once('error', () => done())
+        })
+    )
+  )
+  for (const rs of victims) rs.destroy()
+  await Promise.race([closedAll, new Promise<void>((r) => setTimeout(r, 300))])
+  return victims.length
+}
+
+/** 抑制窗口：key = 子树根的规范化绝对路径，value = 失效时间戳 */
+const mediaSuppressedUntil = new Map<string, number>()
+
+/**
+ * 「抑制窗口被开过多少次」（只增不减）。
+ *
+ * 用途：冒烟里锁**接线**——`library.renameFolder` 改名前必须真的开过窗。
+ * 为什么不能只断言抑制机制本身（开窗→请求被拒）：那是直接调 `suppressMediaUnder`，
+ * 拿掉 `renameFolder` 里的那行调用它照样绿（QA 的 D1 注入实测）。
+ */
+let suppressActivations = 0
+
+/** 供冒烟断言「renameFolder 真的开过窗」（接线断言，不是行为断言） */
+export function mediaSuppressionActivations(): number {
+  return suppressActivations
+}
+
+/**
+ * 开一个抑制窗口：窗口内落到该子树下的 `stash://media` 请求直接拒（见 `serveMedia`）。
+ *
+ * 为什么必须「按子树」：改名的是一级目录，而渲染层重开的是「里面某个素材」的 URL，
+ * 两者不是同一个路径。按子串/前缀匹配才能挡住它。
+ */
+export function suppressMediaUnder(absPath: string, ms: number = MEDIA_SUPPRESS_MS): void {
+  suppressActivations++
+  const root = handleKeyOf(absPath)
+  const now = Date.now()
+  mediaSuppressedUntil.set(root, now + Math.max(0, ms))
+  // 顺手清掉已过期的条目：抑制窗口只在改名时开，条目数天然很小，
+  // 但万一 `clearSuppression` 没被调到，也不该无限堆积。
+  for (const [k, until] of mediaSuppressedUntil) if (until <= now) mediaSuppressedUntil.delete(k)
+}
+
+/** 立刻解除所有抑制（改名动作一结束就调：成功→按新路径重取；失败→继续允许预览） */
+export function clearMediaSuppression(): void {
+  mediaSuppressedUntil.clear()
+}
+
+/** 当前是否处于抑制窗口内（过期条目顺手清掉） */
+function isMediaSuppressed(absPath: string): boolean {
+  if (!mediaSuppressedUntil.size) return false
+  const key = handleKeyOf(absPath)
+  const now = Date.now()
+  let hit = false
+  for (const [root, until] of mediaSuppressedUntil) {
+    if (until <= now) {
+      mediaSuppressedUntil.delete(root)
+      continue
+    }
+    if (isSameOrUnder(key, root)) hit = true
+  }
+  return hit
+}
+
+/**
+ * **测试缝**（只给冒烟用，产品路径绝不调用）：登记一个「destroy 之后**永远不会 emit close**」的假流。
+ *
+ * 为什么需要它：`releaseMediaUnderAsync` 的 300ms 上限是防「等 close 等死」的兜底，
+ * 而真实 `fs.ReadStream` 的 close 只要 1ms —— 正常路径上那个上限**永远不会被触发**，
+ * 于是「把上限删掉」这种回归用任何端到端用例都测不出来（QA 的 D3 注入印证了这点）。
+ * 有了这条缝，冒烟能造出「卡在等 close」的真实态：此时 rename 必须在 ≈300ms 内完成，
+ * 耗时既不会缩到 0（说明上限被改成 0、根本没在等）也不会无限长（说明上限被删了）。
+ *
+ * 返回一个卸载函数（emit 'error' 让登记表自摘），用例结束务必调用，别污染后续计数。
+ */
+export function __testAddUnclosableStream(absPath: string): () => void {
+  // 用**真的** Readable（`emitClose: false` → destroy 之后永不发 'close'），
+  // 而不是自己拼一个 EventEmitter 假对象：假对象在真实事件循环里踩过坑（会把后续的
+  // `serveMedia` 卡死），用 Node 自己的类最稳。
+  const stuck = new Readable({ read: () => undefined, emitClose: false })
+  trackMediaStream(absPath, stuck as unknown as ReadStream)
+  return () => {
+    stuck.emit('error', new Error('TEST_DETACH'))
+  }
+}
+
+/**
+ * 冒烟/诊断用：当前活跃流数量。传路径则只数该子树。
+ * ⚠️ 这条是给断言用的**真判据**（不是自证的计数器）：它直接读登记表，
+ *    而登记表由流的 `close`/`error` 事件驱动摘除 —— 流没真的关掉就不会变 0。
+ */
+export function activeMediaStreamCount(absPath?: string): number {
+  if (absPath == null) {
+    let n = 0
+    for (const set of openMediaStreams.values()) n += set.size
+    return n
+  }
+  return collectStreamsUnder(absPath).length
+}
+
+/**
+ * 交给 `handles.ts` 注册表的那份实现（`main.ts` 启动时接上，见那里的注释）。
+ * 之所以做成对象而不是让 library 直接 import 本文件：依赖方向是 `preview → library`，
+ * 反向 import 会成环（MEMORY.md I3）。
+ */
+export const mediaHandleGuard: MediaHandleGuard = {
+  release: releaseMediaUnder,
+  releaseAsync: releaseMediaUnderAsync,
+  suppress: suppressMediaUnder,
+  clearSuppression: clearMediaSuppression
+}
+
 // ==================== 协议：服务媒体字节 ====================
 /**
  * 读取并发闸门。
@@ -633,6 +862,9 @@ export function parseRange(header: string | null, size: number): { start: number
  */
 function streamBody(abs: string, range: { start: number; end: number } | null, signal: AbortSignal | null): ReadableStream {
   const rs = range ? createReadStream(abs, range) : createReadStream(abs)
+  // 登记进「活跃媒体流」表：重命名文件夹前要靠它把**我们自己的**句柄放掉。
+  // 登记/摘除都在 `trackMediaStream` 里闭合，不会泄漏（摘除挂在 close/error 上）。
+  trackMediaStream(abs, rs)
   if (signal) {
     const destroy = (): void => { rs.destroy() }
     if (signal.aborted) destroy()
@@ -680,6 +912,20 @@ export async function serveMedia(req: Request, idRaw: string): Promise<Response>
   } catch (e) {
     const code = String((e as Error).message ?? e)
     return new Response(code, { status: code === 'ERR_ASSET_NOT_FOUND' ? 404 : 500 })
+  }
+
+  /**
+   * 抑制窗口：这棵子树正在被改名，此刻**不能再把句柄打开**（哪怕一秒）——
+   * 探针 [d] 实测「destroy 后重开耗时 0ms，且立刻重新占住目录」，只要放进来一次，
+   * 紧接着的 rename 就又 EPERM。窗口由 `library.renameFolder` 开、结束时立刻 clear，
+   * 兜底 10s 自动过期（见 handles.MEDIA_SUPPRESS_MS）。
+   *
+   * 为什么用 409 而不是 404：404 在本函数里已有确定含义（派生文件还没生成 / 文件不存在），
+   * 混在一起会让排错时分不清「该等派生」还是「正在改名」。两者对 <video>/<img> 都是加载失败，
+   * 行为上无差别。
+   */
+  if (isMediaSuppressed(abs)) {
+    return new Response('media-suppressed', { status: 409 })
   }
 
   return withReadSlot(async () => {

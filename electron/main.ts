@@ -8,7 +8,9 @@ import * as assetsSvc from './services/assets'
 import * as importerSvc from './services/importer'
 import * as clipboardSvc from './services/clipboard'
 import * as previewSvc from './services/preview'
-import { unwatchLibrary, watchLibrary } from './services/watcher'
+import {
+  unwatchLibrary, watchLibrary, isWatching, suspendWatchingAsync, reconcileWhenReady
+} from './services/watcher'
 import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
 import * as healthSvc from './services/health'
@@ -28,7 +30,78 @@ import { runSmokeMeta } from './services/smoke-meta'
 import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
 import { runSmokeWatch } from './services/smoke-watch'
-import { ensureThumb, ensureBatch, retestLegacyDims, SIZES, type ThumbSize } from './services/thumbs'
+import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, SIZES, type ThumbSize } from './services/thumbs'
+import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
+import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
+
+/**
+ * 把 `preview` 的「媒体句柄释放 / 抑制」实现接进 `handles.ts` 的注册表。
+ *
+ * 为什么需要这份注册表：`preview.ts` import 了 `library.ts`（取库路径），
+ * 所以 `library.renameFolder` **不能**反向 import `preview.ts` —— 会成环（MEMORY.md I3）。
+ * 由 `main.ts`（谁都 import、谁都不被 import 的顶层）在启动时把实现接上，
+ * 依赖方向变成 `library → handles ← preview`，没有环。
+ *
+ * 为什么放在**模块顶层**而不是 `bootstrap()` 里：正常启动走 `bootstrap()`，
+ * 12 套冒烟走别的分支，放顶层才能保证「任何入口都接上」——
+ * 否则 `--smoke-folder` 那条端到端断言会因为「没人注册」而退化成空转（G11）。
+ */
+registerMediaHandleGuard(previewSvc.mediaHandleGuard)
+
+/**
+ * 把「改名隔离」的三个实现接进 `handles.ts` 的第二份注册表。
+ *
+ * 为什么在这里接（而不是让 library 直接 import 它们）：`library` 被 `watcher` / `thumbs` /
+ * `genmeta` / `preview` **全都** import 着，反向 import 会立刻成环（MEMORY.md I3）。
+ * `main.ts` 是唯一「谁都 import、谁都不被 import」的顶层，所以由它接线：
+ *   `library → handles ← watcher / thumbs / genmeta`。
+ *
+ * 三件事各自为什么必须由 main 转一手：
+ *   · 暂停泵：`thumbs` / `genmeta` 都 import 了 `library`（取库路径），library 不能反向调；
+ *   · 停/重挂监听器：`watchLibrary(libPath, db)` 需要**当前库**的路径与连接，而
+ *     `library.renameFolder` 手上现成有这两个值，顺着 handles 的参数传进来最稳
+ *     （让实现方自己 `requireCurrent()` 会在「改名失败 + 事务回滚」的中间态读到不确定的值）。
+ *
+ * 同样放在模块顶层：12 套冒烟各有入口分支，放 `bootstrap()` 里会让冒烟退化成空转（G11）。
+ */
+registerRenameIsolationGuard({
+  async pausePumps(maxWaitMs: number) {
+    // 两个泵并行暂停：串行等待会让上限翻倍（各 3s），并行则总上限仍是 3s。
+    const [thumbs, meta] = await Promise.all([pausePumpAsync(maxWaitMs), pauseMetaPumpAsync(maxWaitMs)])
+    return [
+      { pump: 'thumbs' as const, ...thumbs },
+      { pump: 'genmeta' as const, ...meta }
+    ]
+  },
+  resumePumps() {
+    // 顺序无关：两个泵互不依赖，各自幂等。任一抛错不能挡住另一个。
+    try {
+      resumePump()
+    } finally {
+      resumeMetaPump()
+    }
+  },
+  suspendWatcher() {
+    // 必须是**可等待**的 `suspendWatchingAsync`：`unwatchLibrary()` 只是发起 close() 就返回，
+    // 而 Windows 上目录句柄在 close 真正完成前仍会挡住祖先目录改名（实测：这是本轮的关键）。
+    return suspendWatchingAsync()
+  },
+  restartWatcher(libPath, db) {
+    // `watchLibrary` 开头自带 `unwatchLibrary()`，所以这里不会产生重复 watcher；
+    // `ignoreInitial: true` 保证重挂时不会炸出一堆 add 事件（把存量素材重复索引）。
+    watchLibrary(libPath, db)
+    return isWatching()
+  },
+  watcherActive() {
+    return isWatching()
+  },
+  reconcileAfterWindow(libPath, db) {
+    // 停监听 → 重挂到 ready 之间写进库的文件会被 ignoreInitial 吞掉（窗口随库规模线性增长），
+    // 全库又没有第二个「磁盘 → 索引」入口，所以这条是收尾责任：等 ready 后补一次对账。
+    // 内部 `setImmediate` + 不 await，绝不拖慢改名/删除的 IPC 返回。
+    reconcileWhenReady(db, libPath)
+  }
+})
 
 /**
  * 删库的**唯一收口入口**：删的是「当前正在监听的库」时，先停掉 chokidar 再删目录。

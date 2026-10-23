@@ -921,7 +921,20 @@ export async function scanAsset(job: MetaJob): Promise<void> {
   }
 }
 
+/**
+ * 元数据扫描泵是否被**临时**暂停（`library.renameFolder` 的隔离链第 2 步）。
+ *
+ * 为什么连它一起停：`scanAsset` 走 `sharp(abs).metadata()`（按**路径**打开）与 `readHead`（`openSync`），
+ * 都是「打开文件」的形态。虽然实测它们不是用户那次的持柄来源（那次只有目录句柄、文件全没被打开），
+ * 但改名瞬间它们仍可能抢到瞬时占用 —— 隔离链要按「**我方所有会开句柄的泵**」来收口，
+ * 而不是只停我们**已知**会挡的那一个。
+ */
+let metaPaused = false
+
 function metaPump(): void {
+  // 暂停中：不取新任务（见 `pauseMetaPumpAsync` 的说明）。队列与去重集原样保留，
+  // `resumeMetaPump()` 会再推一次，不会漏扫、也不会重复入队。
+  if (metaPaused) return
   while (metaRunning < META_CONCURRENCY && metaQueue.length > 0) {
     const job = metaQueue.shift()!
     queuedIds.delete(job.id)
@@ -934,6 +947,35 @@ function metaPump(): void {
         if (metaRunning === 0 && metaQueue.length === 0) broadcast('meta:done', {})
       })
   }
+}
+
+/** 一次暂停的观测量（与 `thumbs.PumpPauseInfo` 同形，冒烟断言用） */
+export interface MetaPumpPauseInfo {
+  inFlight: number
+  waitedMs: number
+  timedOut: boolean
+}
+
+/** 暂停元数据扫描泵，并有界等待在场任务收尾（默认 3s，到点继续） */
+export async function pauseMetaPumpAsync(maxWaitMs = 3000): Promise<MetaPumpPauseInfo> {
+  metaPaused = true
+  const inFlight = metaRunning
+  const t0 = Date.now()
+  while (metaRunning > 0 && Date.now() - t0 < maxWaitMs) {
+    await new Promise<void>((r) => setTimeout(r, 10))
+  }
+  return { inFlight, waitedMs: Date.now() - t0, timedOut: metaRunning > 0 }
+}
+
+/** 恢复元数据扫描泵（幂等；必须放在 finally 里调，别把补扫永久停掉） */
+export function resumeMetaPump(): void {
+  metaPaused = false
+  metaPump()
+}
+
+/** 泵当前状态（冒烟断言「恢复到位」用） */
+export function metaPumpState(): { paused: boolean; running: number; queued: number } {
+  return { paused: metaPaused, running: metaRunning, queued: metaQueue.length }
 }
 
 /** 把「该扫但还没扫的图片」入队。返回入队数量（冒烟断言用） */

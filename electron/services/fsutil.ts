@@ -93,6 +93,18 @@ function busyRenameError(from: string, to: string, attempts: number, last: unkno
 }
 
 /**
+ * 该错误是不是「我们自己的重命名重试耗尽」（裸码 `ERR_FOLDER_BUSY`）？
+ *
+ * 为什么不能用 `isTransientRenameError` 判：`renameWithRetry` 耗尽后抛的是**新造的裸码错误**
+ * （`code` 为 undefined，原始 EPERM 在 `cause` 里），而 `isTransientRenameError` 只看 `code` ——
+ * 对着它返回 false。「还要不要升级隔离」这个判断必须用本函数，否则第 2 级隔离永远触发不到
+ * （实测：写错成 `isTransientRenameError` 后，改名在有 watcher 的库上仍然直接失败）。
+ */
+export function isBusyRenameError(e: unknown): boolean {
+  return (e as Error | undefined)?.message === 'ERR_FOLDER_BUSY'
+}
+
+/**
  * 有界重试的重命名助手（**异步**）。
  *
  * 语义：

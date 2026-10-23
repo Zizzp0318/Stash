@@ -1,6 +1,7 @@
 import chokidar, { type FSWatcher } from 'chokidar'
 import { basename, extname, join, relative } from 'path'
 import { renameSync, rmSync, statSync } from 'fs'
+import { opendir } from 'fs/promises'
 import { BrowserWindow } from 'electron'
 import { contentHash, EXT_TYPE } from './importer'
 import { ensureFolderRows, mkdirRel } from './library'
@@ -9,6 +10,46 @@ import { relFromLib } from './paths'
 import { escapeLike, type DB } from './db'
 
 let watcher: FSWatcher | null = null
+
+/**
+ * 当前 watcher 是否已经 `ready`（chokidar 走完整棵树、所有 `fs.watch` 都建好了）。
+ *
+ * 为什么需要它（第三轮补）：改名/删除时我们会**整库停掉监听器**，重挂后 chokidar 要从头走一遍树
+ * 才 ready；这段窗口里写进库的文件会被 `ignoreInitial: true` 当成「初始状态」直接吞掉
+ * （实测 250 文件库 ≈1.5s，QA 实测 305 目录 1540ms）。所以重挂之后必须**等 ready**
+ * 再做一次「磁盘 → 索引」对账（见 `reconcileWhenReady`），否则那些文件永远进不了索引。
+ */
+let watcherReady = false
+/** `whenWatcherReady()` 的等待者；watcher 就绪（true）或被摘掉（false）时统一唤醒 */
+let readyWaiters: Array<(ok: boolean) => void> = []
+
+function settleReadyWaiters(ok: boolean): void {
+  const list = readyWaiters
+  readyWaiters = []
+  for (const fn of list) fn(ok)
+}
+
+/**
+ * 等到当前 watcher `ready`（或超时 / 被摘掉）。**没有 watcher 时立刻返回 false**。
+ *
+ * @param timeoutMs 上限兜底（默认 10s）：绝不让调用方（对账）永久悬着。
+ * @returns `true` = 已 ready；`false` = 没有 watcher、或超时、或等待期间被摘掉
+ */
+export function whenWatcherReady(timeoutMs = 10_000): Promise<boolean> {
+  if (!watcher) return Promise.resolve(false)
+  if (watcherReady) return Promise.resolve(true)
+  return new Promise<boolean>((resolve) => {
+    let done = false
+    const finish = (ok: boolean): void => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(ok)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    readyWaiters.push((ok) => finish(ok))
+  })
+}
 
 /** 压缩管线写的临时文件前缀（同目录、同盘，见 compress.ts 的 tmpPathFor） */
 const TMP_PREFIX = '.stash-compress-'
@@ -168,110 +209,404 @@ export function isWatching(): boolean {
   return watcher !== null
 }
 
-export function unwatchLibrary(): void {
-  if (watcher) {
-    watcher.close()
-    watcher = null
+/**
+ * 当前 watcher 已建立 watch 的**目录数量**（`getWatched()` 的键数）；没在监听返回 0。
+ *
+ * 仅供冒烟断言：验证「改名期间停监听→重挂」**不会留下重复 watcher**。
+ * `isWatching()` 只能回答「有没有」，回答不了「有没有两份」—— 而两份 watcher 的后果是
+ * 事件双发（`bumpExternal` 双计、界面收到两次「库在外部被改动」），且句柄翻倍。
+ * 判据取「改名前后的目录数相等」：重挂若漏掉了旧的 close，这个数会接近翻倍。
+ * 切库后目录数变化是正常的（那是不同的库），所以只在「同一个库、刚重挂完」时比较。
+ */
+export function watchedDirCount(): number {
+  if (!watcher) return 0
+  try {
+    return Object.keys(watcher.getWatched()).length
+  } catch {
+    return -1
   }
+}
+
+/**
+ * 摘掉当前监听器，并清掉「属于上一个库」的全部待发状态。**不等待 `close()` 完成**。
+ *
+ * 抽出来的理由：停监听有两条需求完全不同的调用路径 ——
+ *   · 切库 / 关库 / 删库 / 进程退出（`unwatchLibrary`）：只要不再产生新事件即可，不关心句柄几时释放；
+ *   · **改名隔离**（`suspendWatchingAsync`）：必须**确认**底层句柄已释放，否则紧接着的 rename 还是 EPERM。
+ * 两边的清理动作必须一模一样（否则「少清一样」只会在其中一条路径上暴露），所以清理收在这里，
+ * 差别只在「要不要 await close()」。
+ */
+function detachWatcher(): FSWatcher | null {
+  const w = watcher
+  watcher = null
+  // 就绪态一并归零，并唤醒所有等 ready 的人（返回 false）：否则对账会一直等到超时。
+  watcherReady = false
+  settleReadyWaiters(false) // 被摘掉 = 永远不会 ready，别让对账白等到超时
   suppressed.clear()
-  // 清掉待发的去抖广播与计数。否则切库/关库后，一个属于**上一个库**的陈旧广播
-  // 会打到新库上：新库会莫名弹出「库在外部被改动了」并把列表刷新一遍。
-  // watchLibrary 开头也会调本函数，所以「切库」与「关库」两条路径都被覆盖。
+  // 清掉待发的去抖广播与计数（**故意丢掉，不 flush**）。
+  //
+  // 曾经在这里试过「先 flush 一次别丢用户提示」，被 `--smoke-watch` 的 D5 当场否证：
+  // D5 的契约是「切库后**绝不能**收到上一个库的待发广播」，flush 恰好把它送到了新库上
+  // （实测 `waited=true leaked=[{added:2,partial:false}]` 两条红）。
+  // 代价可以接受：丢掉的只是**界面的刷新提示**（索引早在事件到达时就写好了），
+  // 而且「改名」和「切库」这两个调用语境下界面本来就会重拉一次列表。
+  // 谁再想加 flush，先看 D5 的注释。
   if (externalTimer) {
     clearTimeout(externalTimer)
     externalTimer = null
   }
   pendingExternal = null
   batchStartedAt = null
+  return w
+}
+
+export function unwatchLibrary(): void {
+  const w = detachWatcher()
+  if (!w) return
+  // 故意**不** await：本函数所有调用点（切库 / 关库 / 删库 / 退出）都不需要「句柄已释放」这个保证，
+  // 而等待会让删库路径多一次让位、并把这些原本同步的调用点变成异步。
+  // **需要「句柄已释放」的只有改名隔离**，它走下面的 `suspendWatchingAsync()`。
+  try {
+    void Promise.resolve(w.close()).catch((e) => console.warn('[watcher] 停监听时 close 失败：', e))
+  } catch (e) {
+    console.warn('[watcher] 停监听时 close 抛异常：', e)
+  }
+}
+
+/**
+ * 暂停库监听，并**等 chokidar 真的把底层 watcher 关掉**再 resolve。
+ *
+ * 为什么必须等（2026-10-16 第三轮实测，`.workbuddy/audit/probe-real-lib-rename.mts`）：
+ *   chokidar 在 Windows 上**逐目录**建立 `fs.watch`（每个目录一个句柄）。只要某个**子目录**上挂着
+ *   这样一个句柄，改它**祖先目录**的名就必定 `EPERM` —— 即使用户什么都没打开。
+ *   实测形状判据（`probe-watch-shape.mts`）：
+ *     · 顶层目录只有文件        → 改名 **OK**
+ *     · 顶层目录含 1 个子目录   → 改名 **EPERM**
+ *     · 顶层目录含 11 个子目录  → 改名 **EPERM**
+ *     · 停掉 watcher 后三种形状 → 全部 **OK**
+ *   ⇒ 这正是用户「一级文件夹永远改不了名」的**真正根因**（上一轮修的媒体读流只是另一条成因）。
+ *   停监听还不够：`close()` 是异步的，句柄在它 resolve 之前仍可能在被释放 —— 所以这里 **await**。
+ *
+ * @returns 之前是否在监听（`false` = 本来就没在监听，调用方不必重启）
+ */
+export async function suspendWatchingAsync(): Promise<boolean> {
+  const w = detachWatcher()
+  if (!w) return false
+  try {
+    await w.close()
+  } catch (e) {
+    // 关不掉也得往下走：调用方还会重试 rename，且 finally 里一定会 watchLibrary 重挂，
+    // 绝不能因为「关的时候抛了一下」就把改名流程和监听恢复一起中断。
+    console.warn('[watcher] 暂停监听时 close 失败（继续尝试改名）：', e)
+  }
+  return true
+}
+
+
+/**
+ * 「这个绝对路径是否属于不参与索引的东西」（`.stash*` / `.thumbs` / 压缩临时文件）。
+ *
+ * 抽成函数是为了让 **chokidar 的 `ignored` 与对账 `reconcileLibrary` 用同一份判据** ——
+ * 两份判据迟早分叉（审计 §2.16 的老账），而对账多扫了 `.thumbs` 里的 webp 会直接往库里
+ * 插进一堆「素材」；少扫了 `.stash-compress-*` 又会在压缩中途把临时文件索引成素材。
+ *
+ * ⚠️ 绝不能在这里把「库根目录本身」判为忽略（`rel === ''`）：chokidar 会对被监听的根目录
+ * 求值 `ignored`，返回 true 会**直接不建立任何 watch**（chokidar 5.0.0 实测：
+ * getWatched() 为空、写文件 0 事件、ready 0ms）→ 整个外部变更同步静默失效。
+ */
+function isIgnoredAbs(libPath: string, p: string): boolean {
+  const rel = relative(libPath, p)
+  return rel.startsWith('.stash') || rel.startsWith('.thumbs') || basename(rel).startsWith(TMP_PREFIX)
+}
+
+/** `indexFile` 的结局：插入了新行 / 跳过（已存在、非素材、隐藏目录、被抑制） */
+type IndexOutcome = 'inserted' | 'skipped'
+
+/**
+ * **测试缝**（仅供冒烟）：把插入用的 `folder_id` 强制成 `null`。
+ *
+ * 为什么要这条缝：QA 第四轮证明 `INSERT OR IGNORE` 会把 `folder_id NOT NULL` 违反**静默吞掉**
+ * （无异常、无 warn、`changes=0`）。换成 `ON CONFLICT(rel_path) DO NOTHING` 之后它必须真的抛错，
+ * 并由调用方 warn。没有这条缝就只能靠「将来某次真实回归」来验证「不再静默」——那不叫验证。
+ * 默认关闭，任何生产路径都不会打开它。
+ */
+let forceNullFolderId = false
+
+/** 打开/关闭上面的测试缝（仅供冒烟；返回旧值便于恢复） */
+export function __testForceNullFolderId(on: boolean): boolean {
+  const prev = forceNullFolderId
+  forceNullFolderId = on
+  return prev
+}
+
+/**
+ * 把一个库内文件按**索引规则**落库（watcher 的 `add` 与盲窗对账**共用这一条路径**）。
+ *
+ * ⚠️ 为什么必须抽出来而不是各写一份：QA 的第四轮要求「盲窗对账」不得改变索引语义 ——
+ * 根目录文件要移进「未分类」、非素材扩展名要跳过、`.` 开头的目录要跳过、
+ * 外部新建的子目录要 `ensureFolderRows` 补齐。任何一条在两条路径上不一致，
+ * 就会出现「拷进来的文件被索引成素材 / 对账后凭空多出卡片」这类怪事。
+ *
+ * @param opts.external `true` = 来自 chokidar 的**外部**改动（要消费抑制标记、要计入待发广播）；
+ *                      `false` = 对账补写（我们自己发起的，不需要广播，界面本来就会刷新）
+ */
+function indexFile(db: DB, libPath: string, abs: string, opts: { external: boolean }): IndexOutcome {
+  let rel = relFromLib(libPath, abs)
+  // 我们自己刚放进来的（压缩替换）→ 索引已经改好了，别再插一行重复素材
+  if (opts.external && consumeSuppressed(rel)) return 'skipped'
+  // 索引里已有该 rel_path → 不重复插行。
+  // 这条同时兜住「根目录文件被我们移动后，chokidar 补发的新路径 add」：
+  // 移动是同步完成的，本行的 INSERT 已先于那次 add 落库（详见下方根目录分支的注释）；
+  // 也是**对账的幂等闸门**：连跑两次时第二次全部命中这里（不算 hash、不动任何列）。
+  if (db.prepare('SELECT id FROM assets WHERE rel_path=?').get(rel)) return 'skipped'
+
+  const ext = extname(abs).slice(1).toLowerCase()
+  const type = EXT_TYPE[ext]
+  // 非素材类型（含压缩临时文件 `.stash-compress-*` 等）：不索引
+  if (!type) return 'skipped'
+
+  let dirRel = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+  // `.` 开头的目录一律不索引：与 deleteFolder/renameFolder 的 `path.startsWith('.')`
+  // → `ERR_PROTECTED_FOLDER` 保护同一条线。否则会给它们造出「侧栏里看不见、
+  // 却又因为受保护而永远删不掉/改不掉」的 folders 行（既不在册又受保护）。
+  if (dirRel.split('/').some((p) => p.startsWith('.'))) return 'skipped'
+
+  // 注意：用 `rel.slice(...)` 取文件名而不是 `path.basename` ——
+  // rel 已被规范化成 `/` 分隔，而 Windows 上 basename 只认 `\\`，会原样返回整串路径。
+  let name = rel.slice(dirRel.length ? dirRel.length + 1 : 0)
+  let folderId: number | null = null
+
+  if (!dirRel) {
+    // ① 文件落在**库根目录**：folders 表里没有「根目录」这一行，folder_id 保持 null 会撞
+    //    `assets.folder_id INTEGER NOT NULL`。按 importer 的既有约定，把它物理移动进
+    //    「未分类」——索引与磁盘始终一致，且不需要动 schema（用户已知情并同意此行为）。
+    const fallback = mkdirRel(UNCATEGORIZED)
+    const destDir = join(libPath, ...fallback.path.split('/'))
+    // 目标已存在同名文件 → 自动改名，绝不覆盖（规则唯一来源 naming.ts 的 uniqueName）
+    const movedName = uniqueName(destDir, name)
+    renameSync(abs, join(destDir, movedName)) // 同一目录树内移动 = 同盘，不会跨卷
+    dirRel = fallback.path
+    name = movedName
+    rel = `${dirRel}/${name}`
+    folderId = fallback.id
+  } else {
+    // ② 文件落在子目录：查 folders 行；查不到 = 外部（资源管理器）新建的目录，
+    //    用 ensureFolderRows 逐级补齐（不建目录，目录已由用户建好）。
+    const f = db.prepare('SELECT id FROM folders WHERE path=?').get(dirRel) as { id: number } | undefined
+    folderId = f ? f.id : ensureFolderRows(db, dirRel.split('/')).id
+  }
+
+  const absPath = join(libPath, ...rel.split('/'))
+  const st = statSync(absPath)
+  // 测试缝（仅供冒烟，见 `__testForceNullFolderId`）：模拟「folderId 变 null」这类回归
+  const folderIdForInsert: number | null = forceNullFolderId ? null : folderId
+  // content_hash 必须与行在同一 INSERT 内落库：thumbs.ts 的 `ensureOne`/`ensureBatch`
+  // 都以 `content_hash` 为过滤条件，缺了它这张卡永远没有缩略图、尺寸/色板也永不回填。
+  const hash = contentHash(absPath)
+  // ⚠️ **必须是 `ON CONFLICT(rel_path) DO NOTHING`，不能写 `INSERT OR IGNORE`**：
+  // `OR IGNORE` 忽略的是**所有**约束违反，不只是 UNIQUE —— 连 `folder_id NOT NULL`、
+  // `CHECK` 违反都会被静默跳过（`changes=0`，无异常、无 warn，看起来就像「这行已存在」）。
+  // 那正是我们花两轮在消灭的「文件凭空不入库、日志零痕迹」。QA 第四轮用 E6/E2 注入实测到了：
+  // 把 `folderId` 传 null 时，`OR IGNORE` 一声不响地跳过；改成 `ON CONFLICT(rel_path)` 之后
+  // 只有 rel_path 冲突会被跳过，其余约束违反会**真的抛错** → 交给调用方 warn（见 add/reconcile）。
+  //
+  // `rel_path` 有 UNIQUE（db.ts schema），所以「chokidar 的 add」与「盲窗对账」同时看到同一个
+  // 文件时，后到的那个走 DO NOTHING，不抛错、也不重复插行。
+  const info = db
+    .prepare(
+      `INSERT INTO assets(folder_id,name,rel_path,source_path,type,ext,size,content_hash,file_mtime,imported_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(rel_path) DO NOTHING`
+    )
+    .run(folderIdForInsert, name, rel, null, type, ext, st.size, hash, Math.floor(st.mtimeMs), Date.now())
+  if (Number(info.changes) <= 0) return 'skipped'
+  // 走到这里 = 真的插了一行外部新增素材 → 才计入待广播的 added。
+  // 上面任何一条 return（抑制 / 查重 / 非素材 / 隐藏目录）都不会执行到这里。
+  if (opts.external) bumpExternal('added')
+  return 'inserted'
+}
+
+/** 一次「盲窗对账」的结果（冒烟断言用：`inserted` 必须是可鉴别的数字） */
+export interface ReconcileResult {
+  /** 扫过的文件数（不含被忽略的目录/临时文件） */
+  scanned: number
+  /** 真正补回索引的文件数 */
+  inserted: number
+  /** 耗时（毫秒） */
+  ms: number
+  /** 是否因为「库已切换 / 连接已关闭」而**中途放弃**（此时 inserted 是已完成的部分） */
+  aborted: boolean
+}
+
+/** 让位一次：给事件循环处理 IPC / 定时器 / 渲染层消息的机会（`setImmediate` 比 `setTimeout(0)` 更早） */
+function yieldToLoop(): Promise<void> {
+  return new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+/**
+ * 对账的让位节流参数（QA 第四轮：最坏情况会把主进程冻几秒）。
+ *
+ * 实测（300 目录 / 3900 文件）：稳态 69~71ms 没问题，但**首次全量**（3900 行都要算 hash + 插入）
+ * 4303~4902ms ≈ 1.1ms/文件，而且是同步 DFS + 同步 SQLite ⇒ 主进程整段冻住、界面无响应。
+ * 触发场景真实存在：用户关着 App 往库里拷一批文件（`openLibrary` 不重扫 + `ignoreInitial` 吞），
+ * 下次改名时对账会把它们一次全补 → 冻 4.3s；2 万文件≈22s。
+ *
+ * 所以遍历改成异步 `opendir`（每个条目天然让出 I/O），再**每 50 个条目或累计 >50ms 显式
+ * `setImmediate` 让位一次**。50ms 的取值：远小于人能感知的卡顿阈值（~100ms），
+ * 又不会让 3900 个文件变成 3900 次事件循环往返（那会把总耗时抬得太多）。
+ */
+const RECONCILE_YIELD_EVERY = 50
+const RECONCILE_YIELD_MS = 50
+
+/** 连接是否还活着（对账是异步收尾，中途用户可能切库/关库 → `closeCurrent()` 会把连接关掉） */
+function isDbAlive(db: DB): boolean {
+  try {
+    db.prepare('SELECT 1').get()
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * **盲窗对账**：把「磁盘上有、索引里没有」的文件补回来。
+ *
+ * 背景（QA 第四轮实测）：改名/删除必须整库停掉 watcher（`chokidar.unwatch(subtree)` 在 5.0.0
+ * 上**不释放句柄**，实测 getWatched 仍列出该子树、rename 仍 EPERM）；重挂后 chokidar 要走完整棵树
+ * 才 `ready`，这段窗口随库规模线性增长（23 目录 73ms / 95 目录 480ms / **305 目录 1540ms**）。
+ * 窗口内写进库的文件会被 `ignoreInitial: true` 当成初始状态吞掉：`onDisk=true` 但永不入库，
+ * 而且**全库没有第二个「磁盘 → 索引」入口**（`openLibrary` 不重扫、`meta:rescan` 只重排已有行），
+ * 用户只能删掉再放回。所以这里补一次对账。
+ *
+ * 判据刻意**只做单向**：磁盘有、库里没有 → 插入。已有行**一律跳过**（不算 hash、不动任何列），
+ * 所以它是幂等的（连跑两次第二次 `inserted=0`），也不会覆盖用户字段（评分/标签/备注/提示词）。
+ *
+ * ⚠️ 反向（库里有一行、磁盘上没了）**不处理**：那需要全表比对并 `missing=1`，
+ * 与 `unlink` 那条线职责重叠，且误判代价（把正在拷的大文件标成失效）更高。记为已知边界。
+ *
+ * TODO(反向对账)：盲窗内**外部删除**的文件会留下 `missing=0` 的 stale 行（界面上是坏卡片）。
+ *   要做的话正确形状是：同样只在隔离窗口结束后跑一次，遍历 `SELECT id, rel_path FROM assets`
+ *   对 `existsSync` 为假的置 `missing=1`——但要先解决两个前提：
+ *   ① 不能把「正在被拷入/正在被压缩替换的同名文件」误判（需要 mtime 宽限或二次确认）；
+ *   ② 必须先让 `unlink` 那条线在同一窗口内停摆，否则两处互相覆盖。
+ *   QA 判定为中危、本轮不做；将来谁做，务必先补「误判」的注入测试。
+ *
+ * 顺带记一笔**不是对账的**卡顿源：改名后 0~0.86s 内主线程还有 156~390ms 的卡顿，
+ * 主因是 `watchLibrary` 重挂 + chokidar 首轮扫描（逐目录建 watch），不是对账 ——
+ * 所以「把对账分片」并不能消掉它；要治得从 chokidar 的启动扫描下手（另开工单）。
+ */
+export async function reconcileLibrary(db: DB, libPath: string): Promise<ReconcileResult> {
+  const t0 = Date.now()
+  // 先探一次连接：对账是**异步收尾**（等 ready + setImmediate），这期间用户完全可能切库/关库
+  // （`closeCurrent()` 会把连接关掉）。不探的话，遍历里每个文件都会抛 "database is not open"
+  // 并被单文件 catch 成一条 warn —— 250 个文件就是 250 行噪音，还把「真的对账失败」埋在中间。
+  if (!isDbAlive(db)) return { scanned: 0, inserted: 0, ms: 0, aborted: true }
+
+  let scanned = 0
+  let inserted = 0
+  const insertedRels: string[] = []
+  const stack: string[] = [libPath]
+  let sinceYield = 0
+  let lastYield = Date.now()
+
+  while (stack.length) {
+    const dirPath = stack.pop()!
+    // `opendir` + `for await`：条目逐个异步取（每步都天然让出 I/O），且退出时自动 close。
+    let dir: Awaited<ReturnType<typeof opendir>>
+    try {
+      dir = await opendir(dirPath)
+    } catch {
+      continue // 目录在遍历期间被删/被占用：跳过，下次对账再说
+    }
+    for await (const e of dir) {
+      const abs = join(dirPath, e.name)
+      if (isIgnoredAbs(libPath, abs)) continue
+      if (e.isDirectory()) {
+        // `.` 开头的目录整棵不索引（与 indexFile 的 dirRel 判据同源）
+        if (!e.name.startsWith('.')) stack.push(abs)
+        continue
+      }
+      if (!e.isFile()) continue
+      scanned++
+      try {
+        if (indexFile(db, libPath, abs, { external: false }) === 'inserted') {
+          inserted++
+          if (insertedRels.length < 5) insertedRels.push(relFromLib(libPath, abs))
+        }
+      } catch (err) {
+        // 单文件失败不中断对账（与 watcher 的 add 同一条纪律），但**必须带 rel_path 留痕**：
+        // 换成 `ON CONFLICT(rel_path) DO NOTHING` 之后，非 UNIQUE 的约束违反会真的抛到这里。
+        console.warn('[reconcile] 补写失败，该文件未入索引：', relFromLib(libPath, abs), err)
+      }
+      // —— 让位检查点（QA 第四轮：不加会把主进程冻几秒）——
+      sinceYield++
+      if (sinceYield >= RECONCILE_YIELD_EVERY || Date.now() - lastYield >= RECONCILE_YIELD_MS) {
+        await yieldToLoop()
+        sinceYield = 0
+        lastYield = Date.now()
+        // 让位之后立刻检查「库还是这个库吗」：切库/关库了就**立刻中止**，
+        // 绝不拿旧连接继续写（那会往已关闭的连接上插行，或者更糟：写到新库的路径下）。
+        if (!isDbAlive(db)) {
+          return { scanned, inserted, ms: Date.now() - t0, aborted: true }
+        }
+      }
+    }
+  }
+
+  const result = { scanned, inserted, ms: Date.now() - t0, aborted: false }
+  if (inserted > 0) {
+    // 带上文件名（最多 5 个）：万一对账补错了，日志里能直接看出补的是什么
+    const sample = insertedRels.join('、') + (inserted > insertedRels.length ? ' …' : '')
+    console.log(
+      `[reconcile] 补回 ${inserted} 个盲窗内写入的文件（扫描 ${scanned}，耗时 ${result.ms}ms）：${sample}`
+    )
+  }
+  return result
+}
+
+/**
+ * 重挂监听器之后**等 ready 再对账**（不阻塞改名/删除的 IPC 返回）。
+ *
+ * 两件事都不急：① 等 ready 才有意义（ready 之前写进来的文件还没被 chokidar 吞完）；
+ * ② `setImmediate` 让调用方（改名/删除）先 return —— 对账是收尾工作，
+ *    不该算进用户等的那几百毫秒里。
+ */
+export function reconcileWhenReady(db: DB, libPath: string): void {
+  void whenWatcherReady().then(async (ready) => {
+    if (!ready) return // 没有监听器 / 超时：窗口不存在（或已放弃），没有要补的
+    await yieldToLoop() // 先让调用方（改名/删除）的 IPC 返回
+    try {
+      await reconcileLibrary(db, libPath)
+    } catch (e) {
+      // 对账失败绝不能影响「改名/删除已经成功」这个结论
+      console.warn('[reconcile] 对账失败（不影响改名/删除结果）：', e)
+    }
+  })
 }
 
 /** 监听库目录，外部改动增量同步索引（防抖由 awaitWriteFinish + 简单标记实现） */
 export function watchLibrary(libPath: string, db: DB): void {
   unwatchLibrary()
+  watcherReady = false
   watcher = chokidar.watch(libPath, {
     ignoreInitial: true,
-    ignored: (p: string) => {
-      const rel = relative(libPath, p)
-      // .stash 数据库文件 / .thumbs 缩略图缓存，均不参与索引同步。
-      // `.stash-compress-*.tmp` 是压缩管线写在**目标同目录**的临时文件（同盘 rename 才快），
-      // 必须一并忽略 —— 否则会被当成「外部新增文件」（见 compress.ts 的 tmpPathFor）
-      //
-      // ⚠️ 绝不能在这里忽略「库根目录本身」（即 `rel === ''`）：chokidar 会对被监听的根目录
-      // 求值 `ignored`，返回 true 会**直接不建立任何 watch**（chokidar 5.0.0 实测：
-      // getWatched() 为空、写文件 0 事件、ready 0ms）→ 整个外部变更同步静默失效。
-      // 而根目录本没有理由被忽略：`ignoreInitial: true` 已跳过初始扫描，也没有 addDir 处理器。
-      // `relative()` 对子路径至少返回一段文件名，只有根目录会得到 `''`，删掉它不影响下面三条判断。
-      return (
-        rel.startsWith('.stash') ||
-        rel.startsWith('.thumbs') ||
-        basename(rel).startsWith(TMP_PREFIX)
-      )
-    },
+    ignored: (p: string) => isIgnoredAbs(libPath, p),
     awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 100 }
+  })
+
+  watcher.once('ready', () => {
+    watcherReady = true
+    settleReadyWaiters(true)
   })
 
   watcher.on('add', (abs: string) => {
     try {
-      let rel = relFromLib(libPath, abs)
-      // 我们自己刚放进来的（压缩替换）→ 索引已经改好了，别再插一行重复素材
-      if (consumeSuppressed(rel)) return
-      // 索引里已有该 rel_path → 不重复插行。
-      // 这条同时兜住「根目录文件被我们移动后，chokidar 补发的新路径 add」：
-      // 移动是同步完成的，本行的 INSERT 已先于那次 add 落库（详见下方根目录分支的注释）。
-      if (db.prepare('SELECT id FROM assets WHERE rel_path=?').get(rel)) return
-
-      const ext = extname(abs).slice(1).toLowerCase()
-      const type = EXT_TYPE[ext]
-      // 非素材类型（含压缩临时文件 `.stash-compress-*` 等）：不索引
-      if (!type) return
-
-      let dirRel = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
-      // `.` 开头的目录一律不索引：与 deleteFolder/renameFolder 的 `path.startsWith('.')`
-      // → `ERR_PROTECTED_FOLDER` 保护同一条线。否则会给它们造出「侧栏里看不见、
-      // 却又因为受保护而永远删不掉/改不掉」的 folders 行（既不在册又受保护）。
-      if (dirRel.split('/').some((p) => p.startsWith('.'))) return
-
-      // 注意：用 `rel.slice(...)` 取文件名而不是 `path.basename` ——
-      // rel 已被规范化成 `/` 分隔，而 Windows 上 basename 只认 `\\`，会原样返回整串路径。
-      let name = rel.slice(dirRel.length ? dirRel.length + 1 : 0)
-      let folderId: number | null = null
-
-      if (!dirRel) {
-        // ① 文件落在**库根目录**：folders 表里没有「根目录」这一行，folder_id 保持 null 会撞
-        //    `assets.folder_id INTEGER NOT NULL`。按 importer 的既有约定，把它物理移动进
-        //    「未分类」——索引与磁盘始终一致，且不需要动 schema（用户已知情并同意此行为）。
-        const fallback = mkdirRel(UNCATEGORIZED)
-        const destDir = join(libPath, ...fallback.path.split('/'))
-        // 目标已存在同名文件 → 自动改名，绝不覆盖（规则唯一来源 naming.ts 的 uniqueName）
-        const movedName = uniqueName(destDir, name)
-        renameSync(abs, join(destDir, movedName)) // 同一目录树内移动 = 同盘，不会跨卷
-        dirRel = fallback.path
-        name = movedName
-        rel = `${dirRel}/${name}`
-        folderId = fallback.id
-      } else {
-        // ② 文件落在子目录：查 folders 行；查不到 = 外部（资源管理器）新建的目录，
-        //    用 ensureFolderRows 逐级补齐（不建目录，目录已由用户建好）。
-        const f = db.prepare('SELECT id FROM folders WHERE path=?').get(dirRel) as { id: number } | undefined
-        folderId = f ? f.id : ensureFolderRows(db, dirRel.split('/')).id
-      }
-
-      const absPath = join(libPath, ...rel.split('/'))
-      const st = statSync(absPath)
-      // content_hash 必须与行在同一 INSERT 内落库：thumbs.ts 的 `ensureOne`/`ensureBatch`
-      // 都以 `content_hash` 为过滤条件，缺了它这张卡永远没有缩略图、尺寸/色板也永不回填。
-      const hash = contentHash(absPath)
-      db.prepare(
-        `INSERT INTO assets(folder_id,name,rel_path,source_path,type,ext,size,content_hash,file_mtime,imported_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`
-      ).run(folderId, name, rel, null, type, ext, st.size, hash, Math.floor(st.mtimeMs), Date.now())
-      // 走到这里 = 真的插了一行外部新增素材 → 才计入待广播的 added。
-      // 上面任何一条 return（抑制 / 查重 / 非素材 / 隐藏目录）都不会执行到这里。
-      bumpExternal('added')
+      indexFile(db, libPath, abs, { external: true })
     } catch (e) {
-      // 保持「单文件失败不中断监听」的语义，但留下可诊断的痕迹：
-      // 此前这里是空 catch，用户看到的「文件拷进去却凭空消失」因此在日志里查无实据。
-      console.warn('[watcher] add 同步失败:', basename(abs), e)
+      // 保持「单文件失败不中断监听」的语义，但**必须留痕且带 rel_path**：
+      // `ON CONFLICT(rel_path) DO NOTHING` 之后，非 UNIQUE 的约束违反会真的抛到这里
+      // （以前 `OR IGNORE` 会把它吞成「已存在」，日志零痕迹 —— 那正是「文件凭空不入库」的成因）。
+      console.warn('[watcher] add 同步失败，该文件未入索引：', relFromLib(libPath, abs), e)
     }
   })
 

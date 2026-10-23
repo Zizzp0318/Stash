@@ -423,6 +423,61 @@ interface Job {
 const queue: Job[] = []
 let running = 0
 
+/**
+ * 泵是否被**临时**暂停（改名隔离用，见 `pausePumpAsync`）。
+ *
+ * 语义：暂停后 `pump()` 立即返回、**不取新任务**，但已在跑的 job 照常跑完并照常 settle 批次 ——
+ * 队列不清空、进度不丢。恢复（`resumePump`）后从队列原样继续。
+ */
+let paused = false
+
+/** 一次「暂停」的观测量（冒烟断言用：证明暂停**真的**等到在场任务收尾，而不是空转） */
+export interface PumpPauseInfo {
+  /** 暂停瞬间的在场并发数 */
+  inFlight: number
+  /** 等到全部收尾花了多久（毫秒）；`inFlight === 0` 时为 0 */
+  waitedMs: number
+  /** 是否等到上限仍有任务在场（超时后照样继续，靠 finally 恢复） */
+  timedOut: boolean
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+/**
+ * **暂停**取新任务，并有界等待在场任务收尾。
+ *
+ * 用途（`library.renameFolder` 的隔离链第 2 步）：改名瞬间若缩略图 job 正在解码同一子树里的文件，
+ * 它会短暂持有该文件的句柄；虽然 `openSource` 已改成「读进内存」（避免长驻句柄），
+ * 但 `statSync` / 写 `.thumbs` 与「改名同一目录」撞上仍可能抢到瞬时占用。
+ * 停一下泵比加长重试预算可靠得多（对常驻句柄重试一万次也没用）。
+ *
+ * @param maxWaitMs 有界上限（默认 3s）。到点仍在跑就返回 `timedOut: true` 继续往下走 ——
+ *                  **绝不**因为缩略图没跑完就把改名卡死（改名是用户主动操作，优先级更高）。
+ */
+export async function pausePumpAsync(maxWaitMs = 3000): Promise<PumpPauseInfo> {
+  paused = true
+  const inFlight = running
+  const t0 = Date.now()
+  while (running > 0 && Date.now() - t0 < maxWaitMs) await sleepMs(10)
+  return { inFlight, waitedMs: Date.now() - t0, timedOut: running > 0 }
+}
+
+/**
+ * **恢复**泵。幂等、可在任何时刻调用（没有暂停过也安全）。
+ * 必须放在 `finally` 里调 —— 否则改名失败会把缩略图队列**永久**停掉（用户看到「卡片一直灰」）。
+ */
+export function resumePump(): void {
+  paused = false
+  pump()
+}
+
+/** 泵的当前状态（冒烟断言「恢复到位」用；生产代码不依赖它） */
+export function pumpState(): { paused: boolean; running: number; queued: number } {
+  return { paused, running, queued: queue.length }
+}
+
 function broadcast(channel: string, data: unknown): void {
   BrowserWindow.getAllWindows()[0]?.webContents.send(channel, data)
 }
@@ -459,6 +514,9 @@ function finishJob(job: Job): void {
 }
 
 function pump(): void {
+  // 暂停中：**不取新任务**（在场 job 的 `finishJob` 仍会调回这里，也走这条早退）。
+  // 队列原样保留，`resumePump()` 会再推一次。
+  if (paused) return
   while (running < concurrency() && queue.length > 0) {
     const job = queue.shift()!
     running++

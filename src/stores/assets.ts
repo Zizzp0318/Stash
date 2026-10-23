@@ -121,6 +121,28 @@ export const useAssetStore = defineStore('assets', () => {
     thumbV.value++
   }
 
+  /**
+   * **媒体版本号（按素材 id）**：只在「我们确实把这个素材的媒体流 destroy 掉了」时才 +1。
+   *
+   * 为什么不能拿 `rel_path` 当「该重载了」的信号（QA 实测的回归，别再改回去）：
+   *   `stash://media/{id}` 在主进程是**按 id 查库**解析绝对路径的，`rel_path` 变了 URL 也不变；
+   *   更关键的是 `rel_path` 在**与播放无关**的场景也会变（外部变更 → `onExternal` 每 ~1.4s 的
+   *   `reloadDetail()` 会给 detail 换一个新对象）—— 用 `rel_path` 驱动会让正在播的视频
+   *   每隔 1.4s 被换一次 `src`，从头播（实测 ct 2.01s → 0、paused=true）。
+   *   而 `asset.rename` / `moveAssets` 改的是**文件**（探针 [a2]：文件改名不被句柄挡住），
+   *   旧 fd 依然有效，本来就该继续播。
+   * ⇒ 只有 `library.renameFolder`（那条路径会 destroy 该子树的读流）才需要重载，
+   *   由 `SideBar.commitDraft` 在确认「预览素材就在被改名子树内」时显式 bump。
+   */
+  const mediaRev = ref<Record<number, number>>({})
+  function bumpMedia(id: number): void {
+    mediaRev.value = { ...mediaRev.value, [id]: (mediaRev.value[id] ?? 0) + 1 }
+  }
+  /** 读某素材的媒体版本号（`usePreviewMedia` 的 watch 依赖它，必须是标量） */
+  function mediaRevOf(id: number | null | undefined): number {
+    return id == null ? 0 : (mediaRev.value[id] ?? 0)
+  }
+
   // —— AI 来源标识的中文名（主进程下发，渲染层不自己抄一份）——
   const aiLabels = ref<Record<string, string>>({})
   async function loadAiLabels(): Promise<void> {
@@ -212,6 +234,8 @@ export const useAssetStore = defineStore('assets', () => {
     detail.value = null
     previewId.value = null
     previewDirty.value = false
+    // 切库清空：媒体版本号是按素材 id 记的，而各库 id 从 1 起（MEMORY A9 的同一条教训）
+    mediaRev.value = {}
   }
 
   /**
@@ -584,6 +608,7 @@ export const useAssetStore = defineStore('assets', () => {
     selectedIds, selectedCount, selectedAllFav, selectedRating, selectedRatingMixed, isSelected,
     importing, importNotice, notify,
     thumbV, bumpThumbs, thumbUrl,
+    mediaRev, bumpMedia, mediaRevOf,
     aiLabels, loadAiLabels, aiSourceLabel, reloadDetail,
     cardFields, toggleCardField, viewZoom,
     detailCollapsed, toggleDetail,
