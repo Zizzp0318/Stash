@@ -44,7 +44,6 @@ const LIB_ERROR_TEXT: Record<string, string> = {
   ERR_LIBRARY_EXISTS: '该目录已存在同名库',
   ERR_LIBRARY_TOO_NEW: '此库由更新版本的 Stash 创建，请升级软件后再打开',
   ERR_NOT_A_LIBRARY: '该目录不是一个 Stash 库（缺少 .stash 索引）',
-  ERR_NOT_REGISTERED: '该库不在最近列表中，无法直接删除',
   ERR_NO_LIBRARY: '未打开任何库',
   ERR_INVALID_NAME: '名称含非法字符（\\ / : * ? " < > |）或为系统保留名'
 }

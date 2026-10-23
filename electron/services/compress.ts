@@ -24,6 +24,7 @@ import { uniqueName } from './naming'
 import { ensureBatch } from './thumbs'
 import { suppressRel } from './watcher'
 import { scanAssetIfNeeded } from './genmeta'
+import { isThumbHash } from './paths'
 
 export type CompressFormat = 'jpeg' | 'webp'
 
@@ -274,7 +275,7 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
       pipe = pipe.resize({ width: maxEdge, height: maxEdge, fit: 'inside', withoutEnlargement: true })
     }
 
-    // ICC 必须留着：剥掉的话广色域图（手机照片、HEIC 转来的）颜色会变。
+    // ICC 必须留着：剥掉的话广色域图（手机照片等）颜色会变。
     // 其它元数据（EXIF / PNG 文本块）就随它去 —— 见文件末尾的说明。
     pipe = pipe.keepIccProfile()
 
@@ -393,13 +394,15 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
   }
 
   // ---- 旧缩略图缓存：hash 变了，`.thumbs/{旧hash}/` 成孤儿 ----
-  if (row.content_hash && row.content_hash !== newHash && /^[0-9a-f]{20}$/.test(row.content_hash)) {
-    const used = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?').get(row.content_hash) as {
+  // 先过 isThumbHash 再拼路径：hash 若是 `..` 这类脏值，join 会指到库根（见 paths.ts 的说明）
+  const oldHash = row.content_hash
+  if (isThumbHash(oldHash) && oldHash !== newHash) {
+    const used = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?').get(oldHash) as {
       c: number
     }
     if (!used.c) {
       try {
-        rmSync(join(libPath, '.thumbs', row.content_hash), { recursive: true, force: true })
+        rmSync(join(libPath, '.thumbs', oldHash), { recursive: true, force: true })
       } catch {
         /* 缓存清理失败不影响压缩结果 */
       }

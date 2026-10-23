@@ -73,17 +73,26 @@ function toggleMenu(): void {
   }
 }
 
-async function doDelete(path: string): Promise<void> {
+/**
+ * 从最近库列表移除。**只删软件里的记录，磁盘一个字节都不动** ——
+ * 所以这里没有「不可恢复」的二次确认压力，但仍要点一次确认框（防手滑把库从列表里点没了，
+ * 虽然重新「打开库…」指回目录就能加回来）。
+ */
+async function doForget(path: string): Promise<void> {
   busy.value = true
   err.value = ''
-  const e = await lib.deleteLibrary(path)
+  const name = nameOf(path)
+  const e = await lib.forgetLibrary(path)
   busy.value = false
   pendingDel.value = null
   if (e) {
     err.value = libErrorText(e)
     return
   }
-  // 删掉当前库后 lib.info 变 null，App 会自动切到欢迎页；否则留在菜单里
+  // 非破坏性操作也要给回执：用户点了「确认移除」后如果只是列表少了一行、没有任何提示，
+  // 很容易以为「是不是连库都删了」。这句明确告诉他磁盘没动。
+  assets.notify('info', `已从列表移除「${name}」，库目录未改动`)
+  // 移除当前库后 lib.info 变 null，App 会自动切到欢迎页；否则留在菜单里
   if (!lib.info) menuOpen.value = false
 }
 
@@ -177,7 +186,7 @@ async function createNew(): Promise<void> {
           </div>
         </template>
 
-        <!-- 管理库视图：删除库（彻底删除，不进回收站） -->
+        <!-- 管理库视图：从列表移除库（不碰磁盘） -->
         <template v-else>
           <div class="lib-menu-label">管理库</div>
           <div v-for="r in lib.recent" :key="r.path" class="lib-manage-item">
@@ -185,16 +194,16 @@ async function createNew(): Promise<void> {
               <span class="lm-name">{{ r.name }}<span v-if="r.path === lib.info?.path" class="lm-cur">（当前）</span></span>
               <span class="lm-path">{{ r.path }}</span>
             </div>
-            <button class="lm-del" :disabled="busy" @click="pendingDel = r.path">删除</button>
+            <button class="lm-del" :disabled="busy" @click="pendingDel = r.path">移除</button>
           </div>
           <div v-if="!lib.recent.length" class="lib-menu-empty">暂无库</div>
           <div v-if="pendingDel" class="lib-confirm" @click.stop>
             <div class="lc-text">
-              彻底删除「{{ nameOf(pendingDel) }}」？库目录连同全部素材将从磁盘<b>永久移除，不进回收站，无法恢复</b>。
+              从列表移除「{{ nameOf(pendingDel) }}」？只会删掉软件里的这条记录，<b>库目录和里面的素材不会被删除</b>，以后用「打开库…」指回该目录即可重新加回来。
             </div>
             <div class="lc-actions">
               <button class="w-btn small" :disabled="busy" @click="pendingDel = null">取消</button>
-              <button class="w-btn small danger" :disabled="busy" @click="doDelete(pendingDel)">确认删除</button>
+              <button class="w-btn small" :disabled="busy" @click="doForget(pendingDel)">确认移除</button>
             </div>
           </div>
           <div class="lib-menu-sep"></div>

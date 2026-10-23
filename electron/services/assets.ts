@@ -6,7 +6,7 @@ import { importFiles } from './importer'
 import { uniqueName } from './naming'
 import { derivedCopyCols } from './derived'
 import { moveFileSync, renameWithShortRetrySync } from './fsutil'
-import { relFromLib, subtreeOfPath, toRel, validateName } from './paths'
+import { isThumbHash, relFromLib, subtreeOfPath, toRel, validateName } from './paths'
 import { escapeLike, type DB } from './db'
 
 export interface AssetQuery {
@@ -508,7 +508,7 @@ export function deleteAssets(ids: number[]): {
 
     // 缩略图缓存：hash 校验通过（同时防目录穿越）且无其他素材引用时才删
     const hash = row.content_hash
-    if (hash && /^[0-9a-f]{20}$/.test(hash)) {
+    if (isThumbHash(hash)) {
       const used = (stillUsed.get(hash) as { c: number }).c
       if (!used) {
         try {

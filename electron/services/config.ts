@@ -31,7 +31,7 @@ export interface Settings {
   preview: {
     /** 播放条 / 图片提示的自动隐藏延迟（ms）。0 = 不自动隐藏 */
     idleHideMs: number
-    /** 图片派生（HEIC/TIFF/超大图）的长边上限 */
+    /** 图片派生（TIFF/超大图）的长边上限 */
     maxImagePx: number
     /** 文本预览与保存的字节上限 */
     textMaxBytes: number
@@ -315,11 +315,33 @@ export function addRecentLibrary(p: string): void {
   save()
 }
 
-export function removeRecentLibrary(p: string): void {
+/**
+ * 把一条记录从「最近库列表」里移除，返回**是否真的移除了**。
+ *
+ * 为什么要有返回值：它现在是「移除库」这个动作的**全部**效果（磁盘一个字节都不动），
+ * 调用方必须能区分「移掉了一条」与「本来就不在列表里（或路径写法对不上）」——
+ * 否则 UI 会对一个根本没发生的变化说「已移除」。
+ *
+ * ⚠️ **`save()` 失败必须回滚内存**（磁盘满 / 文件被占 / 权限不足）：
+ * `load()` 返回的是模块级 `cache` 本体，先改内存再落盘一旦落盘失败，
+ * 进程内的列表已经看不到它、磁盘上却还在 —— 用户看到「已移除」，重启后库又回来了。
+ * 所以改动失败就把 `recentLibraries` 恢复成改动前的快照再把异常抛出去，
+ * 让调用方拿到一个「和磁盘一致」的状态去报错。
+ */
+export function removeRecentLibrary(p: string): boolean {
   const c = load()
   const k = normKey(p)
+  const before = c.recentLibraries.slice()
   c.recentLibraries = c.recentLibraries.filter((x) => normKey(x) !== k)
-  save()
+  // 本来就不在列表里：什么都没变，不写盘（也不该被当成失败）
+  if (c.recentLibraries.length === before.length) return false
+  try {
+    save()
+  } catch (e) {
+    c.recentLibraries = before // 回滚：别让「内存里没了、磁盘上还在」
+    throw e
+  }
+  return true
 }
 
 export function listRecentLibraries(): string[] {

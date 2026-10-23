@@ -3,7 +3,7 @@
 // 缓存全在 `<库>/.thumbs/` 里，但**三类东西混住**，清理时必须分开：
 //   · 缩略图      `{hash}/grid.webp` `{hash}/detail.webp` —— 删了能重新生成（秒级）
 //   · 派生预览    `{hash}/preview.mp4`（老视频 remux/转码）、`{hash}/preview.mp3`（音频转码）、
-//                 `{hash}/preview-{尺寸}.webp`（HEIC/TIFF 的高清大图，**图片派生的文件名带尺寸 tag**，
+//                 `{hash}/preview-{尺寸}.webp`（TIFF 的高清大图，**图片派生的文件名带尺寸 tag**，
 //                 见 `preview.ts` 的 `derivedPathFor()` / `derivedAbs()`）——
 //                 删了要**重新转码**（慢，几十秒都正常），所以绝不能被「清理缓存」一把带走
 //   · 其它        `placeholder-*.webp`（占位图，删了会重新生成）、`*.tmp`（写一半的临时文件）
@@ -42,7 +42,7 @@ interface Entry {
  * ⚠️ 必须精确匹配，**不能只判 `startsWith('preview')` 或 `startsWith('preview.')`**：
  *   · 图片派生带尺寸 tag → `preview-2560.webp`（`preview.ts` 的 `derivedPathFor()` 把
  *     `maxImagePx()` 算进文件名，改设置就换个文件、不会命中旧尺寸）；只认 `preview.` 会**整类漏掉**
- *     —— 那恰恰是最占空间的 HEIC/TIFF 高清大图，本项目 I2 就栽在这里。
+ *     —— 那恰恰是最占空间的 TIFF 高清大图，本项目 I2 就栽在这里。
  *   · 派生**中途的临时文件**也以 `preview` 开头 → 图片 `preview-{尺寸}.webp.tmp`、
  *     视频/音频 `preview.{时间戳}.tmp.{mp4,mp3}`（见 `preview.ts` 的
  *     `deriveImage/deriveVideo/deriveAudio`）。它们**不是**可用的派生预览，归「其它」，

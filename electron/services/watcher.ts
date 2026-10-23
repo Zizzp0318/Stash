@@ -6,7 +6,7 @@ import { BrowserWindow } from 'electron'
 import { contentHash, EXT_TYPE } from './importer'
 import { ensureFolderRows, mkdirRel } from './library'
 import { uniqueName } from './naming'
-import { relFromLib } from './paths'
+import { isThumbHash, relFromLib } from './paths'
 import { escapeLike, type DB } from './db'
 
 let watcher: FSWatcher | null = null
@@ -712,7 +712,7 @@ export function watchLibrary(libPath: string, db: DB): void {
       // ⚠️ 必须在 UPDATE **之后**数引用：否则这一行自己还挂在旧 hash 上，永远显示「有人用」。
       // ⚠️ 也必须数引用：两份内容相同的素材共享同一个 hash 目录，删了会把另一张卡打成灰。
       const oldHash = row.content_hash
-      if (oldHash && oldHash !== hash && /^[0-9a-f]{20}$/.test(oldHash)) {
+      if (isThumbHash(oldHash) && oldHash !== hash) {
         const still = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?').get(oldHash) as {
           c: number
         }

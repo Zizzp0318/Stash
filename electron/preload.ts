@@ -16,7 +16,8 @@ contextBridge.exposeInMainWorld('stash', {
   },
   library: {
     create: (args: { name: string; parentDir: string }) => ipcRenderer.invoke('library:create', args),
-    delete: (target: string) => ipcRenderer.invoke('library:delete', target),
+    /** 从软件的最近库列表移除（只删记录，库目录与素材不动） */
+    forget: (target: string) => ipcRenderer.invoke('library:forget', target),
     open: (target: string) => ipcRenderer.invoke('library:open', target),
     list: () => ipcRenderer.invoke('library:list'),
     close: () => ipcRenderer.invoke('library:close'),

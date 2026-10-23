@@ -256,10 +256,10 @@ async function revealLibrary(): Promise<void> {
 }
 
 /**
- * 删除当前库。**不可恢复**，所以要点两次，且删除的是「当前这个库的目录」，
- * 不接受任意路径 —— 主进程那边还会再确认它确实在最近列表里（见 deleteLibrary）。
+ * 把当前库从「最近库列表」里移除。**只删软件里的记录，库目录与素材一个字节都不动**，
+ * 所以这里只是防手滑的二次确认，不是危险操作（原文案「不可恢复」已随之作废）。
  */
-async function doDeleteLibrary(): Promise<void> {
+async function doForgetLibrary(): Promise<void> {
   if (!deleteLibArmed.value) {
     deleteLibArmed.value = true
     return
@@ -267,16 +267,17 @@ async function doDeleteLibrary(): Promise<void> {
   deleteLibArmed.value = false
   const target = lib.info?.path
   if (!target) return
+  const name = lib.info?.name ?? target
   libBusy.value = true
-  const err = await lib.deleteLibrary(target)
+  const err = await lib.forgetLibrary(target)
   libBusy.value = false
   if (err) {
-    assets.notify('error', `删除失败：${err}`)
+    assets.notify('error', `移除失败：${err}`)
     return
   }
-  // 库已经没了，面板也别留着 —— 对着欢迎页开一个「库与存储」很怪
+  // 库已经关掉了，面板也别留着 —— 对着欢迎页开一个「库与存储」很怪
   settings.closePanel()
-  assets.notify('info', '库已删除')
+  assets.notify('info', `已从列表移除「${name}」，库目录未改动`)
 }
 
 async function openCacheDir(): Promise<void> {
@@ -600,7 +601,7 @@ async function copyDiagnostics(): Promise<void> {
             <div class="sp-row">
               <div class="sp-label">
                 <div class="sp-name">高清预览上限</div>
-                <div class="sp-tip">HEIC / TIFF / 超大图转成预览图时的长边上限，越大越清晰也越占空间</div>
+                <div class="sp-tip">TIFF / 超大图转成预览图时的长边上限，越大越清晰也越占空间</div>
               </div>
               <div class="sp-seg" data-sp-maxpx>
                 <button
@@ -758,7 +759,7 @@ async function copyDiagnostics(): Promise<void> {
             <div class="sp-row">
               <div class="sp-label">
                 <div class="sp-name">清理派生预览</div>
-                <div class="sp-tip">HEIC / TIFF 大图与老视频的转码结果 —— 删掉后下次打开要重新转码</div>
+                <div class="sp-tip">TIFF 大图与老视频的转码结果 —— 删掉后下次打开要重新转码</div>
               </div>
               <button
                 class="sp-btn danger"
@@ -1003,18 +1004,18 @@ async function copyDiagnostics(): Promise<void> {
 
             <div class="sp-danger">
               <div class="sp-label">
-                <div class="sp-name">删除此库</div>
-                <div class="sp-tip">库目录连同里面的素材一起从磁盘物理删除，不进回收站、无法恢复</div>
+                <div class="sp-name">从此列表移除</div>
+                <div class="sp-tip">只删掉软件里的这条记录，库目录和里面的素材都不会被动到</div>
               </div>
               <button
-                class="sp-btn danger"
+                class="sp-btn"
                 :class="{ armed: deleteLibArmed }"
                 type="button"
                 data-sp-delete-lib
                 :disabled="libBusy"
-                @click="doDeleteLibrary"
+                @click="doForgetLibrary"
               >
-                {{ deleteLibArmed ? '再点一次确认' : '删除此库' }}
+                {{ deleteLibArmed ? '再点一次确认' : '移除此库' }}
               </button>
             </div>
           </template>

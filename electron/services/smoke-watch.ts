@@ -1261,46 +1261,70 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       check('Q 段没有引入新的渲染层运行期错误', jsErrors.length === 0, jsErrors.slice(0, 3).join(' | '))
     }
 
-    // ==================== I3 删库前必须停掉 chokidar 监听器（审计 §1.3） ====================
-    // 缺陷：`library:delete` 只调 deleteLibrary → 走 closeCurrent 后直接 rmSync，**从不** unwatchLibrary
-    // （对比 `library:close` 是先 unwatch 再 close）。chokidar 因此一直持有已删目录的句柄 ——
-    // 回调因 current 为 null 抛错、被内部 try/catch 吞掉，所以**不崩、只是泄漏**，要等下次 library:open
-    // 才被顺带回收；Windows 上还可能让紧随的 rmSync 撞 EBUSY。修法在 main.ts 的 deleteLibrarySafely 收口
-    // （`--smoke-del` argv 分支 与 `library:delete` IPC 两个调用点都走它）。
-    // 本段走**生产路径**：经 IPC open 挂上 watcher、再经 IPC delete 触发那个收口入口。
+    // ==================== I3 移除库前必须停掉 chokidar 监听器 ====================
+    // ⚠️ 语义已反转：`library:forget` **只删 config.json 里的记录，磁盘一个字节都不动**（不再物理删库）。
+    // 但「移除的是当前库」时仍必须先 unwatch 再 closeCurrent（顺序同 `library:close`）：
+    // 否则 chokidar 会一直挂着这个目录，回调因 current 为 null 抛错又被内部 try/catch 吞掉 ——
+    // **不崩、只是句柄泄漏**，要等下次 `library:open` 才被顺带回收。
+    // 本段走**生产路径**：经 IPC open 挂上 watcher、再经 IPC forget 触发那个 handler。
+    // 于是本段断言两件事：①监听器确实停了；②目录 / `.stash` 一个都没少。
     {
-      // 前置正对照（铁律 G9）：先证明「开库确实挂上了监听器」，否则后面的否定断言（删后 isWatching=false）
+      // 前置正对照（铁律 G9）：先证明「开库确实挂上了监听器」，否则后面的否定断言（移除后 isWatching=false）
       // 会因为 isWatching 恒为 false 而假绿。
       const libDel = createLibrary({ name: 'watch-lib-del', parentDir: dir })
       await js(`window.stash.library.open(${JSON.stringify(libDel.path)})`)
       const before = isWatching()
       check(
-        'I3 正对照：经 IPC 开库后 chokidar 确实在监听（否则「删后监听器已停」是空转断言）',
+        'I3 正对照：经 IPC 开库后 chokidar 确实在监听（否则「移除后监听器已停」是空转断言）',
         before === true,
         `isWatching=${before}`
       )
+      // 第二个正对照：它必须**真的在列表里**，否则「记录被移除」同样是空转断言
+      const listedBefore = await js<{ ok: boolean; data?: Array<{ path: string }> }>('window.stash.library.list()')
+      check(
+        'I3 前置：目标库确实在最近库列表里（否则「记录被移除」是空转断言，铁律 G9）',
+        !!listedBefore?.data?.some((x) => x.path.toLowerCase() === libDel.path.toLowerCase()),
+        JSON.stringify(listedBefore?.data ?? null)
+      )
 
-      // 通过 IPC 删除**当前库** → 必须走 main.ts 收口的 deleteLibrarySafely（先 unwatch 再删目录）。
-      await js(`window.stash.library.delete(${JSON.stringify(libDel.path)})`)
+      // 通过 IPC 移除**当前库**
+      const forgetRes = await js<{ ok: boolean; data?: { removed: boolean } }>(
+        `window.stash.library.forget(${JSON.stringify(libDel.path)})`
+      )
       const after = isWatching()
       check(
-        'I3 删除当前库后监听器已停（isWatching=false，不再泄漏已删目录的 chokidar 句柄）',
+        'I3 移除当前库后监听器已停（isWatching=false，不再泄漏已关库的 chokidar 句柄）',
         after === false,
         `isWatching=${after}`
       )
       check(
-        'I3 库目录确实已从磁盘删除（收口入口没妨碍删除本身）',
-        !existsSync(libDel.path),
-        `exists=${existsSync(libDel.path)}`
+        'I3 forget 回执 removed=true（确实移除了一条记录，不是「什么都没变也说成功」）',
+        forgetRes?.data?.removed === true,
+        JSON.stringify(forgetRes ?? null)
+      )
+      const listedAfter = await js<{ ok: boolean; data?: Array<{ path: string }> }>('window.stash.library.list()')
+      check(
+        'I3 记录已从最近库列表消失',
+        !!listedAfter && !(listedAfter.data ?? []).some((x) => x.path.toLowerCase() === libDel.path.toLowerCase()),
+        JSON.stringify(listedAfter?.data ?? null)
+      )
+      check(
+        'I3 库目录与 .stash 全都还在（**没有**被物理删除 —— 本次语义反转的核心承诺）',
+        existsSync(libDel.path) && existsSync(join(libDel.path, '.stash')),
+        `exists=${existsSync(libDel.path)} stash=${existsSync(join(libDel.path, '.stash'))}`
+      )
+      check(
+        'I3 当前库已被关闭（getInfo 的 data 为 null → 界面回到欢迎页）',
+        (await js<{ ok: boolean; data?: unknown }>('window.stash.library.getInfo()'))?.data == null
       )
     }
 
-    // ==================== I3b 对抗用例：删「别的库」绝不能停掉当前库的监听器 ====================
-    // 工程师的 isCurrentLib 守卫本身正确，但他的 I3 断言只覆盖「删当前库」，「删非当前库」没有断言。
-    // 这条防的回归正是「不管删谁都 unwatch」：界面上表现为「删掉一个不相干的库后，当前库不再同步外部变更」。
+    // ==================== I3b 对抗用例：移除「别的库」绝不能停掉当前库的监听器 ====================
+    // 工程师的 isCurrentLib 守卫本身正确，但他的 I3 断言只覆盖「移除当前库」，「移除非当前库」没有断言。
+    // 这条防的回归正是「不管移谁都 unwatch」：界面上表现为「移掉一个不相干的库后，当前库不再同步外部变更」。
     {
       const libA = createLibrary({ name: 'watch-adv-A', parentDir: dir })
-      // createLibrary 会把 current 设为最后创建的那个；再建一个 B，为「删非当前库」造出对照前提
+      // createLibrary 会把 current 设为最后创建的那个；再建一个 B，为「移除非当前库」造出对照前提
       const libB = createLibrary({ name: 'watch-adv-B', parentDir: dir })
       // 走生产路径把 current 切回 A 并挂上监听器（createLibrary 本身不挂 watcher）
       await js(`window.stash.library.open(${JSON.stringify(libA.path)})`)
@@ -1311,21 +1335,28 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         `isWatching=${wA}`
       )
 
-      // 通过 IPC 删除「另一个库 B」：isCurrentLib=false → 绝不能 unwatch
-      await js(`window.stash.library.delete(${JSON.stringify(libB.path)})`)
+      // 通过 IPC 移除「另一个库 B」：isCurrentLib=false → 绝不能 unwatch
+      const forgetB = await js<{ ok: boolean; data?: { removed: boolean } }>(
+        `window.stash.library.forget(${JSON.stringify(libB.path)})`
+      )
       const wAfter = isWatching()
       check(
-        'I3b(对抗) 删除非当前库 B 后 A 的监听器必须仍在（防「删谁都停监听」回归）',
+        'I3b(对抗) 移除非当前库 B 后 A 的监听器必须仍在（防「移谁都停监听」回归）',
         wAfter === true,
         `isWatching=${wAfter}`
       )
       check(
-        'I3b 库 B 目录确实已删（收口入口不妨碍删非当前库）',
-        !existsSync(libB.path),
-        `existsB=${existsSync(libB.path)}`
+        'I3b B 的记录确实被移除（守卫没妨碍移除本身）',
+        forgetB?.data?.removed === true,
+        JSON.stringify(forgetB ?? null)
       )
       check(
-        'I3b 当前库仍是 A（删 B 不能误清当前库）',
+        'I3b 库 B 目录与 .stash 都还在（移除非当前库同样不碰磁盘）',
+        existsSync(libB.path) && existsSync(join(libB.path, '.stash')),
+        `existsB=${existsSync(libB.path)} stashB=${existsSync(join(libB.path, '.stash'))}`
+      )
+      check(
+        'I3b 当前库仍是 A（移除 B 不能误清当前库）',
         curPath() === libA.path,
         `current=${curPath()} A=${libA.path}`
       )
@@ -1337,7 +1368,7 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         20000
       )
       check(
-        'I3b(对抗) 删掉 B 之后 A 仍能同步外部新增（写文件进 A → 入库，证明监听没被误停）',
+        'I3b(对抗) 移除 B 之后 A 仍能同步外部新增（写文件进 A → 入库，证明监听没被误停）',
         gotAdv
       )
       const advRow = rowByRel(`${UNCAT}/adv.png`)
@@ -1346,44 +1377,6 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         !!advRow && HEX20.test(advRow.content_hash ?? ''),
         JSON.stringify(advRow)
       )
-    }
-
-    // ==================== I3c 自愈分支：目标是当前库、但 deleteLibrary 抛错 ====================
-    // 本机没有「deleteLibrary 通过两条校验后必抛」的真实路径，故用注入构造：临时在 library.ts
-    // 的 deleteLibrary 通过校验后加 `if (process.env.STASH_INJECT_DELETE_THROW) throw`（跑完即还原，见报告）。
-    // 期望：deleteLibrarySafely 的 catch 把「已被 unwatch 的当前库」重新挂回监听器，且 current 不被清。
-    // 仅在注入环境下执行（正常跑本套时该段 0 断言，计数不变）。
-    if (process.env.STASH_INJECT_DELETE_THROW === '1') {
-      const libC = createLibrary({ name: 'watch-adv-C', parentDir: dir })
-      await js(`window.stash.library.open(${JSON.stringify(libC.path)})`)
-      const wBefore = isWatching()
-      check('I3c(前置) 打开库 C 后监听器在', wBefore === true, `isWatching=${wBefore}`)
-
-      // 删当前库 → deleteLibrary 抛错 → 收口入口自愈重新挂监听
-      await js(`window.stash.library.delete(${JSON.stringify(libC.path)})`)
-      const wHeal = isWatching()
-      check(
-        'I3c(自愈) 删当前库抛错后监听器被重新挂回（isWatching=true，绝不留在「当前库裸奔」中间态）',
-        wHeal === true,
-        `isWatching=${wHeal}`
-      )
-      check(
-        'I3c(自愈) current 未被清掉（仍指向 C，未进入「无当前库」中间态）',
-        curPath() === libC.path,
-        `current=${curPath()} C=${libC.path}`
-      )
-      check(
-        'I3c 库 C 目录未被误删（抛错发生在 rmSync 之前）',
-        existsSync(join(libC.path, '.stash')),
-        `stashExists=${existsSync(join(libC.path, '.stash'))}`
-      )
-      // 自愈后的监听器必须真的在工作
-      writeFileSync(join(libC.path, 'heal.png'), await makePng(180, 180, 90))
-      const gotHeal = await waitDb(
-        () => curPath() === libC.path && count("SELECT count(*) AS c FROM assets WHERE name='heal.png'") === 1,
-        20000
-      )
-      check('I3c(自愈) 自愈后的监听器确实在工作（写文件进 C → 入库）', gotHeal)
     }
 
     // ==================== I4-D1 独立计数：result.added == 另一条只读连接看到的新增行数 ====================

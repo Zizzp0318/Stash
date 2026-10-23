@@ -911,18 +911,18 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       const missingAfter = (await js<string>("document.querySelector('[data-sp-lib-missing]')?.textContent.trim() ?? ''")) ?? ''
       check('S10 清理后失效记录归零', /^0/.test(missingAfter), missingAfter)
 
-      // —— 删除库：只验「要点两次」，不真删（真删了后面几段就没库可用了）——
+      // —— 移除库（只删记录，不碰磁盘）：只验「要点两次」，不真点第二次（点了当前库就被关掉了，后面几段就没库可用）——
       await clickEl('[data-sp-delete-lib]')
       const delArmed = (await js<string>("document.querySelector('[data-sp-delete-lib]')?.textContent.trim() ?? ''")) ?? ''
-      check('S10 删除库要先二次确认', delArmed === '再点一次确认', delArmed)
-      check('S10 第一次点击不会真删库', existsSync(join(lib.path, '.stash')))
+      check('S10 移除库要先二次确认', delArmed === '再点一次确认', delArmed)
+      check('S10 第一次点击不会真移除库', existsSync(join(lib.path, '.stash')))
       // 换个分组再回来：二次确认必须被收掉（不然回到这一组会让人以为已经点过一次了）
       await clickEl('[data-sp-group="shortcuts"]')
       await waitFor("!!document.querySelector('[data-sp-shortcuts]')", 6000)
       await clickEl('[data-sp-group="library"]')
       await waitFor("!!document.querySelector('[data-sp-delete-lib]')", 6000)
       const delReset = (await js<string>("document.querySelector('[data-sp-delete-lib]')?.textContent.trim() ?? ''")) ?? ''
-      check('S10 换分组会收掉「删除」的二次确认', delReset === '删除此库', delReset)
+      check('S10 换分组会收掉「移除」的二次确认', delReset === '移除此库', delReset)
       await capture('shot-settings-library.png')
     }
 

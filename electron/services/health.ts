@@ -9,6 +9,7 @@
 import { readdirSync, rmSync, statSync } from 'fs'
 import { join } from 'path'
 import { requireCurrent, getLibrary, pruneUnlinkedTags } from './library'
+import { isThumbHash } from './paths'
 
 export interface LibraryStats {
   name: string
@@ -196,7 +197,7 @@ export function cleanMissing(): CleanMissingResult {
     }
     // 同 hash 仍被别的素材引用时，缓存要留着
     const hash = row.content_hash
-    if (hash && /^[0-9a-f]{20}$/.test(hash) && !(stillUsed.get(hash) as { c: number }).c) {
+    if (isThumbHash(hash) && !(stillUsed.get(hash) as { c: number }).c) {
       const dir = join(path, '.thumbs', hash)
       try {
         freed += dirSize(dir)

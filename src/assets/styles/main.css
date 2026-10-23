@@ -938,27 +938,39 @@ mark {
 .lib-manage-item:hover { background: var(--bg-hover); }
 .lib-manage-item .lm-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding-left: 5px; }
 .lm-cur { color: var(--text-3); font-size: 10px; }
+/* 管理库行内的「移除」按钮。
+   ⚠️ 语义已不是破坏性操作（只删软件里的一条记录，磁盘与素材不动），
+   所以刻意**不用红色**（旧值 #6B4640 / #D98F7F / hover #52322C 会喊「危险」）。
+   取值一律沿用本菜单已有的中性色 token（与 .lib-menu-item.action 同源），不引入新色值。 */
 .lm-del {
   flex-shrink: 0;
   height: 24px; padding: 0 10px;
   border-radius: 6px;
-  border: 1px solid #6B4640;
+  border: 1px solid var(--border-soft);
   background: transparent;
-  color: #D98F7F;
+  color: var(--text-2);
   font-size: 11px; font-family: var(--font);
   cursor: pointer;
 }
-.lm-del:hover:not(:disabled) { background: #52322C; }
+.lm-del:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-1); }
 .lm-del:disabled { opacity: 0.5; cursor: default; }
+/* 库管理菜单里的「移除确认」浮层。
+   ⚠️ 语义已不是破坏性操作（正文明确写着「不会删除你的文件」），所以**刻意不用暖红**
+   （旧值 background #3A2724 / border #6B4640 / 文字 #E8C4B4 / 加粗 #F2A890 是「危险动作」的视觉语言，
+   与正文直接打架 —— 用户第一反应就成了「又要删我东西了」）。
+   改成中性凹面板：底色比菜单（--bg-raised）更沉一档、边框用 --border，文字 --text-2。
+   ⚠️ 只作用于本菜单的 .lib-confirm / .lc-*：**没有**改任何全局 --danger 变量，
+   也没有碰 GalleryGrid 删素材、CompressDialog 这些真·危险操作的红色样式（它们必须保持红）。 */
 .lib-confirm {
   margin: 6px 2px 2px;
   padding: 9px 10px;
   border-radius: 8px;
-  background: #3A2724;
-  border: 1px solid #6B4640;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
 }
-.lc-text { font-size: 11px; color: #E8C4B4; line-height: 1.5; }
-.lc-text b { color: #F2A890; }
+.lc-text { font-size: 11px; color: var(--text-2); line-height: 1.5; }
+/* 加粗只用于「不会删除你的文件」这句关键承诺：提亮到正文色即可，不用彩色强调 */
+.lc-text b { color: var(--text-1); }
 .lc-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 .w-btn.danger { background: #8A4638; border-color: #8A4638; color: #fff; }
 .w-btn.danger:hover:not(:disabled) { background: #9A5648; }

@@ -89,7 +89,10 @@ onMounted(async () => {
       // 重名被自动改名也要说出来 —— 不说的话用户只知道「新增 1 个」，
       // 却在瀑布里找不到自己那个文件名，会以为导入错了。
       const renamedNote = r.renamed ? `，${r.renamed} 个因重名已自动改名` : ''
-      assets.notify('info', `导入完成：新增 ${r.added} 个${renamedNote}${r.skipped ? `，跳过重复 ${r.skipped} 个` : ''}`)
+      // ⚠️ `skipped` 是**混装**的：内容重复与「扩展名不在 EXT_TYPE（如 HEIC）」共用同一个计数器
+      // （见 `importer.ts` 的 `if (!type) { skipped++; continue }`）。所以这里绝不能只说「跳过重复」——
+      // 拖进一张 HEIC 会被说成"库里已经有了"，纯属误导。
+      assets.notify('info', `导入完成：新增 ${r.added} 个${renamedNote}${r.skipped ? `，跳过 ${r.skipped} 个（重复或格式不支持）` : ''}`)
     }
   })
 })

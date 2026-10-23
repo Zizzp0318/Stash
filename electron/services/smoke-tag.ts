@@ -25,7 +25,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import { unwatchLibrary } from './watcher'
-import { closeCurrent, createLibrary, deleteLibrary, requireCurrent } from './library'
+import { closeCurrent, createLibrary, forgetLibrary, requireCurrent } from './library'
 import { createTag, deleteTag, setTags } from './assets'
 import { importFiles } from './importer'
 
@@ -908,12 +908,13 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
   } finally {
     R.jsErrors = jsErrors
     if (jsErrors.length) R.rendererLogs = rendererLogs.filter((l) => /error|Error|warn|Warn/.test(l)).slice(-8)
-    // ⚠️ 删库前先停 chokidar：它还持有库目录句柄，Windows 上会让 rmSync 抛 ENOTEMPTY/EPERM，
-    // 于是 `deleteLibrary` 失败 → 库目录留在临时目录里 → 外层的 rmSync 必然也失败。
-    // 这是 `main.ts` 的 `deleteLibrarySafely` 早就写死的纪律，`smoke-folder.ts` 也已对齐，这里补齐。
+    // ⚠️ 删目录前先停 chokidar：它还持有库目录句柄，Windows 上会让 rmSync 抛 ENOTEMPTY/EPERM，
+    // 于是外层的 rmSync(dir) 必然也失败、临时库永远留在临时目录里。
+    // 这是 `library:close` 早就写死的纪律，`smoke-folder.ts` 也已对齐，这里补齐。
+    // `forgetLibrary` 只清 `config.json` 的最近库记录（不再物理删库），删目录由外层 rmSync(dir) 负责。
     unwatchLibrary()
     try {
-      if (libPath && existsSync(join(libPath, '.stash'))) deleteLibrary(libPath)
+      if (libPath) forgetLibrary(libPath)
     } catch (e) {
       R.cleanupError = String(e)
     }

@@ -24,7 +24,10 @@ const KNOWN_CHUNKS = {
   Description: 'Midjourney（就是提示词原文）',
   AIGC: '国内 AIGC 隐式标识'
 }
-const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif', '.tif', '.tiff', '.heic'])
+// 目录扫描时只收这些扩展名。**故意没有 .heic / .heif**：本脚本靠 `sharp(abs).metadata()`
+// 读元数据，而预编译的 sharp 不带 HEVC 解码器（`sharp.format.heif.input.fileSuffix` 只有 `.avif`），
+// 扫到 HEIC 必然解不出来 —— 那会打印「无法解码」，看起来像用户的文件坏了，比不扫更误导。
+const IMG_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif', '.tif', '.tiff'])
 
 function collect(paths) {
   const out = []

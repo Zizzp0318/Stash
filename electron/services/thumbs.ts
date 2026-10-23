@@ -80,7 +80,7 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
     if (asset.type === 'image') {
       await openSource(abs)
         .rotate() // 按 EXIF 方向摆正
-        .toColourspace('srgb') // HDR 广色域（HEIC 等）转 sRGB，避免缩略图偏灰
+        .toColourspace('srgb') // HDR 广色域照片转 sRGB，避免缩略图偏灰
         // 注意：`animated` 是 sharp 的**输入选项**（`sharp(input, { animated })`），
         // 不是 resize 选项 —— 写在这里既无效果又过不了类型检查，所以不写。
         // 动图在本项目走的是「取首帧」策略（见 preview.ts 的 IMG_NATIVE：gif 直出原文件）。
@@ -300,7 +300,7 @@ async function writeImageMeta(asset: { id: number; rel_path: string }): Promise<
   try {
     const { width, height } = orientedDims(await openSource(abs).metadata())
     db.prepare('UPDATE assets SET width=?, height=? WHERE id=?').run(width, height, asset.id)
-  } catch { /* HEIC 之外解析失败忽略 */ }
+  } catch { /* 解析失败忽略 */ }
 }
 
 /**

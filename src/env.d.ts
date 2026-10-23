@@ -16,7 +16,8 @@ export interface Unsub {
 
 export interface StashLibraryApi {
   create: (args: { name: string; parentDir: string }) => Promise<{ ok: boolean; data?: { path: string; name: string }; error?: string }>
-  delete: (target: string) => Promise<{ ok: boolean; data?: null; error?: string }>
+  /** 只从最近库列表移除记录，**不删磁盘**。当前库会被关闭（回到欢迎页） */
+  forget: (target: string) => Promise<{ ok: boolean; data?: { removed: boolean }; error?: string }>
   open: (target: string) => Promise<{ ok: boolean; data?: { path: string; name: string }; error?: string }>
   list: () => Promise<{ ok: boolean; data?: Array<{ path: string; name: string }>; error?: string }>
   close: () => Promise<{ ok: boolean; data?: null; error?: string }>

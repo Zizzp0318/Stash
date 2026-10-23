@@ -5,10 +5,10 @@
 //   Plyr / Vidstack / media-chrome 都只是套在原生 <video> 外面的控制条，底层解不了照样白给。
 //   实测矩阵：mp4 / **HEVC(hvc1)** / **mkv** / mov / webm / mp3 / flac / wav / m4a / aac / ogg
 //   都能直接播（mkv 与 HEVC 能播这两条反常识，但确实是实测结果）；**只有 avi 这类老容器不行**。
-//   图片侧 Chromium 解不了 heic / heif / tiff。
+//   图片侧 Chromium 解不了 tiff。
 //
 // 所以这里做的是「**按需产出浏览器能播的版本并缓存**」，而不是引入播放器库：
-//   图片（heic/heif/tiff）→ sharp 出 2560px 大图（sharp 本来就在依赖里）
+//   图片（tiff 等）     → sharp 出 2560px 大图（sharp 本来就在依赖里）
 //   视频（avi/wmv/flv…）  → 先 `-c copy` remux 成 mp4（秒级无损）；mp4 装不下那个编码
 //                            （xvid/divx/mjpeg/indeo…）才退到转码
 //   音频（wma/ape/aiff…） → 转 mp3
@@ -33,6 +33,7 @@ import { getSettings } from './config'
 import { contentHash } from './importer'
 import { requireCurrent } from './library'
 import { ensureBatch } from './thumbs'
+import { isThumbHash } from './paths'
 import { MEDIA_SUPPRESS_MS, type MediaHandleGuard } from './handles'
 
 export type PreviewKind = 'image' | 'video' | 'audio' | 'text'
@@ -64,7 +65,25 @@ export function textMaxBytes(): number {
 
 /** 浏览器能直接解码的图片格式（其余交给 sharp 派生） */
 const IMG_NATIVE = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg', 'ico'])
-// ⚠️ **tif / tiff 不在里面**，heic / heif 也不在 —— 这几个才是图片派生路径要救的格式。
+
+/**
+ * **明确不支持**的图片格式：HEIC / HEIF。
+ *
+ * 它们既不在 `IMG_NATIVE` 里，也**救不回来** —— 这份预编译 sharp 的 libheif 不带 HEVC 编解码器，
+ * 决定性证据是 `sharp(...).heif({ compression: 'hevc' })` 直接抛 `heifsave: Unsupported compression`
+ * （辅助证据：`libvips-42.dll` 里查不到 `libde265` / `dav1d` 这两个 HEVC 解码器符号），派生必然失败。
+ * `EXT_TYPE` 已经不认这几个扩展名（新导入直接 skipped），但**存量库里可能还有**
+ * `type='image', ext='heic'` 的行，所以要在这里显式返回 unsupported 给出原因，
+ * 而不是让它走 derived 撞 sharp 报错、卡片一片空白还看不出为什么。
+ *
+ * ⚠️ **别拿扩展名列表当证据**：`sharp.format.heif.input.fileSuffix` 只有 `['.avif']`，
+ * 但 sharp 解码按**魔数嗅探**，不看扩展名 —— 把一份 AVIF 改名成 `.heic` 照样读得出来
+ * （`metadata().format` 仍是 `heif`）。所以「改名 .heic 也能解」不能证明支持 HEIC，
+ * 只能证明那份文件本来就不是 HEIC。
+ */
+const IMG_UNSUPPORTED = new Set(['heic', 'heif', 'hif'])
+
+// ⚠️ **tif / tiff 不在白名单里**（`IMG_UNSUPPORTED` 里也没有它）—— 它才是图片派生路径要救的格式。
 // 这里记一段踩过的坑，免得下次又「发现」一遍：曾有一轮冒烟里「<img> 加载 tiff 成功」，
 // 于是把 tiff 挪进了白名单。那是**测试假象**：tiff 当时被判为 derived，而
 // `stash://media/{id}` 在派生文件已生成后送出去的就是**派生出来的 webp** ——
@@ -234,6 +253,14 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
     if (IMG_NATIVE.has(ext)) {
       // 原图直出。尺寸交给 <img> 自己的 naturalWidth，这里不额外读盘
       return { ...base, kind: 'image', bytes: size }
+    }
+    // 存量 HEIC/HEIF：走 derived 只会撞 sharp 的「不带 HEVC 解码器」并失败，
+    // 界面表现为空白卡片且没有原因 —— 这里显式说清楚，别让它静默空白。
+    if (IMG_UNSUPPORTED.has(ext)) {
+      return {
+        ...base, kind: 'image', strategy: 'unsupported', mime: null,
+        reason: 'HEIC/HEIF 不受支持：预编译 sharp 不带 HEVC 解码器'
+      }
     }
     const hash = row.content_hash ?? ''
     if (!hash) {
@@ -569,7 +596,12 @@ export function writeText(id: number, text: string, baseMtime?: number): TextWri
 
   if (oldHash && oldHash !== hash) {
     const stillUsed = (db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?').get(oldHash) as { c: number }).c
-    if (stillUsed === 0) {
+    // ⚠️ `isThumbHash` 是**安全闸**，不是格式洁癖：`.thumbs` 下的目录名由 hash 直接拼成，
+    // 一旦 `content_hash` 是 `..` 之类的脏值，`join(lib, '.thumbs', '..')` 会归一成**库根**，
+    // 下面那行 `rmSync(recursive)` 就把整个库删光。本文件是 6 个删缓存点里**唯一漏了这道校验**的
+    // （其余 5 处各自抄了一份正则，现已统一到 paths.ts 的同一份实现）。
+    // 校验不过就**跳过**（不删、不抛）—— 删不掉的孤儿缓存远好过一个被删掉的库，也不该打断保存。
+    if (isThumbHash(oldHash) && stillUsed === 0) {
       try {
         rmSync(join(libPath(), '.thumbs', oldHash), { recursive: true, force: true })
       } catch { /* 删不掉不算错，下次还有机会 */ }

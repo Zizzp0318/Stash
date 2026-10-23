@@ -16,7 +16,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
-import { closeCurrent, createLibrary, deleteLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
+import { closeCurrent, createLibrary, forgetLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
 import { readFiles, writeFiles } from './clipboard'
 import { copyAssets, createTag, pastePaths, renameAsset, renameTag, updateAsset } from './assets'
 import { importFiles, type ImportResult } from './importer'
@@ -1312,7 +1312,8 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     try {
       if (libPath) {
         closeCurrent()
-        deleteLibrary(libPath)
+        // 只清 `config.json` 的最近库记录（不再物理删库），删目录由外层 rmSync(dir) 负责
+        forgetLibrary(libPath)
       }
     } catch {
       /* 清理失败不影响结论 */

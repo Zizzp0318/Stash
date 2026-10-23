@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import {
-  closeCurrent, createLibrary, deleteFolder, deleteLibrary, mkdirChild, openLibrary, renameFolder, requireCurrent
+  closeCurrent, createLibrary, deleteFolder, forgetLibrary, mkdirChild, openLibrary, renameFolder, requireCurrent
 } from './library'
 import { createTag, setTags } from './assets'
 import { importFiles } from './importer'
@@ -2065,12 +2065,14 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     R.jsErrors = jsErrors
     if (jsErrors.length) R.rendererLogs = rendererLogs.filter((l) => /error|Error|warn|Warn/.test(l)).slice(-8)
     // ⚠️ 先停 chokidar 再删目录：它还持有库目录的句柄，Windows 上会让 rmSync 抛 EPERM
-    // （与 main.ts 的 `deleteLibrarySafely` 同一条纪律；H 段的 library.open 已经把 watcher 挂上了）。
-    // 不停的话，`deleteLibrary` 会静默失败，紧接着的 rmSync(dir) 抛出去 —— 而它抛在 finally 里，
+    // （与 `library:close` 同一条纪律；H 段的 library.open 已经把 watcher 挂上了）。
+    // 守则不变：不停的话外层的 rmSync(dir) 会抛出去 —— 而它抛在 finally 里，
     // 会把下面的结果 JSON 与 `app.exit(0)` 一起吞掉（整轮冒烟"无结论地"挂死，只能靠超时杀）。
+    // `forgetLibrary` 只清 `config.json` 里的最近库记录（不再物理删库，删目录由外层 rmSync(dir) 负责），
+    // 目的是别让临时库的死记录在 config.json 里越积越多。
     unwatchLibrary()
     try {
-      if (libPath && existsSync(join(libPath, '.stash'))) deleteLibrary(libPath)
+      if (libPath) forgetLibrary(libPath)
     } catch (e) {
       R.cleanupError = String(e)
     }

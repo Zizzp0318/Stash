@@ -57,3 +57,25 @@ export function subtreeOfPath<T extends { path: string }>(all: T[], rootPath: st
   const prefix = rootPath + '/'
   return all.filter((f) => f.path === rootPath || f.path.startsWith(prefix))
 }
+
+/**
+ * 内容哈希（`assets.content_hash`，同时也是 `<库>/.thumbs/{hash}/` 的目录名）的**唯一**形状定义：
+ * 20 位小写十六进制（`importer.contentHash` 的产物）。
+ *
+ * 为什么必须集中成一份（审计 §2.16 同源问题）：这段校验原先在 6 个 service 里**各抄一遍**正则，
+ * 改一处必漏一处 —— 实际上就已经漏了一处（`preview.ts` 删旧缓存时完全没有校验）。
+ *
+ * 为什么它是**安全闸**而不只是「格式检查」：`.thumbs` 下的目录名直接由 hash 拼成。
+ * 一旦某个 `content_hash` 被写成 `..`（脏库 / 手改 DB / 将来某条写 hash 的路径出错），
+ * `join(lib, '.thumbs', '..')` 会归一成**库根**，紧接着的 `rmSync(recursive)` 就把整个库删了。
+ * ⇒ 凡是用 hash 拼路径或删缓存的代码，**必须先过 `isThumbHash`**。
+ */
+export const THUMB_HASH_RE = /^[0-9a-f]{20}$/
+
+/**
+ * hash 形状是否合法（见 `THUMB_HASH_RE`）。不合法的 hash **不**拿来拼路径、**不**删缓存。
+ * 传 `null` / `undefined` / 空串一律为假 —— 三个调用点里有两个的源头是 DB 可空列。
+ */
+export function isThumbHash(h: string | null | undefined): h is string {
+  return !!h && THUMB_HASH_RE.test(h)
+}

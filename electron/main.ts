@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
 import { spawn } from 'child_process'
 import { join, dirname } from 'path'
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync, unlinkSync } from 'fs'
+import { existsSync, readFileSync, rmSync, mkdirSync, mkdtempSync, writeFileSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import * as librarySvc from './services/library'
 import * as assetsSvc from './services/assets'
@@ -33,6 +33,7 @@ import { runSmokeWatch } from './services/smoke-watch'
 import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
+import { isThumbHash } from './services/paths'
 
 /**
  * 把 `preview` 的「媒体句柄释放 / 抑制」实现接进 `handles.ts` 的注册表。
@@ -104,39 +105,23 @@ registerRenameIsolationGuard({
 })
 
 /**
- * 删库的**唯一收口入口**：删的是「当前正在监听的库」时，先停掉 chokidar 再删目录。
+ * 移除库的**唯一收口入口**：IPC 与 `--smoke-forget` 都走它，避免两处各写一遍。
  *
- * 为什么必须收口：`deleteLibrary` 有两个调用点 —— 下面的 `--smoke-del` argv 分支 与
- * `library:delete` IPC handler。只在其中一处补 `unwatchLibrary()` 必然漏掉另一处。
+ * 顺序刻意是「先删记录、后关库」：万一写配置失败，应用仍停在原来的库上，
+ * 不会出现「库还开着、但列表里已经没了」这种半截状态。
+ * 当前库要先 unwatch 再 close（同 library:close）：chokidar 持有句柄时直接 close 不干净。
  *
- * 为什么顺序与 `library:close` 一致（先 unwatch 再删）：
- *   chokidar 若还持有已被 `rmSync` 掉的目录句柄，会一直泄漏到下次 `library:open`
- *   （`watchLibrary` 开头顺带 `unwatchLibrary`）才回收；Windows 上还可能让紧随的 `rmSync`
- *   撞 EBUSY。回调本身因 `current` 为 null 抛错、被内部 try/catch 吞掉，所以**不崩、只是泄漏**，
- *   正因如此它长期没被发现 —— 必须在删之前显式停掉。
- *
- * 为什么「先 unwatch、后 deleteLibrary 抛错」在本项目里不会发生（也不会把当前库留在裸奔态）：
- *   ① 只有「目标就是当前库」才会走到 unwatch。能成为 `current` 的库必然经 `setCurrent` 装进来，
- *      而 `createLibrary`/`openLibrary` 都在调 `setCurrent` **之前**校验过 `existsSync(.stash)`，
- *      `setCurrent` 又调 `addRecentLibrary` —— 这正是 `deleteLibrary` 两条校验
- *      （`ERR_NOT_A_LIBRARY` / `ERR_NOT_REGISTERED`）的前提，故校验必然通过。
- *   ② 万一仍在校验上抛错（如外部把 `.stash` 删了这种病态态），`current` 尚未被 `closeCurrent` 清掉，
- *      这里按原样把监听器重新挂回去再抛出 —— 自愈兜底，绝不接受「当前库失去监听」这个中间态。
+ * ⚠️ 全程不允许出现 rmSync / unlink —— 这个函数**只删 config.json 里的一行记录**。
  */
-function deleteLibrarySafely(target: string): void {
+function forgetLibrary(target: string): { removed: boolean } {
+  const res = librarySvc.forgetLibrary(target)
   const cur = librarySvc.getLibrary()
-  const isCurrentLib = !!cur && cur.path.toLowerCase() === librarySvc.normalizeLibraryPath(target).toLowerCase()
-  if (isCurrentLib) unwatchLibrary()
-  try {
-    librarySvc.deleteLibrary(target)
-  } catch (e) {
-    // 自愈：只有「删当前库」这条路才可能把它短暂置空监听器；校验抛错时 current 还在，重新挂回。
-    if (isCurrentLib) {
-      const still = librarySvc.getLibrary()
-      if (still) watchLibrary(still.path, librarySvc.getDatabase())
-    }
-    throw e
+  const isCurrent = !!cur && cur.path.toLowerCase() === librarySvc.normalizeLibraryPath(target).toLowerCase()
+  if (isCurrent) {
+    unwatchLibrary()
+    librarySvc.closeCurrent()
   }
+  return res
 }
 
 // stash://thumb/{hash}/{size}.webp —— 缩略图自定义协议（需在 app ready 前注册）
@@ -271,16 +256,37 @@ if (process.argv.includes('--smoke-m1')) {
   app.whenReady().then(() => runSmokeM2())
 } else if (process.argv.includes('--smoke-m3')) {
   app.whenReady().then(() => runSmokeM3())
-} else if (process.argv.includes('--smoke-del')) {
-  // 删除库冒烟：electron . --smoke-del <库路径>
-  const idx = process.argv.indexOf('--smoke-del')
-  const target = process.argv[idx + 1]
+} else if (process.argv.includes('--smoke-forget')) {
+  // 移除库冒烟：electron . --smoke-forget（**不带参数**，自己造库自己收尾）
+  // 核心承诺：记录被移除，但目录 / .stash / .thumbs 一个都不少。
+  // 不用 argv 传库路径：手搓的目录不在 config.json 里，`wasListed` 会恒为 false，
+  // 断言就成了空转（铁律 G9）。用应用自己的 createLibrary 造库，才是真实路径。
   app.whenReady().then(() => {
+    const root = mkdtempSync(join(tmpdir(), 'stash-forget-'))
     try {
-      deleteLibrarySafely(target)
-      console.log('SMOKE-DEL OK exists:', existsSync(target))
+      const lib = librarySvc.createLibrary({ name: 'forget-smoke-lib', parentDir: root })
+      const listed = (): boolean =>
+        librarySvc.listLibraries().some((l) => l.path.toLowerCase() === lib.path.toLowerCase())
+
+      const wasListed = listed() // 正对照：必须在列表里
+      const res = forgetLibrary(lib.path) // 与 IPC 共用同一个收口函数
+      const stillListed = listed()
+
+      const dirExists = existsSync(lib.path)
+      const stashExists = existsSync(join(lib.path, '.stash'))
+      const thumbsExists = existsSync(join(lib.path, '.thumbs'))
+      const currentCleared = librarySvc.getLibrary() === null
+
+      console.log('[SMOKE-FORGET] ' + JSON.stringify({
+        wasListed, removed: res.removed, stillListed,
+        dirExists, stashExists, thumbsExists, currentCleared,
+        ok: wasListed && res.removed && !stillListed && dirExists && stashExists && thumbsExists && currentCleared
+      }))
     } catch (e) {
-      console.log('SMOKE-DEL FAIL:', String((e as Error).message ?? e))
+      console.log('[SMOKE-FORGET] FAIL:', String((e as Error).message ?? e))
+    } finally {
+      // 只清这个临时根目录（自己建的），不碰任何用户数据
+      try { rmSync(root, { recursive: true, force: true }) } catch { /* ignore */ }
     }
     app.exit(0)
   })
@@ -415,7 +421,8 @@ function bootstrap(): void {
 
     // 库
     ipcMain.handle('library:create', (_e, args) => wrap(() => librarySvc.createLibrary(args)))
-    ipcMain.handle('library:delete', (_e, target: string) => wrap(() => deleteLibrarySafely(target)))
+    // 移除库：只删软件里的记录，磁盘不动。收口入口见上面的 `forgetLibrary()`。
+    ipcMain.handle('library:forget', (_e, target: string) => wrap(() => forgetLibrary(target)))
     ipcMain.handle('library:open', (_e, target) =>
       wrap(() => {
         const info = librarySvc.openLibrary(target)
@@ -627,9 +634,12 @@ function bootstrap(): void {
         }
         if (url.host !== 'thumb' || !lib) return new Response('no library', { status: 404 })
         const segs = url.pathname.split('/').filter(Boolean)
-        const hash = (segs[0] ?? '').toLowerCase().replace(/[^0-9a-f]/g, '')
+        // hash 只做小写归一，**不再「剔掉非 hex 字符」再校验**：那一步等于放宽了校验
+        // （`abc-xdef…` 剔完还能凑够 20 位 hex 就算合法）。这里直接用全仓唯一的那份
+        // `isThumbHash`（paths.ts）—— 它同时是「hash 能安全拼进 .thumbs 路径」的唯一闸门。
+        const hash = (segs[0] ?? '').toLowerCase()
         const size = (segs[1] ?? '').replace(/\.webp$/i, '')
-        if (!/^[0-9a-f]{20}$/.test(hash) || !['grid', 'detail'].includes(size)) {
+        if (!isThumbHash(hash) || !['grid', 'detail'].includes(size)) {
           return new Response('bad request', { status: 400 })
         }
         const file = join(lib.path, '.thumbs', hash, `${size}.webp`)

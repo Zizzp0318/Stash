@@ -235,14 +235,22 @@ export const useLibraryStore = defineStore('library', () => {
     await loadRecent()
   }
 
-  /** 彻底删除库（库目录连素材一起从磁盘移除）。删的是当前库则回到欢迎页 */
-  async function deleteLibrary(target: string): Promise<string | null> {
+  /**
+   * 从最近库列表移除（**只删记录，不删磁盘**）。移除的是当前库则回到欢迎页。
+   *
+   * 语义与 `closeLibrary` 的区别：close 只是「这次不看了」，记录还在列表里；
+   * forget 是「这个库别再出现在我的列表里」，但**库目录、.stash、.thumbs、素材全部原样保留**，
+   * 以后用「打开库…」指回该目录即可重新加回来。
+   */
+  async function forgetLibrary(target: string): Promise<string | null> {
+    // ⚠️ isCurrent 必须在 IPC **之前**取：forget 成功后主进程已把当前库关掉（getInfo 变 null），
+    // 事后再比较就永远拿到 false，欢迎页那套状态清理会被整段跳过。
     const isCurrent = info.value?.path.toLowerCase() === target.toLowerCase()
-    const r = await window.stash.library.delete(target)
-    if (!r.ok) return r.error ?? '删除失败'
-    // delete 与 open/create/close 同属「库生命周期成功动作」，成功时一并清掉 bootError：
-    // 删的是当前库时用户直接回到欢迎页（与 closeLibrary 同一情形），留着陈旧文案一样会误导；
-    // 删的是别的库时，用户的操作上下文也已改变，那条启动理由同样不再代表当下。
+    const r = await window.stash.library.forget(target)
+    if (!r.ok) return r.error ?? '移除失败'
+    // forget 与 open/create/close 同属「库生命周期成功动作」，成功时一并清掉 bootError：
+    // 移除的是当前库时用户直接回到欢迎页（与 closeLibrary 同一情形），留着陈旧文案一样会误导；
+    // 移除的是别的库时，用户的操作上下文也已改变，那条启动理由同样不再代表当下。
     bootError.value = ''
     if (isCurrent) {
       useAssetStore().reset()
@@ -250,6 +258,7 @@ export const useLibraryStore = defineStore('library', () => {
       folders.value = []
       tags.value = []
       counts.value = { total: 0, byFolder: {}, byTag: {} }
+      collapsed.value = []
     }
     await loadRecent()
     return null
@@ -260,6 +269,6 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, deleteLibrary, refreshCounts, loadMeta,
+  return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, forgetLibrary, refreshCounts, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

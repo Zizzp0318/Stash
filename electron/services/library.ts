@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, rmSync } from 'fs'
 import { join, dirname, basename, relative, isAbsolute, resolve } from 'path'
 import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
-import { subtreeOfPath, validateName } from './paths'
+import { isThumbHash, subtreeOfPath, validateName } from './paths'
 import { isBusyRenameError, renameWithRetry } from './fsutil'
 import {
   beginRenameIsolationTrail,
@@ -108,9 +108,9 @@ export function listLibraries(): LibraryInfo[] {
  * 把「库路径」的多种写法统一解析成**库目录**的绝对路径。
  *
  * 允许传入 `.stash` 索引文件本身或库目录本身 —— 两者都指向同一个库（与 openLibrary 同口径）。
- * 纯提取自 deleteLibrary 的头两行，逻辑一字未改；导出是为了让 main.ts 的删库收口入口
- * 能与 deleteLibrary 内部用**同一份**规范化结果去判断「删的是不是当前库」，
- * 避免两边各写一份路径比较而分叉。
+ * 导出是为了让 `main.ts` 的 `library:forget` handler 能用**同一份**规范化结果判断
+ * 「要移的是不是当前库」，避免两边各写一份路径比较而分叉
+ * （Windows 路径大小写不敏感，比较口径必须只有一处）。
  */
 export function normalizeLibraryPath(target: string): string {
   const raw = target.toLowerCase().endsWith('.stash') ? dirname(target) : target
@@ -118,20 +118,17 @@ export function normalizeLibraryPath(target: string): string {
 }
 
 /**
- * 彻底删除库：库目录（含全部素材、.stash 索引、.thumbs 缓存）直接从磁盘移除，不进回收站。
- * 安全约束：只允许删除「最近列表中注册且含 .stash 的库目录」，防止误删任意路径。
+ * 把库从「软件里」移除：只删 `config.json` 的最近库记录，**绝不碰磁盘**。
  *
- * ⚠️ 本函数**不含** `unwatchLibrary()`：直接 import watcher 会与 watcher → library 形成 import 环。
- * 「删当前库前先停 chokidar」由 main.ts 的收口入口 `deleteLibrarySafely` 负责（两个调用点都走它）。
+ * 为什么不做任何 `existsSync(.stash)` 校验：目录被外部删掉/移走的死记录**同样要能移除**，
+ * 那正是用户最需要清掉它的时候。旧 `deleteLibrary` 的 `ERR_NOT_A_LIBRARY` /
+ * `ERR_NOT_REGISTERED` 两个校验随之一起消失。
+ *
+ * 当前库的「停监听 + 关连接」不在这里做 —— `library.ts` 不能 import `watcher.ts`（会成环，
+ * 见 handles.ts 的头注释）。由 `main.ts` 的 handler 先 unwatch 再 close，顺序与 `library:close` 一致。
  */
-export function deleteLibrary(target: string): void {
-  const libPath = normalizeLibraryPath(target)
-  if (!existsSync(join(libPath, '.stash'))) throw new Error('ERR_NOT_A_LIBRARY')
-  const registered = listRecentLibraries().some((p) => p.toLowerCase() === libPath.toLowerCase())
-  if (!registered) throw new Error('ERR_NOT_REGISTERED')
-  if (current && current.path.toLowerCase() === libPath.toLowerCase()) closeCurrent()
-  rmSync(libPath, { recursive: true, force: true })
-  removeRecentLibrary(libPath)
+export function forgetLibrary(target: string): { removed: boolean } {
+  return { removed: removeRecentLibrary(normalizeLibraryPath(target)) }
 }
 
 // —— 文件夹（与库目录真实文件夹 1:1）——
@@ -711,7 +708,7 @@ async function deleteFolderUnlocked(id: number): Promise<{
     const stillUsed = db.prepare('SELECT count(*) AS c FROM assets WHERE content_hash=?')
     for (const a of assetRows) {
       const hash = a.content_hash
-      if (!hash || !/^[0-9a-f]{20}$/.test(hash)) continue
+      if (!isThumbHash(hash)) continue
       if ((stillUsed.get(hash) as { c: number }).c) continue
       try {
         rmSync(join(libPath, '.thumbs', hash), { recursive: true, force: true })
