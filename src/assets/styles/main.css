@@ -60,11 +60,17 @@ body {
 /* 顶栏与页面背景同色（图标 + 软件名 + 搜索框都属于「软件外壳」），所以不能有分割线把它割开 */
 .titlebar {
   position: relative;
-  height: 44px;
+  /*
+   * 高度 36 + 上内边距 8：搜索框（28px）恰好落在 y 8..36，上方留 8、
+   * 下方隔着 .body 的 8px 上内边距到面板也是 8 —— 上下对称。
+   * 之前是 height 44 + 居中：搜索框下方 = 8(栏内) + 8(外缝) = 16，比上方多一倍（用户截图框选处）。
+   * 注意内容区 y 8..36 与旧版完全一致，窗口按钮等几何不变，只有面板整体上移 8px。
+   */
+  height: 36px;
   background: var(--bg-app);
   display: flex;
   align-items: center;
-  padding: 0 14px;
+  padding: 8px 14px 0;
   gap: 16px;
   flex-shrink: 0;
   -webkit-app-region: drag;
