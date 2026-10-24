@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 底部悬浮批量操作条：选中 ≥1 项时出现
 // 只做「批量该做的事」——打标按需求不提供，标签仍在右侧详情里单个编辑
-import { ref } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { useAssetStore } from '../stores/assets'
 
 const assets = useAssetStore()
@@ -9,6 +9,75 @@ const emit = defineEmits<{ (e: 'move'): void; (e: 'remove'): void; (e: 'compress
 
 // 悬停时预览评分（不影响已选中的公共评分）
 const hoverStar = ref(0)
+
+/**
+ * 单行高度（border-box，含 1px 边框与 7px 上下内边距）——
+ * 必须与 `main.css` 里 `.batchbar` 的 `min-height` 保持一致；
+ * 两个数一旦分叉，`--bb-extra` 就会在单行时算成非 0，底部留白整体漂移。
+ */
+const BB_SINGLE_H = 44
+
+/**
+ * 底部让位的实测来源。
+ *
+ * 背景：条子是 `flex-wrap` 的，窄窗会从单行（44）折成两行（78），
+ * 而 `.grid-wrap` 的 `padding-bottom` 与 `.to-top` 的 `bottom` 都得跟着变，
+ * 否则最后一行卡片会被条子压住、浮标会跟条子撞在一起。
+ *
+ * 旧实现用媒体查询按「内容宽 615 + 面板宽」硬推了一个换行点（1107px）。
+ * 那是双重魔法数字：`@media (max-width:1200px)` 会把 `.bb-div` 隐掉，内容宽降到 596.8，
+ * 真实换行点变成 ≈1089 —— 于是 1089~1107 这 18px 区间里「条子已是单行，留白却按两行给」，
+ * 多出 34px 空白、浮标也偏高 34px；而文案一变长（「已选 12345 项」），换行点又整体挪走。
+ *
+ * 现在改成**量出多少算多少**：实测条高减去单行高度就是「多出来的那一截」，
+ * 写进 CSS 变量 `--bb-extra`，`main.css` 里用 `calc()` 叠到 84 / 74 上。
+ * 观察的是条子自己，改的是 `.grid-wrap` 的内边距 —— 条子是绝对定位、宽高都由内容决定，
+ * 不受内边距影响，所以这个环不会自激。
+ */
+const barEl = ref<HTMLElement | null>(null)
+/** CSS 变量挂在 `.batchbar` 的父节点（`.gallery`）上：它是 `.grid-wrap` 与 `.to-top` 的共同祖先 */
+let hostEl: HTMLElement | null = null
+let ro: ResizeObserver | null = null
+/** 上次写进变量的值（px）。-1 表示「还没写过」，保证首次一定会写一遍 */
+let lastExtra = -1
+
+const setExtra = (extra: number): void => {
+  if (extra === lastExtra) return
+  lastExtra = extra
+  hostEl?.style.setProperty('--bb-extra', `${extra}px`)
+}
+
+const applyHeight = (height: number): void => {
+  // 先取整再相减：单行 44 必须稳稳落成 0，不能因为亚像素（43.99 / 44.01）变成 ±1，
+  // 否则默认窗口的 padding-bottom 会从 84 漂成 83 或 85。
+  setExtra(Math.max(0, Math.round(height) - BB_SINGLE_H))
+}
+
+const detach = (): void => {
+  ro?.disconnect()
+  ro = null
+  // 条子撤了就把变量收回 0：留着上一轮的 34 会让「没量到」的那一帧凭空多让 34px
+  hostEl?.style.setProperty('--bb-extra', '0px')
+  hostEl = null
+  lastExtra = -1
+}
+
+// 条子由内层 v-if 控制（选中数 > 0 才挂），所以要盯模板 ref 的出现/消失，不能只靠 onMounted
+watch(
+  barEl,
+  (el) => {
+    detach()
+    if (!el) return
+    hostEl = el.parentElement
+    // 首帧同步量一次：变量在挂载这帧就位，避免「先 84、下一帧才 118」的闪跳
+    applyHeight(el.getBoundingClientRect().height)
+    ro = new ResizeObserver(() => applyHeight(el.getBoundingClientRect().height))
+    ro.observe(el)
+  },
+  { flush: 'post' }
+)
+
+onBeforeUnmount(detach)
 
 /**
  * 星标是否点亮：悬停预览优先，未悬停时用选中项的公共评分（0 = 全部未评分）。
@@ -20,7 +89,7 @@ const starOn = (n: number): boolean => n <= (hoverStar.value || assets.selectedR
 
 <template>
   <Transition name="raise">
-    <div v-if="assets.selectedCount > 0" class="batchbar">
+    <div v-if="assets.selectedCount > 0" ref="barEl" class="batchbar">
       <span class="bb-count">已选 <b>{{ assets.selectedCount }}</b> 项</span>
       <span class="bb-div"></span>
 

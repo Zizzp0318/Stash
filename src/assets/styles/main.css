@@ -1306,7 +1306,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
  * 条子直接溢到右栏上去（难看但能读能点）。本轮给 .gallery 加了 overflow:hidden（圆角需要），
  * 于是它被硬裁在面板边界：「已选 N 项」整段消失、「取消选择」只剩半个「取」且点不到（QA 实测）。
  * 所以：max-width 兜住宽度 + flex-wrap 换成多行。窄窗下条子变高，
- * 下面那条 @media 同步抬高浮标与网格底部留白。
+ * 抬高浮标与网格底部留白的量由 BatchBar 的 ResizeObserver 实测成 `--bb-extra`（见下），不再靠媒体查询猜。
  */
 .batchbar {
   position: absolute;
@@ -1548,9 +1548,15 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* 悬停提亮一档：以浮层色为基色往上混一点一级文字色（不用写死的 #43474C） */
 .to-top:hover { background: color-mix(in srgb, var(--text-1) 12%, var(--bg-raised)); color: var(--text-1); }
 .to-top:active { transform: translateY(1px); }
-/* 批量条是 left:50% 居中（bottom:18px、单行高 44px），窗口一窄就会和右下角的浮标撞上，
-   所以它在场时把浮标抬到它上方：18 + 44 + 12 = 74 */
-.to-top.with-batchbar { bottom: 74px; }
+/*
+ * 批量条是 left:50% 居中（bottom:18px、单行高 44px），窗口一窄就会和右下角的浮标撞上，
+ * 所以它在场时把浮标抬到它上方：18 + 44 + 12 = 74。
+ *
+ * `--bb-extra` 是 BatchBar 的 ResizeObserver 实测出来的「条子比单行高出的那几像素」：
+ * 单行 = 0，折成两行 = 34。所以窄窗下两个值自动变成 108 / 118，不再靠媒体查询猜换行点。
+ * 变量挂在 `.gallery` 上（.batchbar 的父节点，也是 .grid-wrap 与 .to-top 的共同祖先）。
+ */
+.to-top.with-batchbar { bottom: calc(74px + var(--bb-extra, 0px)); }
 /* 只做纵向位移。BatchBar 用的 .raise 里带 translate(-50%)（那是给它居中定位配的），
    浮标靠 right 定位，照搬会在出现/消失时横向跳一下。 */
 .toTop-enter-active, .toTop-leave-active { transition: opacity 0.16s ease, transform 0.16s ease; }
@@ -1559,19 +1565,12 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* 浮标会盖住最后一行卡片的右下角，给它让出位置。
    批量条的 84px 更大且写在后面 —— 两个类同时命中时按它生效，不叠加。 */
 .grid-wrap.has-totop { padding-bottom: 76px; }
-/* 悬浮条出现时给列表底部让出空间，避免最后一行被压住：18 + 44 + 22 = 84 */
-.grid-wrap.has-batchbar { padding-bottom: 84px; }
+/* 悬浮条出现时给列表底部让出空间，避免最后一行被压住：18 + 44 + 22 = 84。
+   `--bb-extra` = 条子高出单行的部分（单行 0、两行 34），由 BatchBar 的 ResizeObserver 实测写入。 */
+.grid-wrap.has-batchbar { padding-bottom: calc(84px + var(--bb-extra, 0px)); }
 /*
- * 批量条会换行的窗口区间。
- * 条子内容宽 615，`max-width = 面板宽 − 24`、面板宽 = 窗宽 − 468 →
- * 窗宽 < 615 + 24 + 468 = 1107 时它就从单行变成两行（实测 962/1000/1080/1100 都是 2 行、高 78）。
- *   浮标：18 + 78 + 12 = 108；网格留白：18 + 78 + 22 = 118
+ * 窄窗批量条会换行：竖分隔线这时会落在行首/行尾像根多余的竖杠，直接隐掉，靠行距分组
  */
-@media (max-width: 1107px) {
-  .to-top.with-batchbar { bottom: 108px; }
-  .grid-wrap.has-batchbar { padding-bottom: 118px; }
-}
-/* 窄窗批量条会换行：竖分隔线这时会落在行首/行尾像根多余的竖杠，直接隐掉，靠行距分组 */
 @media (max-width: 1200px) {
   .bb-div { display: none; }
 }
