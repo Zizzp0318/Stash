@@ -2,6 +2,7 @@
 import { onMounted } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import SideBar from './components/SideBar.vue'
+import ColumnResizer from './components/ColumnResizer.vue'
 import GalleryGrid from './components/GalleryGrid.vue'
 import DetailPanel from './components/DetailPanel.vue'
 import Welcome from './components/Welcome.vue'
@@ -104,6 +105,12 @@ onMounted(async () => {
     <TitleBar />
     <div class="body">
       <SideBar />
+      <!--
+        左栏宽度拖拽条：盖在「侧栏 ↔ 中栏」的 8px 缝隙上。
+        **绝对定位**，所以它虽然排在 .body 里，却不参与 flex 排版 ——
+        不会像加普通子元素那样凭空多出两条缝（改成 static 就会）。
+      -->
+      <ColumnResizer />
       <GalleryGrid />
       <!-- 收纳状态由标题栏右上角的按钮控制（见 TitleBar 的 .wc-btn）。
            收起后整个面板不渲染，点素材也不会把它带回来 —— 状态是显式的，不派生自「有没有选中」 -->

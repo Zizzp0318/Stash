@@ -523,7 +523,7 @@ async function copyDiagnostics(): Promise<void> {
             <div class="sp-danger">
               <div class="sp-label">
                 <div class="sp-name">恢复默认外观</div>
-                <div class="sp-tip">只重置以上外观项；库列表、标签、素材都不动</div>
+                <div class="sp-tip">只重置外观相关设置（含左侧栏宽度）；库列表、标签、素材都不动</div>
               </div>
               <button
                 class="sp-btn danger"

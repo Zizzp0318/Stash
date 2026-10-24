@@ -304,7 +304,9 @@ function bootstrap(): void {
       minWidth: 960,
       minHeight: 600,
       frame: false,
-      backgroundColor: '#242629',
+      // 与 --bg-app 同值：无边框窗口首帧/透明处露出的就是它，
+      // 漏改会在启动瞬间闪一下旧的画布灰（#242629），深黑主题里格外刺眼
+      backgroundColor: '#0D0D0E',
       show: false,
       webPreferences: {
         preload: join(__dirname, '../preload/preload.js'),

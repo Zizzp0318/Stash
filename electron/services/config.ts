@@ -20,6 +20,11 @@ export interface Settings {
   cardFields: { name: boolean; dims: boolean; size: boolean; time: boolean; typeBadge: boolean; aiBadge: boolean }
   /** 右侧信息栏默认收起 */
   detailCollapsed: boolean
+  /**
+   * 左侧栏宽度（px）。用户拖分隔条改的就是它。
+   * 合法区间见 SIDEBAR_WIDTH_MIN/MAX 的注释（唯一定义在渲染层，这里只做落盘前的兜底）。
+   */
+  sidebarWidth: number
   /** 缩略图管线 */
   thumbs: {
     /** 并发生成数（队列同时跑几个 job）。机器弱就调小，SSD 快可以调大 */
@@ -82,11 +87,25 @@ export const DEFAULT_SETTINGS: Settings = {
   viewZoom: 170,
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
+  sidebarWidth: 198,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
   importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
   compress: { format: 'jpeg', quality: 90, maxEdge: 0, alsoJpeg: false }
 }
+
+/**
+ * 左侧栏宽度的合法区间。
+ *
+ * ⚠️ 范围的**唯一定义在渲染层**（`src/stores/settings.ts` 的 `SIDEBAR_W_MIN/MAX/DEFAULT`，
+ * 拖拽、键盘步进、读配置时的钳制都用那一份）。这里的三个数是**同值的镜像**，
+ * 只用来挡「配置文件被手改成 `-5` / `99999` / `"abc"`」这种脏值落盘 ——
+ * 与 `THUMB_CONCURRENCY_MIN/MAX` 是同一套做法（主进程自己也要守住写盘那一关）。
+ * **改一边就得改另一边**，否则「存进去 420、渲染层读出来 420、重新校验变 160」这种漂移会在下次启动时凭空改宽度。
+ */
+export const SIDEBAR_WIDTH_MIN = 160
+export const SIDEBAR_WIDTH_MAX = 420
+export const SIDEBAR_WIDTH_DEFAULT = 198
 
 /** 可选的 webp 质量档位（面板上给三档，别让用户随便填个 1） */
 export const THUMB_QUALITY_CHOICES = [70, 82, 92] as const
@@ -112,8 +131,12 @@ export interface Config {
 
 /**
  * 形状校验：配置文件是用户能直接手改的，坏值一律回落默认。
- * 只做类型/枚举白名单，**不做范围钳制** —— 范围的唯一定义在渲染层
- * （`VIEW_ZOOM_MIN/MAX`，滑块与它同源），两处各钳一次迟早会不一致。
+ *
+ * 只做类型/枚举白名单 —— 范围的唯一定义在渲染层（`VIEW_ZOOM_MIN/MAX`、`SIDEBAR_W_MIN/MAX`，
+ * 滑块/拖拽与它们同源）。**例外**是 `sidebarWidth` 与 `thumbs.concurrency`：
+ * 这两个的合法区间在本文件也有一份镜像常量，因为它们是「原样写进 config.json」的整数，
+ * 一旦落进 -5 这种值，下次启动读到的就是脏数据（不是「读的时候顺手美化一下」能补救的）。
+ * 别再让这里出现第三处范围判断。
  */
 export function sanitizeSettings(raw: unknown): Settings {
   const d = DEFAULT_SETTINGS
@@ -139,11 +162,19 @@ export function sanitizeSettings(raw: unknown): Settings {
   const vol = Number.isFinite(volRaw) ? Math.min(1, Math.max(0, volRaw)) : d.preview.volume
   const conc = Number(th.concurrency)
   const qual = Number(th.quality)
+  // 侧栏宽度：只认真正的 number（字符串 / null / 布尔一律回落默认），再钳进合法区间。
+  // 钳制的意义在于「别把 -5 或 99999 写回 config.json」—— 落盘的值必须永远是能直接渲染的整数。
+  const swRaw = typeof r.sidebarWidth === 'number' && Number.isFinite(r.sidebarWidth) ? r.sidebarWidth : null
+  const sidebarWidth =
+    swRaw == null
+      ? d.sidebarWidth
+      : Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, Math.round(swRaw)))
   return {
     defaultView: r.defaultView === 'list' ? 'list' : 'masonry',
     viewZoom: typeof r.viewZoom === 'number' && Number.isFinite(r.viewZoom) ? Math.round(r.viewZoom) : d.viewZoom,
     cardFields: cf,
     detailCollapsed: r.detailCollapsed === true,
+    sidebarWidth,
     thumbs: {
       concurrency: Number.isFinite(conc)
         ? Math.min(THUMB_CONCURRENCY_MAX, Math.max(THUMB_CONCURRENCY_MIN, Math.round(conc)))

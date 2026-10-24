@@ -26,6 +26,21 @@ export const VIEW_ZOOM_MAX = 280
 export const VIEW_ZOOM_DEFAULT = 170
 
 /**
+ * 左侧栏宽度（px）的合法区间。
+ *
+ * **范围的唯一定义在这里** —— 拖拽（ColumnResizer）、键盘步进、读配置时的钳制都用这三个数。
+ * 默认 198 必须与 `main.css` 的 `.sidebar { width: var(--sidebar-w, 198px) }` 兜底值一致，
+ * 否则「首帧还没读到 config」的那一下会和之后的宽度对不上（会看到侧栏跳一下）。
+ *
+ * ⚠️ 主进程 `electron/services/config.ts` 的 `SIDEBAR_WIDTH_MIN/MAX/DEFAULT` 是这三个数的
+ * **同值镜像**，只负责挡住「配置文件被手改出 -5 / 99999」的脏值落盘。改这里就要同步改那边。
+ * 上限 420 = 再宽就该用列表视图而不是拖侧栏了；下限 160 = 再窄连「文件夹」三个字都排不下。
+ */
+export const SIDEBAR_W_MIN = 160
+export const SIDEBAR_W_MAX = 420
+export const SIDEBAR_W_DEFAULT = 198
+
+/**
  * 补丁类型：`Partial<StashSettings>` 只会把**顶层**变可选，嵌套对象仍是必填 ——
  * 而我们要的是「只改其中一两个开关」。直接复用 `env.d.ts` 里那份深可选定义，
  * 别再抄一遍（抄漏一层就是「改 A 把 B 弄没了」）。
@@ -37,6 +52,7 @@ const FALLBACK: StashSettings = {
   viewZoom: VIEW_ZOOM_DEFAULT,
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
+  sidebarWidth: SIDEBAR_W_DEFAULT,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
   importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
@@ -72,7 +88,9 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
   // ⚠️ 新增一个设置分组时，**这里必须同步** —— 忘了补默认值的话
   // `settings.value.thumbs` 就是 undefined，模板一读 `s.thumbs.concurrency` 当场抛错、
   // 后面的控件整段渲染不出来（本轮就这么翻过一次车）。
-  // 范围与白名单的校验在主进程（config.ts 的 sanitizeSettings），这里只补默认值，别两处各判一次。
+  // 范围与白名单的第一道校验在主进程（config.ts 的 sanitizeSettings）；
+  // 但这里是**渲染前的最后一道**，仍要把值补齐并钳住 —— 旧版本配置里根本没有新键，
+  // 跨窗口广播过来的也可能是别的版本写的值。别在这里新增业务校验，只补默认值 + 钳范围。
   const th = (src.thumbs ?? {}) as Partial<StashThumbSettings>
   const pv = (src.preview ?? {}) as Partial<StashPreviewSettings>
   const im = (src.importing ?? {}) as Partial<StashImportSettings>
@@ -81,11 +99,19 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
   const qual = Number(th.quality)
   const z = Number(src.viewZoom)
   const zoom = Number.isFinite(z) ? Math.min(VIEW_ZOOM_MAX, Math.max(VIEW_ZOOM_MIN, Math.round(z))) : VIEW_ZOOM_DEFAULT
+  // 侧栏宽度：主进程已经挡过一次脏值，这里**还是要再钳一次** ——
+  // 这一层的值可能来自旧版本配置（没有这个键）、也可能来自另一个窗口的广播，
+  // 而「渲染宽度」是唯一不能出错的量（越界就是把中栏挤没）。
+  const sw = Number(src.sidebarWidth)
+  const sidebarWidth = Number.isFinite(sw)
+    ? Math.min(SIDEBAR_W_MAX, Math.max(SIDEBAR_W_MIN, Math.round(sw)))
+    : SIDEBAR_W_DEFAULT
   return {
     defaultView: src.defaultView === 'list' ? 'list' : 'masonry',
     viewZoom: zoom,
     cardFields: cf,
     detailCollapsed: src.detailCollapsed === true,
+    sidebarWidth,
     thumbs: {
       concurrency: Number.isFinite(conc) ? Math.round(conc) : FALLBACK.thumbs.concurrency,
       quality: Number.isFinite(qual) ? Math.round(qual) : FALLBACK.thumbs.quality
@@ -230,13 +256,19 @@ export const useSettingsStore = defineStore('settings', () => {
     panelOpen.value = false
   }
 
-  /** 恢复外观默认值（只动外观，不碰缩略图管线/库列表等其它设置） */
+  /**
+   * 恢复外观默认值（只动外观，不碰缩略图管线 / 库列表等其它设置）。
+   *
+   * `sidebarWidth` 也算外观：用户点「恢复默认」期望的是**三栏比例回到原样**，
+   * 只回一半（视图、卡片大小、详情栏都回来了，左栏还停在拖宽后的 420）比不提供更让人困惑。
+   */
   async function resetAppearance(): Promise<void> {
     await patch({
       defaultView: FALLBACK.defaultView,
       viewZoom: FALLBACK.viewZoom,
       cardFields: { ...FALLBACK.cardFields },
-      detailCollapsed: FALLBACK.detailCollapsed
+      detailCollapsed: FALLBACK.detailCollapsed,
+      sidebarWidth: SIDEBAR_W_DEFAULT
     })
   }
 

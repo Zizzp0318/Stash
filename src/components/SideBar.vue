@@ -621,7 +621,12 @@ onBeforeUnmount(() => {
               @keydown.esc="cancelDraft"
               @blur="commitDraft"
             />
-            <template v-else>{{ f.name }} <span class="n" :title="folderCountTitle(f)">{{ fmtCount(f.count) }}</span></template>
+            <template v-else>
+              <!-- 名字单独一层：拖宽侧栏时才能在**同一行**里多显示几个字（见 main.css 的 .side-name）。
+                   名字与计数之间那个空格不能删：冒烟脚本按 textContent 截取标签名/文件夹名，
+                   没有分隔符时「标签10」+ 计数 10 会被切成「标签1」（smoke-tag.ts 的 sidebarTags）。 -->
+              <span class="side-name">{{ f.name }}</span>{{ ' ' }}<span class="n" :title="folderCountTitle(f)">{{ fmtCount(f.count) }}</span>
+            </template>
           </div>
           <div
             v-if="creatingIn === f.id"
@@ -680,7 +685,10 @@ onBeforeUnmount(() => {
             @keydown.esc="cancelTagRename"
             @blur="commitTagRename"
           />
-          <template v-else>{{ t.name }} <span class="n">{{ fmtCount(lib.counts.byTag[String(t.id)] ?? 0) }}</span></template>
+          <template v-else>
+            <!-- 与文件夹行同构：名字单独可省略的一层，空格见上一条注释 -->
+            <span class="side-name">{{ t.name }}</span>{{ ' ' }}<span class="n">{{ fmtCount(lib.counts.byTag[String(t.id)] ?? 0) }}</span>
+          </template>
         </div>
       </div>
     </div>

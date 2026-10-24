@@ -36,10 +36,11 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 「未保存」角标：底是 accent-soft，小字必须用 --text-1（--accent 只有 3.97:1） */
 .pv-dirty {
   flex-shrink: 0;
   font-size: 11px;
-  color: var(--accent);
+  color: var(--text-1);
   background: var(--accent-soft);
   border-radius: 4px;
   padding: 1px 6px;
@@ -402,7 +403,7 @@
 }
 .ptext-enc { color: var(--text-3); }
 .ptext-ro {
-  color: var(--accent);
+  color: var(--text-1);
   background: var(--accent-soft);
   border-radius: 4px;
   padding: 1px 6px;

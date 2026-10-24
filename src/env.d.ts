@@ -333,6 +333,13 @@ export interface StashSettings {
   viewZoom: number
   cardFields: StashCardFields
   detailCollapsed: boolean
+  /**
+   * 左侧栏宽度（px）—— 用户拖分隔条改的就是它。
+   * 这是**用户意图宽度**：窗口太窄时实际渲染宽度会被 `maxForWindow()` 收窄，
+   * 但存下来的仍是用户拖出来的那个值（窗口放大回来自动恢复）。
+   * 合法区间见 `stores/settings.ts` 的 `SIDEBAR_W_MIN/MAX/DEFAULT`。
+   */
+  sidebarWidth: number
   thumbs: StashThumbSettings
   preview: StashPreviewSettings
   importing: StashImportSettings

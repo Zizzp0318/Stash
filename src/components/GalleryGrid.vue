@@ -276,6 +276,9 @@ function metaText(it: StashAssetRow): string {
 const MASONRY_GAP = 12
 // .card 的内边距（缩略图内缩量），必须与 main.css .card 的 padding 一致
 const CARD_PAD = 4
+// .card 的 1px 描边：box-sizing 是 border-box，所以它从内容宽里再吃掉 1px（两侧共 2px）。
+// 必须与 main.css .card 的 border 宽度一致，否则缩略图比例与卡片高度会各差 1~2px。
+const CARD_BORDER = 1
 // 信息区高度常量，必须与 main.css 中 .card-info / .ci-name / .ci-meta 的行高一一对应，
 // 卡片高度靠这里算出（而不是等 DOM 测量），布局才不会有抖动
 const INFO_PAD_Y = 13 // padding 6 + 7
@@ -408,8 +411,8 @@ watch(() => lib.info?.path, () => {
  */
 watch(() => assets.thumbV, () => thumbRetried.clear())
 
-/** 缩略图可视宽度 = 卡片宽度 - 两侧内边距 */
-const thumbW = computed(() => Math.max(0, cardW.value - CARD_PAD * 2))
+/** 缩略图可视宽度 = 卡片宽度 - 两侧内边距 - 两侧描边 */
+const thumbW = computed(() => Math.max(0, cardW.value - CARD_PAD * 2 - CARD_BORDER * 2))
 
 function thumbH(it: StashAssetRow): number {
   return Math.round(thumbW.value * ratioOf(it))
@@ -442,8 +445,8 @@ const placed = computed<Placed[]>(() => {
     let k = 0
     for (let i = 1; i < c; i++) if (heights[i] < heights[k]) k = i
     const th = thumbH(it)
-    // 卡片总高 = 上下内边距 + 缩略图 + 信息区（含分隔线）
-    const h = th + infoH(it) + INFO_BORDER + CARD_PAD * 2
+    // 卡片总高 = 上下内边距 + 上下描边 + 缩略图 + 信息区（含分隔线）
+    const h = th + infoH(it) + INFO_BORDER + CARD_PAD * 2 + CARD_BORDER * 2
     out.push({ it, x: Math.round(k * (w + MASONRY_GAP)), y: Math.round(heights[k]), w: Math.round(w), h, thumb: th })
     heights[k] += h + MASONRY_GAP
   }

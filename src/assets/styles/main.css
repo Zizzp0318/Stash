@@ -1,24 +1,54 @@
+/*
+ * 深黑配色（唯一主题）：三层亮度阶梯
+ *   外壳 #0D0D0E < 媒体衬底 #0F0F10 < 侧栏 #181818 < 中间板 #1F1F20 < 浮层 #262628
+ * 所以「放在较亮的中间板上的一块暗托盘」是设计意图，不是没对齐。
+ * ⚠️ 本文件不新增任何写死的色值：需要半透明派生色时一律用 color-mix(... var(--token) ...)，
+ *    这样改一个 token 就够，不会又留下一批「改了主色没改派生色」的死值。
+ */
 :root {
-  --bg-canvas: #242629;
-  --bg-panel: #2C2E31;
-  --bg-raised: #35383C;
-  --bg-hover: rgba(255,255,255,0.05);
-  --border: #3A3D42;
+  /* ① 软件外壳：顶栏 + 页面背景 + 三块面板之间的缝 */
+  --bg-app:     #0D0D0E;
+  /* ② 左导航 + 右详情 + 中间顶部工具条 + 设置面板 + 欢迎页卡片 */
+  --bg-panel:   #181818;
+  /* ③ 中间预览板（网格所在），比侧栏更亮 */
+  --bg-canvas:  #1F1F20;
+  /* ④ 面板内浮层：菜单 / 批量条 / chips / 键帽 */
+  --bg-raised:  #262628;
+  /* ⑤ 大图·视频·卡片图片衬底，比侧栏更暗，让图跳出来 */
+  --bg-media:   #0F0F10;
+  /* ⑥ 输入井：顶栏搜索框、设置与弹窗里的输入框 */
+  --bg-input:   rgba(255,255,255,0.045);
+
+  --bg-hover:    rgba(255,255,255,0.06);
+  --border:      #2E2E30;
   --border-soft: rgba(255,255,255,0.07);
-  --text-1: #E9EBED;
-  --text-2: #9CA1A8;
-  --text-3: #6B7076;
-  --accent: #E8B04B;
-  --accent-soft: rgba(232,176,75,0.13);
-  --accent-border: rgba(232,176,75,0.55);
+
+  --text-1: #F2F4F6;
+  --text-2: #A9B0B8;
+  --text-3: #8C949D;
+
+  --accent:        #4795FF;
+  --accent-soft:   rgba(71,149,255,0.16);
+  --accent-border: rgba(71,149,255,0.50);
+  /*
+   * ⚠️ 强调色**只当描边 / 图标 / 实底**用，**不要当小字**：#4795FF 压在 --accent-soft 上只有 3.97:1、
+   * 压在 30% 的 mark 底上只有 3.65:1（AA 要 4.5）。旧主题的 #E8B04B 够亮才没暴露这个坑。
+   * 需要「选中/开启」的文字时用 --text-1：状态已由 accent-soft 那层底色承载，文字再染一遍是重复编码。
+   * 这也是设计稿自己的写法（`.tag-row.active { background: var(--accent-soft); color: var(--text-1) }`），
+   * 与代码里既有的 .sp-chip.on / .sp-nav-item.on / .sp-seg button.on / .list-row.selected 一致。
+   */
+
+  --danger:        #F0705E;
+
   --radius: 8px;
+  --radius-panel: 10px;
   --font: "MiSans", "HarmonyOS Sans SC", "Source Han Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, #app { height: 100%; }
 body {
   font-family: var(--font);
-  background: var(--bg-canvas);
+  background: var(--bg-app);
   color: var(--text-1);
   font-size: 13px;
   overflow: hidden;
@@ -27,11 +57,11 @@ body {
 .app { display: flex; flex-direction: column; height: 100vh; }
 
 /* ============ 顶栏 ============ */
+/* 顶栏与页面背景同色（图标 + 软件名 + 搜索框都属于「软件外壳」），所以不能有分割线把它割开 */
 .titlebar {
   position: relative;
   height: 44px;
-  background: var(--bg-panel);
-  border-bottom: 1px solid var(--border-soft);
+  background: var(--bg-app);
   display: flex;
   align-items: center;
   padding: 0 14px;
@@ -43,9 +73,11 @@ body {
   -webkit-app-region: no-drag;
 }
 .brand { display: flex; align-items: center; gap: 8px; }
+/* 图标是「挖空」出来的：圆点/线条取外壳色（与背景同源），而不是又写一个写死的十六进制 */
 .brand-mark {
   width: 20px; height: 20px; border-radius: 6px;
   background: var(--accent);
+  color: var(--bg-app);
   display: grid; place-items: center;
 }
 .brand-mark svg { width: 12px; height: 12px; }
@@ -68,20 +100,27 @@ body {
   color: var(--text-3); cursor: pointer;
 }
 .tab-add:hover { background: var(--bg-hover); color: var(--text-2); }
+/* 搜索框 = 嵌在顶栏里的一条输入带：半透明白叠在外壳上，而不是一块独立的小面板 */
 .searchbox {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
   width: 300px; height: 28px;
-  background: var(--bg-canvas);
+  background: var(--bg-input);
   border: 1px solid var(--border-soft);
   border-radius: 7px;
   display: flex; align-items: center; gap: 8px;
   padding: 0 10px;
   color: var(--text-3);
   cursor: text;
+  transition: background 0.13s ease, border-color 0.13s ease, box-shadow 0.13s ease;
 }
-.searchbox:hover { border-color: var(--border); }
+.searchbox:hover { background: var(--bg-hover); border-color: var(--border); }
+.searchbox:focus-within {
+  background: var(--bg-hover);
+  border-color: var(--accent-border);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
 .searchbox .hint { font-size: 12px; }
 .win-controls { display: flex; gap: 2px; align-items: center; color: var(--text-3); padding-left: 6px; margin-left: auto; }
 /*
@@ -104,21 +143,100 @@ body {
 }
 .wc-btn svg { width: 16px; height: 16px; display: block; }
 .wc-btn:hover { background: var(--bg-hover); color: var(--text-1); }
-/* 关闭按钮沿用 Windows 的红底白叉惯例，避免误点 */
+/*
+ * 关闭按钮沿用 Windows 的红底白叉惯例，避免误点。
+ * 例外说明：#C42B1C / #fff 是**刻意保留的写死值**（OS 惯例色，不参与主题化）。
+ * 白叉对 #C42B1C 是 5.7:1，合格，所以这里不换成「近黑字」。
+ */
 .wc-btn.close:hover { background: #C42B1C; color: #fff; }
 
 /* ============ 主体三栏 ============ */
-.body { display: flex; flex: 1; min-height: 0; }
+/*
+ * 三块浮起的圆角面板：8px 内边距 + 8px 缝隙露出 --bg-app 底板，圆角才读得出来。
+ * ⚠️ 这里内缩 8px 会让中间网格的可用宽度少 24px（左右 padding + 2 条缝），
+ *    瀑布流的列宽是按实测宽度算的（GalleryGrid 的 layout），所以不用改任何尺寸常量。
+ */
+.body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+  padding: 8px;
+  background: var(--bg-app);
+  /* 拖拽条的定位参照（它绝对定位在「侧栏 ↔ 中栏」那条缝上） */
+  position: relative;
+}
+
+/* ---- 左栏宽度拖拽条 ---- */
+/*
+ * 位置：`.body` 的 padding 是 8px，所以侧栏左边缘在 8px 处、宽度是 `--sidebar-w`，
+ * 它右边的缝隙正好是 [8 + W, 16 + W)。用 left: calc(8px + var(--sidebar-w)) + width: 8px
+ * 严丝合缝盖住那条缝，既不挡侧栏也不挡中栏。
+ * 上下各留 8px：三块面板都有 10px 圆角，竖线不能顶进圆角里。
+ *
+ * ⚠️ 平时**完全不可见**（不是一条浅灰常驻条）：缝隙是设计的一部分（露出 --bg-app 底板），
+ *    只有悬停 / 拖动中才浮出一根 2px 的强调色细线。
+ */
+.col-resizer {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: calc(8px + var(--sidebar-w, 198px));
+  width: 8px;
+  z-index: 30;
+  cursor: col-resize;
+  /* 只是一层透明的命中区，不要任何底色 */
+  background: transparent;
+  border: none;
+  outline: none;
+  touch-action: none;
+}
+.col-resizer::after {
+  content: '';
+  display: block;
+  width: 2px;
+  height: 100%;
+  margin: 0 auto;
+  border-radius: 1px;
+  background: var(--accent);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.col-resizer:hover::after,
+.col-resizer:focus-visible::after,
+body.col-resizing .col-resizer::after {
+  opacity: 1;
+}
+/*
+ * 拖动中：全局换成拖动光标 + 禁止选中。
+ * 不加 `body.col-resizing` 这一层的话，指针一旦划到图片/视频上，
+ * 光标会被 `img`/`video` 的默认行为改回去（甚至变成"禁止"），看起来像拖不动了。
+ */
+body.col-resizing,
+body.col-resizing * {
+  cursor: col-resize !important;
+}
+body.col-resizing * {
+  user-select: none !important;
+}
 
 /* ---- 左侧栏 ---- */
+/*
+ * 宽度是**变量**：默认 198（= 用户拖拽前的原值，首帧还没读到 config 时也用它），
+ * 由 ColumnResizer 在拖动中把 `--sidebar-w` 写到 `.body` 上。
+ * 兜底值与 stores/settings.ts 的 SIDEBAR_W_DEFAULT 必须一致，否则首帧会跳一下。
+ */
 .sidebar {
-  width: 198px;
+  width: var(--sidebar-w, 198px);
   background: var(--bg-panel);
-  border-right: 1px solid var(--border-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
   padding: 10px 8px 10px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  /* 滚动发生在 .side-scroll 上，所以这里裁掉溢出只会把滚动条两端修成圆角，不会丢内容 */
+  overflow: hidden;
 }
 .side-scroll { flex: 1; overflow-y: auto; padding-bottom: 8px; }
 .side-footer {
@@ -166,21 +284,67 @@ body {
   font-size: 12.5px;
 }
 .side-item:hover { background: var(--bg-hover); color: var(--text-1); }
-.side-item.active { background: var(--bg-raised); color: var(--text-1); }
+/* 当前项：accent-soft 底 + 左侧 3px accent 内环（与预览页一致；选中语言只留给强调色） */
+.side-item.active {
+  background: var(--accent-soft);
+  color: var(--text-1);
+  box-shadow: inset 3px 0 0 var(--accent-border);
+}
 .side-item.active .n { color: var(--text-1); }
 .side-item svg { width: 14px; height: 14px; flex-shrink: 0; opacity: 0.75; }
 .side-item .n {
   margin-left: auto;
   font-size: 11px; color: var(--text-3);
   font-variant-numeric: tabular-nums;
+  /* 计数永远不许被名字挤掉：名字自己会省略（见下面的 .side-name） */
+  flex-shrink: 0;
+}
+/*
+ * 文件夹 / 标签的**名字**单独一层，为的是「拖宽侧栏能多看到几个字」这件事真的成立。
+ *
+ * 为什么不能继续让名字当「匿名 flex 项」（就是直接把文字写在 .side-item 里）：
+ * 匿名项的 min-width 是 auto，长名字（尤其带长英文词/日期前缀的文件夹名）压不下去，
+ * 于是整行溢出、把右边的计数和图标顶出可视区 —— 用户说的「名字太长看不到」正是这个。
+ * 这里给 `min-width: 0` 让它能缩到 0，再 `text-overflow: ellipsis` 收尾：
+ * 窄 → 省略号，拖宽 → 同一行里显示更多字符（而不是换行把行高撑开）。
+ */
+.side-item .side-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .side-item .indent-1 { margin-left: 6px; }
 .side-item .indent-2 { margin-left: 24px; }
 .tag-dot { width: 8px; height: 8px; border-radius: 3px; flex-shrink: 0; }
 
 /* ---- 中间画廊 ---- */
-.gallery { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
-.toolbar { padding: 10px 16px 0; flex-shrink: 0; }
+/* 中间板比侧栏更亮（--bg-canvas），所以卡片是一块比板更暗的托盘 */
+.gallery {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  /* 滚动只在 .grid-wrap 上，所以裁掉这里只影响两个顶角与浮层的出界 */
+  overflow: hidden;
+}
+/*
+ * 工具条与左右侧栏同色（--bg-panel）。它在 .gallery 内部，顶部两角由 .gallery 的圆角 +
+ * overflow:hidden 裁出来，所以这里**不加 border-radius**，否则会出现双圆角。
+ * 有底色了，底部要给一点呼吸（padding-bottom 10 → 12）。
+ */
+.toolbar {
+  /* 底部 8px：分割线要“贴着”筛选行，而不是浮在一片空白下面 */
+  padding: 10px 16px 8px;
+  flex-shrink: 0;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
 /* position: relative 只为给 .notice-toast 当定位参照（它浮在这一行的中段上空） */
 .toolbar-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; position: relative; }
 .toolbar-head h1 { font-size: 15px; font-weight: 600; }
@@ -207,9 +371,13 @@ body {
   font-size: 12px;
   font-family: var(--font);
   cursor: pointer;
+  /* 固定高度 + 允许收缩 → 不加这句时窄窗口下「文件名」会被拆成竖排单字；
+     整条不许换行，代之以整枚 chip 换行（.chips 有 flex-wrap） */
+  white-space: nowrap;
+  flex: 0 0 auto;
 }
 .chip:hover { background: var(--bg-hover); color: var(--text-1); }
-.chip.on { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
+.chip.on { border-color: var(--accent-border); color: var(--text-1); background: var(--accent-soft); }
 .chip svg { width: 12px; height: 12px; }
 
 /* 纯图标芯片：评分 / 喜欢 / 类型 / 排序。不给文字留宽度，方形按钮图标略大 */
@@ -220,28 +388,37 @@ body {
 .chip-order { padding: 0; width: 32px; height: 32px; justify-content: center; border-radius: 8px; }
 .chip-order svg { width: 15px; height: 15px; }
 
-/* 清除筛选：只在有筛选条件时出现，用弱化的告警色提示「有东西正在生效」 */
+/*
+ * 清除筛选：只在有筛选条件时出现。
+ * 它既不是「选中项」也不是「危险动作」，所以按普通 chip 处理（--bg-raised 底 + 二级字），
+ * 只在悬停时才借强调色描边提示「点它会清掉当前条件」。
+ */
 .chip-clear {
   height: 32px;
   padding: 0 12px;
   border-radius: 8px;
-  border-color: #6B5A3E;
-  color: #D9B87F;
-  background: rgba(217, 184, 127, 0.07);
+  border-color: var(--border);
+  color: var(--text-2);
+  background: var(--bg-raised);
 }
-.chip-clear:hover { background: rgba(217, 184, 127, 0.15); color: #EBCB97; }
+.chip-clear:hover { background: var(--bg-hover); color: var(--text-1); border-color: var(--accent-border); }
 
-/* 搜索命中高亮 */
+/*
+ * 搜索命中高亮：底是 accent 30% 染出来的一层（保留这个视觉重量），
+ * 字必须用 --text-1 —— --accent 在这层底上只有 3.65:1，不合格；--text-1 是 9.9:1。
+ */
 mark {
-  background: rgba(232, 176, 75, 0.28);
-  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text-1);
   border-radius: 2px;
   padding: 0 1px;
 }
 
-/* 卡片信息字段开关（工具栏最右侧） */
-.field-toggles { margin-left: auto; display: flex; align-items: center; gap: 5px; }
-.ft-label { font-size: 11px; color: var(--text-3); }
+/* 卡片信息字段开关（工具栏最右侧）。
+   窄窗口下这一组自己也要能换行：里面的 chip 加了 nowrap 之后不会再把「文件名」拆成竖排单字，
+   代价是整组最小宽度变大 —— 所以让它在自己内部换行、并整体贴右，而不是被 .gallery 裁掉。 */
+.field-toggles { margin-left: auto; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.ft-label { font-size: 11px; color: var(--text-3); white-space: nowrap; flex: 0 0 auto; }
 
 /* 瀑布视图缩放滑块 */
 .zoom-ctrl { display: flex; align-items: center; gap: 6px; margin-right: 3px; }
@@ -266,7 +443,7 @@ mark {
 .zoom-ctrl input[type='range']:hover::-webkit-slider-thumb,
 .zoom-ctrl input[type='range']:active::-webkit-slider-thumb { background: var(--accent); }
 .chip-ft { height: 24px; padding: 0 9px; font-size: 11.5px; border-radius: 6px; }
-.chip-ft.on { border-color: var(--accent-border); background: var(--accent-soft); color: var(--accent); }
+.chip-ft.on { border-color: var(--accent-border); background: var(--accent-soft); color: var(--text-1); }
 .chip-ft.on::before {
   content: '';
   width: 5px; height: 5px; border-radius: 50%;
@@ -276,39 +453,70 @@ mark {
 .sort { margin-left: auto; color: var(--text-3); font-size: 12px; display: flex; align-items: center; gap: 4px; cursor: pointer; }
 .sort:hover { color: var(--text-1); }
 
-.grid-wrap { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 16px 24px; }
+/*
+ * 全应用唯一的滚动容器。
+ * ⚠️ 绝不能挪走、也不能改成 overflow:hidden（多选/回到顶部/懒加载都挂在它身上）。
+ * ⚠️ `scrollbar-gutter: stable` 不是装饰：三块面板都内缩了 8px 之后，网格宽度正好落在
+ *    「列数切换」的临界点上，于是「出现滚动条 → 内容窄 10px → 列数/高度变 → 滚动条消失」会自激，
+ *    渲染层连发 "ResizeObserver loop completed with undelivered notifications"
+ *    （--smoke-settings 的「无运行期错误」会红）。常驻预留滚动条槽把这个反馈环彻底断掉，
+ *    顺带治好「滚动条一出现卡片就横向跳 10px」。
+ */
+.grid-wrap {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  /*
+   * 上/左/右统一 16px：原来上 4、左右 16，首行卡片贴住分割线，看起来「上面挤、两边宽」。
+   * 右边写 7 而不是 16：`scrollbar-gutter: stable` 会在内边距之外再常驻 9px 滚动条槽，
+   * 7 + 9 = 16，卡片到右边缘的视觉距离才和左边一致（槽宽 9 是 Chromium 在本机的实测值）。
+   */
+  padding: 16px 7px 24px 16px;
+}
 /* 瀑布视图：卡片绝对定位，行列尺寸由 GalleryGrid 的布局算法算出 */
 .masonry { position: relative; }
 .masonry .card { position: absolute; top: 0; left: 0; }
 .masonry .card .thumb { aspect-ratio: auto; }
+/*
+ * 卡片 = 放在「较亮的中间板」上的一块暗托盘：
+ *   图片区 --bg-media(#0F0F10) < 文件名条 --bg-panel(#181818) < 板 --bg-canvas(#1F1F20)
+ * 暗色 UI 里阴影看不见，只会让边缘发灰，所以这里一律不加投影。
+ */
 .card {
   position: relative;
   border-radius: var(--radius);
   overflow: hidden;
   cursor: pointer;
-  background: var(--bg-raised);
+  background: var(--bg-media);
+  border: 1px solid var(--border-soft);
   /* 内缩：让缩略图与描边环之间留出间距，图片不再压线（须与 GalleryGrid 的 CARD_PAD 一致） */
   padding: 4px;
-  transition: background-color 0.16s ease, box-shadow 0.16s ease;
+  transition: background-color 0.16s ease, border-color 0.16s ease;
 }
-/* 描边环：始终画在卡片最外圈、缩略图之上，选中/悬停只改粗细与颜色 */
+/*
+ * 选中 / 悬停环：必须画在缩略图**之上**，所以只能用 ::after（border 会被图片盖住）。
+ * 平时不画环 —— 卡片的静态轮廓改由上面的 1px border 负责，
+ * 否则「border 1px + 环 1px」会在边缘叠出一条 2px 的灰带。
+ */
 .card::after {
   content: '';
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  box-shadow: inset 0 0 0 1px var(--border-soft);
+  box-shadow: none;
   pointer-events: none;
   transition: box-shadow 0.16s ease;
   z-index: 4;
 }
 .card:hover::after { box-shadow: inset 0 0 0 2px var(--accent); }
-.card.selected { background: var(--accent-soft); }
+/* 选中不靠底色（会把整张图的观感带偏），只靠 ::after 那圈 2px accent 内环 */
+.card.selected { background: var(--bg-media); }
 .card.selected::after { box-shadow: inset 0 0 0 2px var(--accent); }
-/* 悬停：卡面提亮 + 浮起阴影 */
+/* 悬停：只把描边提亮一档，不用阴影、也不把图片区提亮 */
 .card:hover {
-  background: var(--bg-hover);
-  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.45);
+  background: var(--bg-media);
+  border-color: var(--border);
 }
 .card .thumb {
   aspect-ratio: 4 / 3.4;
@@ -318,11 +526,12 @@ mark {
   overflow: hidden;
 }
 .card .thumb svg { width: 100%; height: 100%; display: block; }
-/* 卡片下方常驻信息区（替代原悬停浮层）；背景交给 .card，卡面提亮时一起变化 */
+/* 卡片下方常驻信息区（替代原悬停浮层）。
+   它是「暗托盘上的亮条」：图片区 --bg-media，信息条 --bg-panel，中间一条 --border-soft 分隔 */
 .card-info {
   padding: 6px 9px 7px;
   border-top: 1px solid var(--border-soft);
-  background: transparent;
+  background: var(--bg-panel);
 }
 .ci-name {
   font-size: 11.5px;
@@ -364,6 +573,11 @@ mark {
 /* ⚠️ 选择器必须比 `.card .thumb svg`（它把 svg 拉成 100% 宽高）更具体 */
 .card .thumb-type .tt-ico { display: block; width: 11px; height: 11px; }
 .card .thumb-type .tt-ico svg { width: 11px; height: 11px; display: block; }
+/*
+ * ⚠️ 一类**刻意不 token 化**的配色：压在用户图片/视频上的角标（.thumb-type / .video-len / .thumb-ai）。
+ * 它们的前景是「半透明黑遮罩 + 纯白字」，与主题层级无关 —— 底下可能是纯白纸，也可能是纯黑产品图，
+ * 用主题文字色（--text-3 等）在亮图上会直接看不见。所以这些 rgba(24,26,28,…) / #fff 保留原值。
+ */
 .card .video-len {
   position: absolute; bottom: 8px; right: 8px;
   font-size: 10px;
@@ -375,10 +589,16 @@ mark {
 }
 
 /* ---- 右侧详情栏 ---- */
+/*
+ * 圆角加在这个**滚动容器**本身上（而不是像左右那样套一层），
+ * 因为它的 overflow-y:auto 必须留在这一层，否则右侧详情滚不动。
+ * 滚动条会被圆角自然裁切，这是可接受的代价。
+ */
 .detail {
   width: 238px;
   background: var(--bg-panel);
-  border-left: 1px solid var(--border-soft);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
   overflow-y: auto;
   flex-shrink: 0;
   padding-bottom: 20px;
@@ -397,9 +617,10 @@ mark {
 .detail-preview {
   margin: 12px 12px 0;
   padding: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-soft);
   border-radius: 14px;
-  background: var(--bg-raised);
+  /* 大图衬底用 --bg-media（比面板更暗）：图片与面板之间有一圈「暗井」，图才跳得出来 */
+  background: var(--bg-media);
   overflow: hidden;
   max-height: 60vh;
   display: flex;
@@ -432,7 +653,7 @@ mark {
 /* 可移除的提示：× 常驻占位（只改透明度，避免 hover 时宽度跳动导致整行位移） */
 .tag-chip .tag-x { margin-left: 4px; opacity: 0; font-size: 12px; line-height: 1; transition: opacity 0.12s ease; }
 .tag-chip:hover .tag-x { opacity: 0.75; }
-.tag-chip.ai { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); }
+.tag-chip.ai { background: var(--accent-soft); color: var(--text-1); border: 1px solid var(--accent-border); }
 .rate-row { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
 .stars { display: flex; gap: 3px; color: var(--accent); }
 .stars svg { width: 13px; height: 13px; }
@@ -445,7 +666,9 @@ mark {
 .heart-btn svg { width: 15px; height: 15px; }
 .heart-btn:hover { color: var(--accent); }
 .palette { display: flex; height: 22px; border-radius: 6px; overflow: hidden; }
-/* 色块是按钮（可点、可 Tab 到），点一下把该颜色复制成十六进制 */
+/* 色块是按钮（可点、可 Tab 到），点一下把该颜色复制成十六进制。
+   这里每个色块本身就是**数据**（用户图片的主色），所以 #fff 是「压在任意色块上的对勾」，
+   不属于主题配色，刻意保留写死值。 */
 .palette .swatch {
   position: relative;
   flex: 1;
@@ -467,14 +690,15 @@ mark {
   filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.6));
 }
 .d-label-hint { margin-left: 6px; font-size: 10px; opacity: 0.8; }
+/* AI 提示块：与 chip 同一套（--bg-raised 底 + 二级字），只有小标题保留强调色作为「这是 AI 说的」的信号 */
 .ai-note {
-  background: var(--accent-soft);
-  border: 1px solid rgba(232,176,75,0.28);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   padding: 9px 11px;
   font-size: 11.5px;
   line-height: 1.55;
-  color: #D9CBA8;
+  color: var(--text-2);
 }
 .ai-note-head { display: flex; align-items: center; gap: 5px; color: var(--accent); font-size: 10.5px; margin-bottom: 4px; }
 .ai-note-head svg { width: 10px; height: 10px; }
@@ -498,10 +722,10 @@ mark {
 .d-btn:hover { background: var(--bg-hover); color: var(--text-1); }
 .d-btn svg { width: 12px; height: 12px; }
 
-/* 滚动条 */
+/* 滚动条跟随主题（thumb 用 --border，悬停提到三级文字色） */
 ::-webkit-scrollbar { width: 10px; }
-::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.09); border-radius: 5px; border: 3px solid transparent; background-clip: content-box; }
-::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.18); background-clip: content-box; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; border: 3px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: content-box; }
 
 /* ==================== M3 UI 接线新增 ==================== */
 
@@ -536,7 +760,15 @@ mark {
 /* 侧栏交互 */
 .side-item { cursor: pointer; }
 .side-item:hover { background: var(--bg-hover); }
-.side-item.active { background: var(--bg-active, rgba(255,255,255,0.08)); color: var(--text-1); }
+/*
+ * ⚠️ 原来这里写的是 `var(--bg-active, rgba(255,255,255,0.08))` —— 而 --bg-active 全项目从未定义过，
+ * 等于永远走 fallback。改成显式的 accent-soft（不新增 token），与上面的 .side-item.active 同义。
+ */
+.side-item.active {
+  background: var(--accent-soft);
+  color: var(--text-1);
+  box-shadow: inset 3px 0 0 var(--accent-border);
+}
 
 /* 文件夹折叠箭头（无子级时占位隐藏，保证各行图标纵向对齐） */
 .side-item .fold-toggle {
@@ -569,8 +801,8 @@ mark {
   height: 24px;
   padding: 0 8px 0 22px; /* 左侧留给那个小标签图标 */
   border-radius: 6px;
-  border: 1px solid #5A8AC9;
-  background: var(--bg-input, #1D1F22);
+  border: 1px solid var(--accent-border);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 11px;
   font-family: var(--font);
@@ -639,9 +871,9 @@ mark {
   height: 20px;
   padding: 0 5px;
   margin: -2px 0;
-  border: 1px solid #5A8AC9;
+  border: 1px solid var(--accent-border);
   border-radius: 5px;
-  background: var(--bg-input, #1D1F22);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 12px;
   font-family: var(--font);
@@ -658,17 +890,24 @@ mark {
 
 /* 工具栏右侧操作区 */
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/*
+ * 导入 = 全场唯一的主操作：强调色实底 + **近黑字**（--bg-app，值即 #0D0D0E，与外壳同源）。
+ * 白字 #FFFFFF on #4795FF 只有 2.99:1，不合格；近黑字 6.49:1。
+ * ⚠️ 不要为了这个按钮去压暗 --accent：它还要给选中描边与焦点环用。
+ */
 .import-btn {
   display: flex; align-items: center; gap: 5px;
   height: 26px; padding: 0 10px;
   border-radius: 7px;
-  border: 1px solid var(--border-soft);
-  background: transparent;
-  color: var(--text-2);
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--bg-app);
   font-size: 12px; font-family: var(--font);
+  font-weight: 600;
   cursor: pointer;
+  transition: box-shadow 0.12s ease, filter 0.12s ease;
 }
-.import-btn:hover { background: var(--bg-hover); color: var(--text-1); border-color: #5A8AC9; }
+.import-btn:hover { box-shadow: 0 0 0 2px var(--accent-soft); filter: brightness(1.06); }
 .import-btn svg { width: 11px; height: 11px; }
 
 /* 网格卡片真实缩略图 */
@@ -677,7 +916,8 @@ mark {
   width: 100%; height: 100%;
   object-fit: cover;
   display: block;
-  background: var(--bg-hover, #2A2D31);
+  /* 图片没铺满前的衬底 = 媒体衬底（原来借的是 --bg-hover，那是个悬停叠加层，不该当背景色用） */
+  background: var(--bg-media);
 }
 /* 悬停时缩略图轻微放大，作为「鼠标在这一张上」的直观反馈 */
 .card:hover .thumb-img { transform: scale(1.07); }
@@ -698,7 +938,7 @@ mark {
   color: var(--text-2); font-size: 12px;
 }
 .list-row:hover { background: var(--bg-hover); }
-.list-row.selected { background: rgba(90,138,201,0.18); color: var(--text-1); }
+.list-row.selected { background: var(--accent-soft); color: var(--text-1); }
 .list-icon { width: 20px; text-align: center; }
 .list-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-1); }
 .list-dim { width: 110px; color: var(--text-3); }
@@ -718,9 +958,10 @@ mark {
 /* 评分星与喜欢按钮可交互 */
 .stars { display: flex; gap: 2px; }
 .star { width: 14px; height: 14px; cursor: pointer; color: var(--text-3); }
-.star.on { color: #E8B04B; }
+/* 评分点亮 / 「喜欢」点亮：都归到强调色（预览页里 accent 的职责就是「选中 · 评分」） */
+.star.on { color: var(--accent); }
 .heart-btn { cursor: pointer; color: var(--text-3); background: none; border: none; padding: 2px; display: flex; }
-.heart-btn.on { color: #D98F7F; }
+.heart-btn.on { color: var(--accent); }
 .tag-chip { cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
 .tag-chip .tag-dot { width: 7px; height: 7px; border-radius: 50%; }
 
@@ -731,7 +972,8 @@ mark {
   /* contain：完整显示、不裁剪，比例与容器一致时正好铺满 */
   object-fit: contain;
   display: block;
-  background: var(--bg-hover, #2A2D31);
+  /* 同 .thumb-img：衬底用媒体衬底，不再借用悬停叠加层 */
+  background: var(--bg-media);
   /*
    * 与外框**同心**的圆角：内圆角 = 外圆角 − 内缩量 = 14 − (1 边框 + 4 padding) = 9。
    * 直接照抄 14px 会让图片的弧比外框更「急」、四角看着不贴合；
@@ -753,7 +995,8 @@ mark {
   position: relative;
   height: 100vh;
   display: flex; align-items: center; justify-content: center;
-  background: var(--bg-base, #242629);
+  /* 原来是 var(--bg-base, #242629) —— --bg-base 从未定义过，等于写死了旧画布色 */
+  background: var(--bg-app);
   -webkit-app-region: drag;
 }
 .welcome button, .welcome input { -webkit-app-region: no-drag; }
@@ -772,14 +1015,16 @@ mark {
   width: 380px;
   padding: 36px 32px 28px;
   border-radius: 14px;
-  background: var(--bg-panel, #2A2D31);
-  border: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
   text-align: center;
 }
+/* logo 的圆点/线条取外壳色（CSS 里给 color，SVG 用 currentColor 取用） */
 .w-logo {
   width: 44px; height: 44px; margin: 0 auto 14px;
   border-radius: 12px;
-  background: #E8B04B;
+  background: var(--accent);
+  color: var(--bg-app);
   display: flex; align-items: center; justify-content: center;
 }
 .w-logo svg { width: 24px; height: 24px; }
@@ -796,8 +1041,13 @@ mark {
   cursor: pointer;
 }
 .w-btn:hover { background: var(--bg-hover); }
-.w-btn.primary { background: #5A8AC9; border-color: #5A8AC9; color: #fff; }
-.w-btn.primary:hover { background: #4A7AB9; }
+/*
+ * 主操作 = 强调色实底 + **近黑字**（用 --bg-app，与外壳同源，不引入新色值）。
+ * 白字在 #4795FF 上只有 2.99:1，不合格；近黑字是 6.49:1。
+ * 悬停不再换一个蓝色，改成提亮 + 一圈 accent-soft 光环。
+ */
+.w-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg-app); font-weight: 600; }
+.w-btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.06); box-shadow: 0 0 0 2px var(--accent-soft); }
 .w-btn.small { height: 28px; padding: 0 12px; font-size: 11px; }
 .w-new { margin-top: 16px; text-align: left; display: flex; flex-direction: column; gap: 8px; }
 .w-new label { font-size: 11px; color: var(--text-3); }
@@ -805,13 +1055,13 @@ mark {
   height: 30px; padding: 0 10px;
   border-radius: 8px;
   border: 1px solid var(--border-soft);
-  background: var(--bg-input, #1D1F22);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 12px; font-family: var(--font);
   outline: none;
 }
-.w-new input:focus { border-color: #5A8AC9; }
-.w-err { margin-top: 10px; color: #D98F7F; font-size: 11px; }
+.w-new input:focus { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-soft); }
+.w-err { margin-top: 10px; color: var(--danger); font-size: 11px; }
 .w-recent { margin-top: 20px; text-align: left; }
 .w-label { font-size: 11px; color: var(--text-3); margin-bottom: 6px; }
 .w-recent-item {
@@ -829,7 +1079,7 @@ mark {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* 导入进度浮层 */
+/* 导入进度浮层（底层 scrim 是遮罩，保留半透明黑） */
 .import-overlay {
   position: fixed; inset: 0;
   background: rgba(0,0,0,0.35);
@@ -840,12 +1090,12 @@ mark {
   width: 320px;
   padding: 20px 22px;
   border-radius: 12px;
-  background: var(--bg-panel, #2A2D31);
-  border: 1px solid var(--border-soft);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
 }
 .import-title { font-size: 13px; color: var(--text-1); margin-bottom: 12px; }
-.import-bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,0.08); overflow: hidden; }
-.import-fill { height: 100%; background: #5A8AC9; border-radius: 3px; transition: width 0.15s; }
+.import-bar { height: 6px; border-radius: 3px; background: var(--bg-hover); overflow: hidden; }
+.import-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width 0.15s; }
 .import-meta { margin-top: 8px; font-size: 11px; color: var(--text-3); text-align: right; }
 
 /* 轻提示条（导入结果 / 批量操作回执）
@@ -871,8 +1121,14 @@ mark {
   cursor: pointer;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
 }
-.notice-toast.info { background: #31404F; color: #C9D7E2; }
-.notice-toast.error { background: #52322C; color: #F2C4B4; border: 1px solid #7A4A3E; }
+/* 提示条只有两种语气：中性（浮层色）与危险（危险色淡染 + 危险色描边）。
+   半透明淡染用 color-mix 从 --danger 派生，不另写死一份红。 */
+.notice-toast.info { background: var(--bg-raised); color: var(--text-1); border: 1px solid var(--border); }
+.notice-toast.error {
+  background: color-mix(in srgb, var(--danger) 16%, var(--bg-raised));
+  color: var(--text-1);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+}
 .thumb-img { transition: opacity 0.2s ease, transform 0.28s cubic-bezier(0.22, 0.61, 0.36, 1); }
 .detail-img { transition: opacity 0.2s ease; }
 
@@ -887,7 +1143,7 @@ mark {
   width: 280px;
   padding: 6px;
   border-radius: 10px;
-  background: var(--bg-raised, #2E3134);
+  background: var(--bg-raised);
   border: 1px solid var(--border-soft);
   box-shadow: 0 10px 32px rgba(0,0,0,0.45);
   z-index: 95;
@@ -905,9 +1161,10 @@ mark {
 }
 .lib-menu-item:hover:not(:disabled) { background: var(--bg-hover); }
 .lib-menu-item:disabled { opacity: 0.55; cursor: default; }
-.lib-menu-item.current { background: rgba(90,138,201,0.14); }
+.lib-menu-item.current { background: var(--accent-soft); }
 .lm-name { color: var(--text-1); font-size: 12px; }
-.lm-check { color: #7FB069; }
+/* 当前库的对勾：用强调色（「当前选中」在本项目里统一由 accent 表达） */
+.lm-check { color: var(--accent); }
 .lm-path {
   color: var(--text-3); font-size: 10px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -921,13 +1178,13 @@ mark {
   height: 28px; padding: 0 9px;
   border-radius: 7px;
   border: 1px solid var(--border-soft);
-  background: var(--bg-input, #1D1F22);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 12px; font-family: var(--font);
   outline: none;
 }
-.lib-menu-new input:focus { border-color: #5A8AC9; }
-.lib-menu-err { padding: 4px 9px 2px; color: #D98F7F; font-size: 11px; }
+.lib-menu-new input:focus { border-color: var(--accent-border); }
+.lib-menu-err { padding: 4px 9px 2px; color: var(--danger); font-size: 11px; }
 
 /* 管理库视图 */
 .lib-manage-item {
@@ -972,10 +1229,22 @@ mark {
 /* 加粗只用于「不会删除你的文件」这句关键承诺：提亮到正文色即可，不用彩色强调 */
 .lc-text b { color: var(--text-1); }
 .lc-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
-.w-btn.danger { background: #8A4638; border-color: #8A4638; color: #fff; }
-.w-btn.danger:hover:not(:disabled) { background: #9A5648; }
-.w-btn.danger-strong { border-color: #6B4640; color: #D98F7F; }
-.w-btn.danger-strong:hover:not(:disabled) { background: #52322C; color: #F2C4B4; }
+/*
+ * 危险动作三档（全项目统一）：
+ *   ① 实底（danger）  ：--danger 底 + 近黑字 --bg-app。白字在 #F0705E 上只有 2.92:1，近黑字 6.65:1。
+ *   ② 淡染（hover）   ：从 --danger 用 color-mix 派生 14% 底，不另写一份暗红。
+ *   ③ 描边（strong）  ：透明底 + 40% 危险色描边 + 危险色文字。
+ */
+.w-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--bg-app); }
+.w-btn.danger:hover:not(:disabled) { filter: brightness(1.07); }
+.w-btn.danger-strong {
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+.w-btn.danger-strong:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--text-1);
+}
 .w-btn:disabled { opacity: 0.45; cursor: default; }
 .inline-hint { margin-top: 4px; font-size: 10px; color: var(--text-3); padding-left: 2px; }
 
@@ -1009,7 +1278,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   gap: 8px;
   padding: 4px 10px 4px 4px;
   border-radius: 9px;
-  background: rgba(46, 49, 52, 0.97);
+  background: var(--bg-raised);
   border: 1px solid var(--accent);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
   pointer-events: none;
@@ -1030,22 +1299,49 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 
 /* ============ 底部悬浮批量操作条 ============ */
+/*
+ * ⚠️ 这个条子的宽度必须**自己兜住**，不能靠 .gallery 溢出显示。
+ * 它原本是 `left:50% + translateX(-50%)` 的自动宽度（实测内容宽 615px），
+ * 而中间板在 960 最小窗口下只有 492px —— 以前之所以"看得见"，是因为 .gallery 没有 overflow，
+ * 条子直接溢到右栏上去（难看但能读能点）。本轮给 .gallery 加了 overflow:hidden（圆角需要），
+ * 于是它被硬裁在面板边界：「已选 N 项」整段消失、「取消选择」只剩半个「取」且点不到（QA 实测）。
+ * 所以：max-width 兜住宽度 + flex-wrap 换成多行。窄窗下条子变高，
+ * 下面那条 @media 同步抬高浮标与网格底部留白。
+ */
 .batchbar {
   position: absolute;
   left: 50%;
   bottom: 18px;
   transform: translateX(-50%);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  height: 44px;
-  padding: 0 12px;
+  justify-content: center;
+  column-gap: 8px;
+  row-gap: 6px;
+  /*
+   * 单行高度必须仍然是 44：`.to-top.with-batchbar` 的让位、`--smoke-m4` 的 h13 几何断言
+   * 都按 44 算。28(按钮内容) + 7*2(上下内边距) + 2(边框) = 44，正好。
+   */
+  min-height: 44px;
+  padding: 7px 12px;
+  /*
+   * ⚠️ 必须显式 `width: max-content`。这是绝对定位 + `left:50%` + 自动宽度的坑：
+   * 自动宽度会按「容器宽 − left」= **面板的一半**做 shrink-to-fit（962 窗口下只有 246px），
+   * 于是条子被挤成三行、还把内容折成竖排。要的是「按内容宽，但不超过面板」。
+   */
+  width: max-content;
+  /* 上限 = 面板宽 − 两侧各 12，两边永远留一条缝，不再被裁 */
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
   border-radius: 12px;
-  background: rgba(46, 49, 52, 0.96);
+  /* 浮层色（--bg-raised）：它是压在网格上的一块托盘，不能是半透明黑——那会随底下的图变色 */
+  background: var(--bg-raised);
   border: 1px solid var(--border);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(10px);
   z-index: 40;
+  /* 单个按钮内部的文字仍不许折行；换行只发生在"整件"之间 */
   white-space: nowrap;
 }
 .bb-count { font-size: 12px; color: var(--text-2); }
@@ -1073,8 +1369,10 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .bb-btn svg { width: 13px; height: 13px; }
 .bb-btn:hover { background: var(--bg-hover); color: var(--text-1); }
-.bb-btn.on { color: #D98F7F; background: rgba(217, 143, 127, 0.12); }
-.bb-btn.danger:hover { background: #52322C; color: #F2C4B4; }
+/* 「喜欢」已开启：走强调色（本项目里「已开启 / 已选中」统一由 accent 表达） */
+.bb-btn.on { color: var(--text-1); background: var(--accent-soft); }
+/* 批量删除：悬停变成危险实底 + 近黑字（与 .w-btn.danger 同一档） */
+.bb-btn.danger:hover { background: var(--danger); color: var(--bg-app); }
 .bb-btn.ghost { color: var(--text-3); font-size: 11px; }
 .bb-btn.ghost:hover { color: var(--text-1); }
 
@@ -1090,7 +1388,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   min-width: 124px;
   padding: 5px;
   border-radius: 9px;
-  background: var(--bg-raised, #2E3134);
+  background: var(--bg-raised);
   border: 1px solid var(--border);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
   z-index: 110;
@@ -1115,7 +1413,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   white-space: nowrap;
 }
 .chip-menu-item:hover { background: var(--bg-hover); color: var(--text-1); }
-.chip-menu-item.on { color: var(--accent); background: var(--accent-soft); }
+.chip-menu-item.on { color: var(--text-1); background: var(--accent-soft); }
 /* 评分项：星星用 --accent（金），未点亮的用描边灰，跟详情页星级一致 */
 .chip-menu-item .cmi-stars { display: inline-flex; align-items: center; gap: 1px; }
 .chip-menu-item .cmi-star { width: 11px; height: 11px; color: var(--accent); flex-shrink: 0; }
@@ -1129,7 +1427,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   width: 212px;
   padding: 6px;
   border-radius: 10px;
-  background: var(--bg-raised, #2E3134);
+  background: var(--bg-raised);
   border: 1px solid var(--border);
   box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
   z-index: 110;
@@ -1158,8 +1456,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .ctx-item svg { width: 13px; height: 13px; flex-shrink: 0; }
 .ctx-item:hover { background: var(--bg-hover); color: var(--text-1); }
-.ctx-item.danger { color: #D98F7F; }
-.ctx-item.danger:hover { background: #52322C; color: #F2C4B4; }
+.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--text-1); }
 .ctx-sep { height: 1px; background: var(--border-soft); margin: 5px 2px; }
 .ctx-confirm { padding: 4px 4px 2px; display: flex; flex-direction: column; gap: 6px; }
 .ctx-confirm-text { font-size: 12px; color: var(--text-1); padding: 0 4px; }
@@ -1174,10 +1472,17 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
 }
 .ctx-confirm-btn:hover { background: var(--bg-hover); }
-.ctx-confirm-btn.danger { background: #8A4638; border-color: #8A4638; color: #fff; }
-.ctx-confirm-btn.danger:hover { background: #9A5648; }
-.ctx-confirm-btn.danger-strong { background: transparent; border-color: #6B4640; color: #D98F7F; }
-.ctx-confirm-btn.danger-strong:hover { background: #52322C; color: #F2C4B4; }
+.ctx-confirm-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--bg-app); }
+.ctx-confirm-btn.danger:hover { filter: brightness(1.07); }
+.ctx-confirm-btn.danger-strong {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+  color: var(--danger);
+}
+.ctx-confirm-btn.danger-strong:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--text-1);
+}
 
 /* ============ 通用弹窗（移动 / 删除确认） ============ */
 .modal-mask {
@@ -1191,7 +1496,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   max-width: calc(100vw - 48px);
   padding: 18px 20px 16px;
   border-radius: 12px;
-  background: var(--bg-panel, #2C2E31);
+  background: var(--bg-panel);
   border: 1px solid var(--border);
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
 }
@@ -1209,7 +1514,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
 }
 .move-row:hover { background: var(--bg-hover); color: var(--text-1); }
-.move-row.on { background: var(--accent-soft); color: var(--accent); }
+.move-row.on { background: var(--accent-soft); color: var(--text-1); }
 .move-indent { flex-shrink: 0; }
 .move-icon { display: flex; flex-shrink: 0; opacity: 0.75; }
 .move-icon svg { width: 14px; height: 14px; }
@@ -1240,10 +1545,11 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   transition: background 0.15s ease, color 0.15s ease, bottom 0.16s ease;
 }
 .to-top svg { width: 17px; height: 17px; }
-.to-top:hover { background: #43474C; color: var(--text-1); }
+/* 悬停提亮一档：以浮层色为基色往上混一点一级文字色（不用写死的 #43474C） */
+.to-top:hover { background: color-mix(in srgb, var(--text-1) 12%, var(--bg-raised)); color: var(--text-1); }
 .to-top:active { transform: translateY(1px); }
-/* 批量条是 left:50% 居中（bottom:18px、高 44px），窗口一窄就会和右下角的浮标撞上，
-   所以它在场时把浮标抬到它上方 */
+/* 批量条是 left:50% 居中（bottom:18px、单行高 44px），窗口一窄就会和右下角的浮标撞上，
+   所以它在场时把浮标抬到它上方：18 + 44 + 12 = 74 */
 .to-top.with-batchbar { bottom: 74px; }
 /* 只做纵向位移。BatchBar 用的 .raise 里带 translate(-50%)（那是给它居中定位配的），
    浮标靠 right 定位，照搬会在出现/消失时横向跳一下。 */
@@ -1253,8 +1559,22 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* 浮标会盖住最后一行卡片的右下角，给它让出位置。
    批量条的 84px 更大且写在后面 —— 两个类同时命中时按它生效，不叠加。 */
 .grid-wrap.has-totop { padding-bottom: 76px; }
-/* 悬浮条出现时给列表底部让出空间，避免最后一行被压住 */
+/* 悬浮条出现时给列表底部让出空间，避免最后一行被压住：18 + 44 + 22 = 84 */
 .grid-wrap.has-batchbar { padding-bottom: 84px; }
+/*
+ * 批量条会换行的窗口区间。
+ * 条子内容宽 615，`max-width = 面板宽 − 24`、面板宽 = 窗宽 − 468 →
+ * 窗宽 < 615 + 24 + 468 = 1107 时它就从单行变成两行（实测 962/1000/1080/1100 都是 2 行、高 78）。
+ *   浮标：18 + 78 + 12 = 108；网格留白：18 + 78 + 22 = 118
+ */
+@media (max-width: 1107px) {
+  .to-top.with-batchbar { bottom: 108px; }
+  .grid-wrap.has-batchbar { padding-bottom: 118px; }
+}
+/* 窄窗批量条会换行：竖分隔线这时会落在行首/行尾像根多余的竖杠，直接隐掉，靠行距分组 */
+@media (max-width: 1200px) {
+  .bb-div { display: none; }
+}
 /* 评分「混合」提示（选中项评分不一致时才出现） */
 .bb-mixed, .ctx-mixed { font-size: 10px; color: var(--text-3); margin-left: 2px; }
 
@@ -1267,13 +1587,13 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 8px 0 0 8px;
   border: 1px solid var(--border-soft);
   border-right: 0;
-  background: var(--bg-input, #1D1F22);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 12.5px; font-family: var(--font);
   outline: none;
   user-select: text;
 }
-.rename-input:focus { border-color: #5A8AC9; }
+.rename-input:focus { border-color: var(--accent-border); }
 .rename-ext {
   display: flex; align-items: center;
   height: 32px; padding: 0 10px;
@@ -1298,7 +1618,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .note-copy svg { width: 12px; height: 12px; }
 .note-copy:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-1); }
 .note-copy:disabled { opacity: 0.35; cursor: default; }
-.note-copy.ok { color: #6FBF87; }
+/* 复制成功的短暂反馈：走强调色（同一套「正向确认」语言） */
+.note-copy.ok { color: var(--accent); }
 /* 只读预览：文字可选可复制，但双击才进编辑（避免误触改内容） */
 .note-view {
   font-size: 11.5px; line-height: 1.6;
@@ -1322,8 +1643,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   resize: vertical;
   padding: 8px 10px;
   border-radius: 7px;
-  border: 1px solid #5A8AC9;
-  background: var(--bg-input, #1D1F22);
+  border: 1px solid var(--accent-border);
+  background: var(--bg-input);
   color: var(--text-1);
   font-size: 11.5px; line-height: 1.6; font-family: var(--font);
   outline: none;
@@ -1336,7 +1657,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   position: fixed; inset: 0;
   z-index: 60;
   display: flex; align-items: center; justify-content: center;
-  background: rgba(36, 38, 41, 0.68);
+  /* 全屏压暗：由外壳色派生（原来写死的 rgba(36,38,41,.68) 是旧画布色，永远不会跟着主题走） */
+  background: color-mix(in srgb, var(--bg-app) 70%, transparent);
   pointer-events: none;
 }
 .dh-inner {
@@ -1345,7 +1667,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 12px;
   border: 1px dashed var(--accent-border);
   background: var(--accent-soft);
-  color: var(--accent);
+  /* 底被强调色染过 → 小字用 --text-1（--accent 在这层上只有 3.97:1） */
+  color: var(--text-1);
   font-size: 13px;
 }
 .dh-inner svg { width: 20px; height: 20px; }
@@ -1361,16 +1684,21 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   height: 520px;
   max-height: calc(100vh - 72px);
   border-radius: 13px;
-  background: var(--bg-panel, #2C2E31);
+  background: var(--bg-panel);
   border: 1px solid var(--border);
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
   overflow: hidden;
 }
+/*
+ * 左分组导航：原来是 --bg-canvas（旧配色里它比面板暗）。
+ * 新配色里 --bg-canvas 是「比面板更亮的中间板」，照抄会让导航条比设置面板的正文区还亮 ——
+ * 语义反了。这里要的是「比面板更沉一档的凹槽」，所以用 --bg-app（外壳色）。
+ */
 .sp-nav {
   width: 168px;
   flex: 0 0 168px;
   padding: 12px 8px;
-  background: var(--bg-canvas);
+  background: var(--bg-app);
   border-right: 1px solid var(--border-soft);
   overflow-y: auto;
 }
@@ -1494,7 +1822,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   transition: transform 0.16s ease, background 0.16s ease;
 }
 .sp-sw.on { background: var(--accent); }
-.sp-sw.on i { transform: translateX(16px); background: #fff; }
+.sp-sw.on i { transform: translateX(16px); background: var(--text-1); }
 
 .sp-danger {
   display: flex;
@@ -1519,8 +1847,14 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
 }
 .sp-btn:hover { background: var(--bg-hover); color: var(--text-1); }
-.sp-btn.danger { color: #E4826A; border-color: rgba(228, 130, 106, 0.4); }
-.sp-btn.danger.armed { background: rgba(228, 130, 106, 0.15); color: #F0997B; }
+.sp-btn.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+.sp-btn.danger.armed {
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--text-1);
+}
 
 /* 关于：键值表 + 说明块 + 底部按钮 */
 .sp-kv {
@@ -1628,7 +1962,9 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   box-shadow: inset 0 0 0 1px rgba(159, 225, 203, 0.55);
   pointer-events: none;
 }
-/* 列表视图里没有缩略图，角标无处可放，退化成一行小字 */
+/* 列表视图里没有缩略图，角标无处可放，退化成一行小字。
+   ⚠️ #9FE1CB 是「AI 来源」的**语义标识色**（与卡片角标上那圈青色描边同源），刻意不通主题化：
+      按本项目的语义，accent 只表示「选中 / 主操作」，把 AI 也染成蓝会把这个信号冲淡。 */
 .list-ai {
   flex: 0 0 auto;
   font-size: 10px; line-height: 1;
@@ -1658,23 +1994,23 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   font-size: 12.5px; color: var(--text-1);
 }
 .cp-sub { font-size: 11px; color: var(--text-3); }
-/* 后果说明用暖色底：这是本项目唯一「改掉用户原文件内容」的操作 */
+/* 后果说明用危险色淡染底：这是本项目唯一「改掉用户原文件内容」的操作（淡染由 --danger 派生） */
 .cp-warn {
   margin-top: 12px;
   padding: 9px 11px;
   border-radius: 8px;
-  background: rgba(228, 130, 106, 0.09);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
   font-size: 11.5px; line-height: 1.72;
   color: var(--text-3);
 }
-.cp-warn strong { color: #E4826A; font-weight: 500; }
+.cp-warn strong { color: var(--danger); font-weight: 500; }
 .cp-prog-name {
   margin-bottom: 8px;
   font-size: 12.5px; color: var(--text-1);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .cp-prog-bar { height: 6px; border-radius: 999px; background: var(--bg-hover); overflow: hidden; }
-.cp-prog-bar i { display: block; height: 100%; background: #5A8AC9; transition: width 0.2s ease; }
+.cp-prog-bar i { display: block; height: 100%; background: var(--accent); transition: width 0.2s ease; }
 .cp-prog-sub {
   margin-top: 8px;
   font-size: 11.5px; color: var(--text-3);

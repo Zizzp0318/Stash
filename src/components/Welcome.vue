@@ -53,8 +53,8 @@ async function createNew(): Promise<void> {
     <div class="w-card">
       <div class="w-logo">
         <svg viewBox="0 0 12 12" fill="none">
-          <circle cx="6" cy="6" r="2.2" fill="#242629" />
-          <path d="M6 0.5v2.4M6 9.1v2.4M0.5 6h2.4M9.1 6h2.4" stroke="#242629" stroke-width="1.3" stroke-linecap="round" />
+          <circle cx="6" cy="6" r="2.2" fill="currentColor" />
+          <path d="M6 0.5v2.4M6 9.1v2.4M0.5 6h2.4M9.1 6h2.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
         </svg>
       </div>
       <h1>Stash · 素材库</h1>
