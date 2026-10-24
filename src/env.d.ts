@@ -333,6 +333,8 @@ export interface StashSettings {
   viewZoom: number
   cardFields: StashCardFields
   detailCollapsed: boolean
+  /** 点关闭按钮（×）时隐藏到系统托盘而不是退出；false = 直接关闭。默认 true */
+  closeToTray: boolean
   /**
    * 左侧栏宽度（px）—— 用户拖分隔条改的就是它。
    * 这是**用户意图宽度**：窗口太窄时实际渲染宽度会被 `maxForWindow()` 收窄，

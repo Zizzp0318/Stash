@@ -52,6 +52,7 @@ const FALLBACK: StashSettings = {
   viewZoom: VIEW_ZOOM_DEFAULT,
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
+  closeToTray: true,
   sidebarWidth: SIDEBAR_W_DEFAULT,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
@@ -111,6 +112,7 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
     viewZoom: zoom,
     cardFields: cf,
     detailCollapsed: src.detailCollapsed === true,
+    closeToTray: src.closeToTray !== false,
     sidebarWidth,
     thumbs: {
       concurrency: Number.isFinite(conc) ? Math.round(conc) : FALLBACK.thumbs.concurrency,

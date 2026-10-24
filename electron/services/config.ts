@@ -20,6 +20,8 @@ export interface Settings {
   cardFields: { name: boolean; dims: boolean; size: boolean; time: boolean; typeBadge: boolean; aiBadge: boolean }
   /** 右侧信息栏默认收起 */
   detailCollapsed: boolean
+  /** 点关闭按钮（×）时隐藏到系统托盘而不是退出；false = 直接关闭。默认 true */
+  closeToTray: boolean
   /**
    * 左侧栏宽度（px）。用户拖分隔条改的就是它。
    * 合法区间见 SIDEBAR_WIDTH_MIN/MAX 的注释（唯一定义在渲染层，这里只做落盘前的兜底）。
@@ -87,6 +89,7 @@ export const DEFAULT_SETTINGS: Settings = {
   viewZoom: 170,
   cardFields: { name: true, dims: true, size: true, time: true, typeBadge: true, aiBadge: true },
   detailCollapsed: false,
+  closeToTray: true,
   sidebarWidth: 198,
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
@@ -174,6 +177,9 @@ export function sanitizeSettings(raw: unknown): Settings {
     viewZoom: typeof r.viewZoom === 'number' && Number.isFinite(r.viewZoom) ? Math.round(r.viewZoom) : d.viewZoom,
     cardFields: cf,
     detailCollapsed: r.detailCollapsed === true,
+    // 默认「开」（隐藏到托盘），与 importing 组同一判据：只有明确 false 才关，
+    // 否则老配置缺键会被判成关 → 升级后行为悄悄变了
+    closeToTray: r.closeToTray !== false,
     sidebarWidth,
     thumbs: {
       concurrency: Number.isFinite(conc)

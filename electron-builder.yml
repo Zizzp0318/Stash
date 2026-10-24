@@ -20,6 +20,9 @@ npmRebuild: false
 files:
   - out/**
   - package.json
+  # 托盘图标：主进程从 <asar>/build/icon.ico 读（dev 时是项目 build/），没它托盘建不出来
+  - build/icon.ico
+  - build/icon.png
   - '!**/*.map'
   - '!**/{.workbuddy,.git,scripts}/**'
   - '!开发文档.md'

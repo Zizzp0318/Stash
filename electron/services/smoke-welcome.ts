@@ -19,7 +19,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { closeCurrent, createLibrary, getLibrary, openLibrary } from './library'
 import { isWatching, unwatchLibrary } from './watcher'
-import { addRecentLibrary } from './config'
+import { addRecentLibrary, patchSettings } from './config'
 import { SCHEMA_VERSION } from './db'
 
 function sleep(ms: number): Promise<void> {
@@ -458,17 +458,29 @@ export async function runSmokeWelcome(win: BrowserWindow): Promise<void> {
     const qaBootAfterFail = (await rawJs(`${pinia}.bootError`)) as string
     R.lib_QBootRev = { qaBootRevSet, qaFailOpen, qaBootAfterFail }
 
-    // —— 真实点击：关闭（必须是最后一步，窗口会销毁）——
+    // —— 真实点击：关闭（两段契约：默认偏好「最小化到托盘」= 隐藏；关掉偏好后才是真关闭）——
+    // 必须是最后一步：(b) 会销毁窗口
     const pClose = await elPoint('.welcome .win-controls .wc-btn[data-wc="close"]')
-    const closed = new Promise<boolean>((resolve) => {
+    let closedFlag = false
+    win.once('closed', () => {
+      closedFlag = true
+    })
+    if (pClose) click(pClose.x, pClose.y)
+    // (a) 偏好默认开：× 应当把窗口藏进托盘 —— 活着、不可见、未销毁
+    await new Promise((r) => setTimeout(r, 800))
+    R.close = { clicked: !!pClose, hidden: !win.isVisible(), closed: closedFlag, destroyed: win.isDestroyed() }
+
+    // (b) 偏好关掉后：× 必须真的关闭（走与按钮相同的 close 事件路径）
+    patchSettings({ closeToTray: false })
+    win.close()
+    const closedB = new Promise<boolean>((resolve) => {
       const t = setTimeout(() => resolve(false), 5000)
       win.once('closed', () => {
         clearTimeout(t)
         resolve(true)
       })
     })
-    if (pClose) click(pClose.x, pClose.y)
-    R.close = { clicked: !!pClose, closed: await closed, destroyed: win.isDestroyed() }
+    R.closeAfterOptOut = { closed: await closedB, destroyed: win.isDestroyed() }
 
     // ==================== 断言 ====================
     const v = R.view as Record<string, unknown>
@@ -483,7 +495,8 @@ export async function runSmokeWelcome(win: BrowserWindow): Promise<void> {
     const nBack = R.afterRestore as { minimized: boolean; destroyed: boolean; stillWelcome: boolean }
     const nMax = R.maximize as { maximized: boolean; destroyed: boolean }
     const nMax2 = R.unmaximize as { maximized: boolean }
-    const nClose = R.close as { clicked: boolean; closed: boolean; destroyed: boolean }
+    const nClose = R.close as { clicked: boolean; hidden: boolean; closed: boolean; destroyed: boolean }
+    const nCloseOpt = R.closeAfterOptOut as { closed: boolean; destroyed: boolean }
     const nNew = JSON.parse((R.newPanel as string) ?? '{"open":false}') as Record<string, boolean>
 
     // —— I5 schema 版本门控的断言输入 ——
@@ -552,8 +565,11 @@ export async function runSmokeWelcome(win: BrowserWindow): Promise<void> {
         (btns2[0]?.cx ?? 1e9) < (btns[0]?.cx ?? 0) &&
         (btns2[0]?.cy ?? -1) === (btns[0]?.cy ?? -2) &&
         btns2.every((b) => b.inViewport && b.hitSelf),
-      // 无边框窗口唯一的关闭途径：点了必须真的关掉
-      closeActuallyCloses: nClose.clicked === true && nClose.closed === true && nClose.destroyed === true,
+      // 关闭按钮的两段契约：偏好「最小化到托盘」开（默认）→ × 隐藏进托盘；
+      // 关掉偏好 → × 真关闭（无边框窗口唯一的关闭途径，必须有出路）
+      closeHidesToTray:
+        nClose.clicked === true && nClose.hidden === true && nClose.closed === false && nClose.destroyed === false,
+      closeActuallyClosesAfterOptOut: nCloseOpt.closed === true && nCloseOpt.destroyed === true,
       noJsErrors: jsErrors.length === 0,
 
       // —————————————— I5 库 schema 版本门控 ——————————————

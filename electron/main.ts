@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, protocol, shell, Tray, Menu, nativeImage } from 'electron'
 import { spawn } from 'child_process'
 import { join, dirname } from 'path'
 import { existsSync, readFileSync, rmSync, mkdirSync, mkdtempSync, writeFileSync, unlinkSync } from 'fs'
@@ -249,8 +249,14 @@ if (!isSmokeRun && !process.argv.includes(GPU_FALLBACK_FLAG)) {
   })
 }
 
+// 单实例：托盘常驻后再双击图标，应唤起已有窗口而不是开出第二个进程。
+// 必须在 userData 重定向**之后**请求 —— 锁按 userData 划分，冒烟各自的一次性目录互不相干。
+const gotLock = app.requestSingleInstanceLock()
+
 // M1 冒烟测试模式：electron . --smoke-m1
-if (process.argv.includes('--smoke-m1')) {
+if (!gotLock) {
+  app.quit()
+} else if (process.argv.includes('--smoke-m1')) {
   app.whenReady().then(() => runSmoke())
 } else if (process.argv.includes('--smoke-m2')) {
   app.whenReady().then(() => runSmokeM2())
@@ -664,6 +670,61 @@ function bootstrap(): void {
 
     win = createWindow()
     registerIpc()
+
+    // ==================== 托盘 + 关闭拦截 ====================
+    let forceQuit = false
+    app.on('before-quit', () => {
+      forceQuit = true
+    })
+
+    const showMain = (): void => {
+      if (win.isMinimized()) win.restore()
+      win.show()
+      win.focus()
+    }
+
+    // 托盘图标：优先 .ico（多尺寸），退回 .png；两者都没有就不建托盘，
+    // 并让「关闭 = 隐藏」自动失效 —— 没有托盘图标的隐藏等于把应用藏丢，找不回来。
+    let tray: Tray | null = null
+    const trayIco = join(__dirname, '../../build/icon.ico')
+    const trayPng = join(__dirname, '../../build/icon.png')
+    const trayIconPath = existsSync(trayIco) ? trayIco : existsSync(trayPng) ? trayPng : null
+    if (trayIconPath) {
+      try {
+        tray = new Tray(nativeImage.createFromPath(trayIconPath))
+        tray.setToolTip('Stash · 素材库')
+        tray.setContextMenu(
+          Menu.buildFromTemplate([
+            { label: '打开 Stash', click: showMain },
+            { type: 'separator' },
+            {
+              label: '退出',
+              click: () => {
+                forceQuit = true
+                app.quit()
+              }
+            }
+          ])
+        )
+        tray.on('double-click', showMain)
+      } catch (e) {
+        console.log('[tray ERR]', String(e))
+        tray = null
+      }
+    }
+
+    // 关闭拦截：偏好「最小化到托盘」开着 → 点 × 只是隐藏；托盘菜单「退出」或偏好关掉 → 真退。
+    // forceQuit 由 before-quit 置位 —— app.quit() 自己也会触发窗口 close 事件，不置位会被拦住。
+    // 托盘没建成（找不到图标）时也放行，绝不允许「应用在跑却无处可寻」。
+    win.on('close', (e) => {
+      if (!forceQuit && configSvc.getSettings().closeToTray && tray) {
+        e.preventDefault()
+        win.hide()
+      }
+    })
+
+    // 第二实例：唤起已有窗口
+    app.on('second-instance', showMain)
 
     // M4 冒烟：建临时库 → 导入 → 驱动渲染层跑完多选与批量操作 → 核对磁盘/数据库
     if (process.argv.includes('--smoke-m4')) {

@@ -349,6 +349,10 @@ function toggleDetailCollapsed(): void {
   void settings.patch({ detailCollapsed: !s.value.detailCollapsed })
 }
 
+function toggleCloseToTray(): void {
+  void settings.patch({ closeToTray: !s.value.closeToTray })
+}
+
 async function onReset(): Promise<void> {
   if (!resetArmed.value) {
     resetArmed.value = true
@@ -515,6 +519,24 @@ async function copyDiagnostics(): Promise<void> {
                 data-sp-detail
                 :aria-checked="s.detailCollapsed"
                 @click="toggleDetailCollapsed"
+              >
+                <i></i>
+              </button>
+            </div>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">关闭按钮最小化到托盘</div>
+                <div class="sp-tip">点 × 隐藏到系统托盘（托盘右键可退出）；关掉后点 × 直接关闭软件</div>
+              </div>
+              <button
+                class="sp-sw"
+                :class="{ on: s.closeToTray }"
+                type="button"
+                role="switch"
+                data-sp-tray
+                :aria-checked="s.closeToTray"
+                @click="toggleCloseToTray"
               >
                 <i></i>
               </button>
