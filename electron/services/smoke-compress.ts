@@ -22,6 +22,7 @@ import { closeCurrent, createLibrary, mkdirRel, requireCurrent } from './library
 import { importFiles } from './importer'
 import { getSettings, patchSettings, type Settings } from './config'
 import { compressAssets, type CompressSummary } from './compress'
+import { unwatchLibrary } from './watcher'
 
 interface Check { name: string; pass: boolean; detail?: string }
 
@@ -578,6 +579,11 @@ export async function runSmokeCompress(win: BrowserWindow): Promise<void> {
     try {
       closeCurrent()
     } catch { /* 库已经关了 */ }
+    // ⚠️ 删临时目录前先停 chokidar（与 smoke4 同一条纪律）：它还持有库目录句柄，
+    // Windows 上会让 rmSync 抛 ENOTEMPTY/EPERM，临时库就永远留在临时目录里。
+    try {
+      unwatchLibrary()
+    } catch { /* 本来就没在监听 */ }
     if (dir) {
       try {
         rmSync(dir, { recursive: true, force: true })
@@ -585,6 +591,24 @@ export async function runSmokeCompress(win: BrowserWindow): Promise<void> {
     }
     const failed = checks.filter((c) => !c.pass)
     console.log('[SMOKE-COMPRESS] ' + JSON.stringify({ checks, failed, ok: failed.length === 0 }, null, 2))
+    /*
+     * ⚠️ 退出链（本轮实测诊断，过程记录在 QA 报告）：
+     *   只调 `app.exit(0)` 时进程整树吊死 —— 结果 JSON 打完 "ok": true 之后，
+     *   主线程停在 Chromium 收尾上等渲染 / GPU 子进程退出，而 chokidar 的 14 个
+     *   FSWatcher 句柄与存活窗口都还在，子进程不退、主进程 idle，只能靠外部
+     *   `timeout` 杀（exit=124，串行 CI 就断在这）。且这个状态下 `app.exit` 不返回，
+     *   它后面的任何语句、以及一切 setTimeout 都永远不会执行（t+500/t+2000 打点
+     *   全没打印）—— 所以「在 app.exit 后面挂定时器兜底」是无效的。
+     *   先 `win.destroy()` 把渲染层收掉，`app.exit` 就能正常走完退出流程。
+     *   `quit` 事件上的 process.exit(0) 是第二道保险：万一哪天又在 quit 前挂死，
+     *   quit 一到立刻硬退，不等 Chromium 原生收尾。
+     */
+    try {
+      win.destroy()
+    } catch { /* 窗口已经没了 */ }
+    app.once('quit', () => process.exit(0))
     app.exit(0)
+    // 理论不可达（app.exit 正常情况下不返回）；真返回了就同步补刀，不把退出交给运气
+    process.exit(0)
   }
 }
