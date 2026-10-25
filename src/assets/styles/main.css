@@ -474,6 +474,13 @@ mark {
   overflow-x: hidden;
   scrollbar-gutter: stable;
   /*
+   * `overflow-anchor: none` 不是可选项（虚拟滚动 D6/R2）：窗口化后任何一次重排
+   * （缩略图比例回写 / 列数变化 / 视图切换 / 字段开关）都由 `GalleryGrid` **手写**锚点恢复
+   * `scrollTop`。Chromium 自带的滚动锚定会在这之上再挪一次 → 出现「校正过头」的双倍位移。
+   * 两者只能留一个，留我们自己那份（它按素材 id 锚定，跨视图也成立）。
+   */
+  overflow-anchor: none;
+  /*
    * 上/左/右统一 16px：原来上 4、左右 16，首行卡片贴住分割线，看起来「上面挤、两边宽」。
    * 右边写 7 而不是 16：`scrollbar-gutter: stable` 会在内边距之外再常驻 9px 滚动条槽，
    * 7 + 9 = 16，卡片到右边缘的视觉距离才和左边一致（槽宽 9 是 Chromium 在本机的实测值）。
@@ -482,6 +489,8 @@ mark {
 }
 /* 瀑布视图：卡片绝对定位，行列尺寸由 GalleryGrid 的布局算法算出 */
 .masonry { position: relative; }
+/* 加载占位要绝对定位在内容底，所以 .list 也必须是定位锚点（它当前没有别的绝对定位子节点） */
+.list { position: relative; }
 .masonry .card { position: absolute; top: 0; left: 0; }
 .masonry .card .thumb { aspect-ratio: auto; }
 /*
@@ -959,7 +968,36 @@ mark {
 .empty-sub { color: var(--text-3); font-size: 11px; }
 /* 空态里的操作按钮（如「清除筛选」）：与上方文案拉开距离 */
 .empty .w-btn { margin-top: 10px; }
-.loading-tip { text-align: center; padding: 16px 0; color: var(--text-3); font-size: 11px; }
+
+/*
+ * 加载占位条（`.load-strip`）—— **绝对定位在内容底、绝不参与布局**。
+ *
+ * 它取代了从前的 `.loading-tip`（那个是普通流式元素）：
+ * 一旦进入布局，`scrollHeight` 就会随「正在加载 / 加载完」来回变，滚动条跟着抖；
+ * 而窗口化之后总高是由布局精确算出来的（`layout.total`），更不能被这个占位污染。
+ * 绝对定位的溢出只影响 `scrollHeight` 的瞬时值，且发生在用户视口**下方**，视觉上无位移。
+ * 高度写死 26px（= `GalleryGrid.LOAD_STRIP_H`），与 `top: layout.total` 的定位配合使用。
+ */
+.load-strip {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  font-size: 11px;
+  pointer-events: none;
+}
+
+/*
+ * 列表视图的上下占位块：窗口化后只渲染可见行，上下用两个定高空块把行「顶」到正确位置，
+ * 行本身仍走正常流 —— 这样 `.list-row` 的 flex 横排 / hover / 选中底色一行都不用改。
+ * `flex: none` 必不可少：`.list` 是 flex 容器，默认 `flex-shrink: 1` 会在空间不足时压缩占位块。
+ */
+.list-spacer { flex: none; }
+
 
 /* 评分星与喜欢按钮可交互 */
 .stars { display: flex; gap: 2px; }

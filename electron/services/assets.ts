@@ -34,6 +34,16 @@ export interface AssetQuery {
 const SORTABLE = new Set(['imported_at', 'name', 'size', 'rating'])
 
 /**
+ * 单次查询返回的**硬上限**。
+ *
+ * ⚠️ 渲染层 `stores/assets.ts` 的 `SERVER_LIST_LIMIT_MAX` 必须与它相等：那边传更大的 `limit`
+ * 会被这里静默截断，而 store 却以为拿全了（历史 bug：滚到 3000 条时外部一改，列表被砍到 1000 条）。
+ * 跨进程没有共享模块，靠这两处注释钉住 + `--smoke-vscroll` 的 R6 段回归。
+ */
+export const LIST_LIMIT_MAX = 1000
+
+
+/**
  * 转义 LIKE 的通配符 —— 实现在 `db.ts`（`escapeLike`），与 `watcher.ts` 的目录删除共用同一份
  * （不转义时：搜 `100%` 变成「以 100 开头」、搜 `a_b` 会匹配到 `axb`；删 `报告_2024/` 会把
  * `报告X2024/` 下的素材也标成 missing）。配套 SQL 必须写 `ESCAPE '\'`。
@@ -89,7 +99,7 @@ export function listAssets(q: AssetQuery): { total: number; items: unknown[] } {
 
   const sortCol = SORTABLE.has(q.sort ?? '') ? `a.${q.sort}` : 'a.imported_at'
   const order = q.order === 'asc' ? 'ASC' : 'DESC'
-  const limit = Math.min(q.limit ?? 200, 1000)
+  const limit = Math.max(0, Math.min(q.limit ?? 200, LIST_LIMIT_MAX))
   const offset = q.offset ?? 0
 
   const total = (db.prepare(`SELECT count(*) AS c FROM assets a ${whereSql}`).get(...params) as { c: number }).c

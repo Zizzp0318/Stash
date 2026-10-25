@@ -8,6 +8,16 @@ import type { StashAssetRow, StashAssetDetail, StashPrunedTag, StashCardFields }
 const PAGE = 200
 
 /**
+ * 服务端单次查询的**硬上限**（`electron/services/assets.ts` 的 `LIST_LIMIT_MAX`）。
+ *
+ * ⚠️ 这两个常量**必须相等**，而且这里只是「提前按上限钳一次」，绝不能更大 ——
+ * 一旦渲染层传 `limit` 超过服务端上限，服务端会**静默截断**（`Math.min(limit, 1000)`），
+ * 而 `assets.items` 却以为拿全了：表现为「滚到 3000 条时外部文件一变，列表被悄悄砍到 1000 条」。
+ * 跨进程没有共享模块，所以这一处靠注释钉住（`--smoke-vscroll` 的 R6 段有回归断言）。
+ */
+const SERVER_LIST_LIMIT_MAX = 1000
+
+/**
  * 工具栏上「显示字段」的快捷开关。
  * 注意它**不是** `settings.cardFields` 的全部：缩略图类型角标（typeBadge）也在偏好里，
  * 但它属于浮层装饰而不是卡片下方那行信息，所以只在设置面板里给 —— 工具栏留 4 个高频的。
@@ -42,35 +52,42 @@ export const useAssetStore = defineStore('assets', () => {
   const detail = ref<StashAssetDetail | null>(null)
 
   // —— 多选集合（批量操作的作用域）——
-  // 用数组而非 Set：组件里 isSelected 是热路径（每帧每卡一次），数组 includes 在
-  // 单页 200 项量级下开销可忽略，且替换式赋值能保证触发更新，不依赖 Set 的响应式代理
+  // 对外仍是数组（`selectedIds` 的类型与所有调用点都不变），但内部另存一份 Set 供查询：
+  // 网格里 `isSelected` 是热路径（每帧每卡一次），框选几千条时 `includes` 会退化成 O(n·m)。
+  // Set 由 computed 派生 —— `selectedIds` 每次替换式赋值都会让它重建，不存在「Set 落后」的窗口。
   const selectedIds = ref<number[]>([])
+  const selectedSet = computed(() => new Set(selectedIds.value))
   const selectedCount = computed(() => selectedIds.value.length)
   /** 选中项是否全部已喜欢（决定右键/悬浮条显示「设为喜欢」还是「取消喜欢」） */
   const selectedAllFav = computed(() => {
     if (!selectedIds.value.length) return false
-    const set = selectedIds.value
-    const list = items.value.filter((i) => set.includes(i.id))
+    const set = selectedSet.value
+    const list = items.value.filter((i) => set.has(i.id))
     return list.length > 0 && list.every((i) => i.is_fav === 1)
   })
   /** 选中项的公共评分：全部一致时返回该值，不一致返回 0（UI 另用 mixed 提示，避免被误读成「无评分」） */
   const selectedRating = computed(() => {
-    const set = selectedIds.value
-    const list = items.value.filter((i) => set.includes(i.id))
+    const set = selectedSet.value
+    const list = items.value.filter((i) => set.has(i.id))
     if (!list.length) return 0
     const first = list[0].rating
     return list.every((i) => i.rating === first) ? first : 0
   })
   /** 选中项评分是否存在分歧 */
   const selectedRatingMixed = computed(() => {
-    const set = selectedIds.value
-    const list = items.value.filter((i) => set.includes(i.id))
+    const set = selectedSet.value
+    const list = items.value.filter((i) => set.has(i.id))
     if (list.length < 2) return false
     return list.some((i) => i.rating !== list[0].rating)
   })
 
+  /**
+   * 某项是否在选中集合里。
+   * 走 Set（O(1)）而不是数组 `includes`（O(n)）：窗口化后调用次数已经降到 ~100/帧，
+   * 但框选几千条时仍然是 100×5000 量级，而这条改动对外 API 完全不变。
+   */
   function isSelected(id: number): boolean {
-    return selectedIds.value.includes(id)
+    return selectedSet.value.has(id)
   }
 
   // 导入浮层状态
@@ -248,29 +265,72 @@ export const useAssetStore = defineStore('assets', () => {
   const deepOpt = (): { folderDeep?: boolean } => (query.folderId != null ? { folderDeep: true } : {})
 
   /**
-   * 重新拉取当前查询的第一页。
+   * 重新拉取当前查询的列表。
    *
    * `opts.keepDepth`：外部改动触发的自动刷新会用到。默认（不传）取第一页 `PAGE` 条；
    * 传 keepDepth 且用户已经加载超过一页时，按**当前已加载的数量**重新取（offset 仍是 0），
    * 保住浏览深度 —— 否则用户滚到第 5 页时，外部一改就被弹回顶部，是很明显的打扰。
+   *
+   * ⚠️ 这里修掉了一个**既有 bug**（虚拟滚动的 R6）：服务端 `listAssets` 把 `limit` 钳在 1000，
+   * 而以前这里直接传 `items.length` —— 滚到 3000 条时外部文件一变，服务端**静默**返回 1000 条，
+   * `items` 凭空少掉 2000 条、`scrollTop` 被浏览器夹回上方（用户正看着第 3000 条，画面直接跳走）。
+   * 修法两层：
+   *   ① 单次请求的 `limit` 钳到 `SERVER_LIST_LIMIT_MAX`（与 `electron/services/assets.ts` 对齐）；
+   *   ② 深浏览（> 1000）按服务端上限**分页补齐**，把「已加载深度」真的还回来 ——
+   *      只钳不补的话列表照样会缩水，只是缩到 1000 而不是 3000，用户看到的仍是同一个 bug。
+   *   渲染层另有兜底：`GalleryGrid` 的布局 watcher 会按「锚点 id」恢复滚动位置，
+   *   锚点不在新结果里（真的被截断/换了一批数据）就退回顶部。
+   *
    * ⚠️ 默认行为必须与改动前一字不差：大量调用点与冒烟都依赖它。
    */
   async function refresh(opts?: { keepDepth?: boolean }): Promise<void> {
     loading.value = true
-    const limit = opts?.keepDepth && items.value.length > PAGE ? items.value.length : PAGE
-    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: 0, limit })
-    loading.value = false
-    if (r.data) {
-      items.value = r.data.items
-      total.value = r.data.total
-      // 选中项可能已不在列表中（被删/被移走/切换了筛选条件）
-      const visible = new Set(items.value.map((i) => i.id))
-      const kept = selectedIds.value.filter((id) => visible.has(id))
-      if (kept.length !== selectedIds.value.length) selectedIds.value = kept
-      if (selectedId.value != null && !visible.has(selectedId.value)) {
-        selectedId.value = null
-        detail.value = null
+    let rows: StashAssetRow[] | null = null
+    let nextTotal = 0
+    try {
+      // 目标深度：默认一页；keepDepth 时「至少一页，且不少于当前已加载的条数」
+      const target = opts?.keepDepth ? Math.max(items.value.length, PAGE) : PAGE
+      const first = await window.stash.asset.list({
+        ...query,
+        ...deepOpt(),
+        offset: 0,
+        limit: Math.min(target, SERVER_LIST_LIMIT_MAX)
+      })
+      if (first.data) {
+        rows = first.data.items
+        nextTotal = first.data.total
+        // 分页补齐（只在 keepDepth 且超过服务端上限时才会进这个循环）
+        while (rows.length < target && rows.length < nextTotal) {
+          const want = Math.min(SERVER_LIST_LIMIT_MAX, target - rows.length)
+          if (want <= 0) break
+          const next = await window.stash.asset.list({
+            ...query,
+            ...deepOpt(),
+            offset: rows.length,
+            limit: want
+          })
+          if (!next.data) break
+          nextTotal = next.data.total
+          const seen: Set<number> = new Set(rows.map((i) => i.id))
+          const add: StashAssetRow[] = next.data.items.filter((i) => !seen.has(i.id))
+          // 一行都没新增就停：offset 语义异常时也绝不死循环
+          if (!add.length) break
+          rows = rows.concat(add)
+        }
       }
+    } finally {
+      loading.value = false
+    }
+    if (!rows) return
+    items.value = rows
+    total.value = nextTotal
+    // 选中项可能已不在列表中（被删/被移走/切换了筛选条件）
+    const visible = new Set(items.value.map((i) => i.id))
+    const kept = selectedIds.value.filter((id) => visible.has(id))
+    if (kept.length !== selectedIds.value.length) selectedIds.value = kept
+    if (selectedId.value != null && !visible.has(selectedId.value)) {
+      selectedId.value = null
+      detail.value = null
     }
   }
 

@@ -30,6 +30,7 @@ import { runSmokeMeta } from './services/smoke-meta'
 import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
 import { runSmokeWatch } from './services/smoke-watch'
+import { runSmokeVScroll } from './services/smoke-vscroll'
 import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
@@ -805,6 +806,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-watch')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeWatch(win)
+      })
+    }
+
+    // 虚拟滚动冒烟：直插 1 万行 → M1–M8（渲染节点数 / 帧率 / 首屏 / 分页 / 内存 / 视图切换 / 高度单调 / 布局不变量）
+    if (process.argv.includes('--smoke-vscroll')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeVScroll(win)
       })
     }
 

@@ -514,8 +514,57 @@ export interface StashApi {
   app: StashAppApi
 }
 
+/**
+ * 虚拟滚动的只读快照（`GalleryGrid` 挂到 `window.__vsDebug` 上，供 `--smoke-vscroll` 读）。
+ *
+ * 为什么要有它：窗口化之后「DOM 节点数 ≠ 数据条数」，靠 `querySelectorAll('.masonry-card').length`
+ * 既慢又会随滚动变化。这套快照让 M1/M6/M8 直接读布局真相，不依赖 DOM 细节。
+ * 生产构建保留（纯函数、无副作用）。
+ */
+export interface StashVsDebug {
+  /** 已加载条目数（= `assets.items.length`） */
+  n: number
+  /** 查询命中的**总条数**（= `assets.total`，数据基数；DOM 不是它） */
+  dataTotal: number
+  /** 内容总高（布局算出的精确值） */
+  total: number
+  /** 窗口区间 `[start, end)` 与渲染节点数 */
+  start: number
+  end: number
+  rendered: number
+  /** 视口在内容坐标系里的上下沿与滚动量 */
+  vpTop: number
+  vpBottom: number
+  scrollTop: number
+  clientHeight: number
+  /** 布局参数（列数变化必然导致重排，M6 要断言它真的变了） */
+  cols: number
+  cardW: number
+  /** 当前锚点（视口内第一条的素材 id）与其视口内偏移 */
+  anchorId: number | null
+  anchorOffset: number
+  /** 自检：`tops` / `maxBottoms` 是否非递减 */
+  monotonic: boolean
+  /** 自检：`|total - max(y_i + h_i)|`（瀑布视图，误差必须为 0） */
+  maxDiff: number
+  /** 自检：与视口相交却落在窗口区间之外的条目数（必须为 0） */
+  coverMiss: number
+  /** 当前视图 */
+  view: 'masonry' | 'list'
+}
+
+/** M2 帧率采样的缓冲区（页面内 rAF 写入，主进程读取后算 p95 / mean / max） */
+export interface StashVsProbe {
+  d: number[]
+  done: boolean
+}
+
 declare global {
   interface Window {
     stash: StashApi
+    /** 虚拟滚动快照（组件挂载时设置、卸载时删除；不在网格页时是 `undefined`） */
+    __vsDebug?: () => StashVsDebug | null
+    /** 帧率采样探针（仅 `--smoke-vscroll` 用） */
+    __vsProbe?: StashVsProbe
   }
 }

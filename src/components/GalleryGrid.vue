@@ -1,11 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, reactive, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 import { heart, folderIcon } from '@/data/mock'
 import { useLibraryStore } from '../stores/library'
 import { useAssetStore, CARD_FIELDS, VIEW_ZOOM_MIN, VIEW_ZOOM_MAX } from '../stores/assets'
 import { useSettingsStore } from '../stores/settings'
 import { fmtSize, fmtDate, fmtCount, fmtDuration } from '../utils/format'
-import type { StashAssetRow } from '../env'
+import {
+  anchorRestore,
+  buildIndex,
+  findRange,
+  firstGreater,
+  overscanPx,
+  EMPTY_INDEX,
+  type LayoutIndex
+} from '../utils/virtual'
+import type { StashAssetRow, StashVsDebug } from '../env'
 import BatchBar from './BatchBar.vue'
 import CompressDialog from './CompressDialog.vue'
 import PreviewStage from './preview/PreviewStage.vue'
@@ -286,22 +295,72 @@ const INFO_NAME_H = 17 // .ci-name line-height
 const INFO_META_H = 16 // .ci-meta line-height 15 + margin-top 1
 const INFO_BORDER = 1 // .card-info border-top
 
+// ==================== 虚拟滚动常量 ====================
+// 设计见 docs/virtual-scroll-design.md。总原则：**布局对「已加载的全部条目」算（纯算术），
+// 只把 DOM 渲染切成窗口**。卡片高度是算出来的、不读 DOM，所以总高精确、滚动条不抖。
+
+/**
+ * 列表视图的行高与 `.list` 自己的上下内边距。
+ * ⚠️ 必须与 main.css 的 `.list-row { height }` / `.list { padding }` 一一对应 ——
+ * 对不上就会「窗口算错 → 行错位 → 上下占位块补齐后总高不对」。这与 `INFO_NAME_H` 那套
+ * 「常量必须与 CSS 一致」是同一条纪律。
+ */
+const LIST_ROW_H = 34 // main.css: .list-row { height: 34px; }
+const LIST_PAD_TOP = 8 // main.css: .list { padding: 8px 10px; } 的上内边距
+const LIST_PAD_BOTTOM = 8 // 同上，下内边距
+
+/** 缓冲像素下限 / 上限（见 `overscanPx`：按视口高度取一屏，夹在 240~1200px） */
+const OVERSCAN_MIN = 240
+const OVERSCAN_MAX = 1200
+/** 单帧最多渲染多少个节点（硬上限；4K / 超宽窗口下也不会爆） */
+const MAX_RENDER_NODES = 400
+/**
+ * 距「已加载内容的底边」小于这个距离就追加下一页（像素）。
+ * 判定读的是**布局算出的 total**，不是 DOM 的 scrollHeight —— 后者在窗口化之后
+ * 只反映已渲染的那一小段，完全不能用。
+ */
+const LOAD_MORE_AHEAD = 800
+/** 加载占位条高度（main.css 的 `.load-strip { height }`）；它绝对定位，不计入任何 total */
+const LOAD_STRIP_H = 26
+
 const gridWrap = ref<HTMLElement | null>(null)
 const containerW = ref(0)
+/** 当前的滚动量（`onScroll` 里同步写；窗口区间由它派生，不用 rAF 延后 —— 见设计 §4.3） */
+const scrollTopPx = ref(0)
+/** 内容容器顶边相对「滚动内容原点」的偏移（= `.grid-wrap` 的上内边距），在 ResizeObserver 里测一次 */
+const padTop = ref(16)
+/** 滚动容器的可视高度（缓冲与窗口都靠它算） */
+const viewportH = ref(0)
+/** 比例回写的版本号：`measuredRatio` 是普通 Map（不参与响应式），靠它显式让布局失效 */
+const ratioRev = ref(0)
 let ro: ResizeObserver | null = null
 
 onMounted(() => {
   const el = gridWrap.value
   if (el && typeof ResizeObserver !== 'undefined') {
     containerW.value = el.clientWidth
+    // 首帧就要有可视高度：否则窗口区间按 viewportH = 0 算，会先渲染 0~几个节点再跳一下
+    viewportH.value = el.clientHeight
     ro = new ResizeObserver((entries) => {
-      containerW.value = entries[0].contentRect.width
-      // 窗口变化会连带重排滚动内容（可能把 scrollTop 夹小），顺带同步一次浮标
+      const entry = entries[0]
+      containerW.value = entry.contentRect.width
+      // ⚠️ 只在**真的变了**的时候才写 ref：RO 回调里改状态会再次触发布局，
+      // 无脑赋值会喂出 "ResizeObserver loop completed with undelivered notifications"
+      // （--smoke-settings 的「无运行期错误」会红）。
+      const h = Math.round(entry.contentRect.height)
+      if (h !== viewportH.value) viewportH.value = h
+      // 窗口变化会连带重排滚动内容（可能把 scrollTop 夹小）—— 先重测 padTop 与浮标
+      measurePadTop()
       syncTopBtn()
+      // 首屏没填满视口时不会有 scroll 事件 ⇒ 必须在这里复查一次「要不要续页」
+      maybeLoadMore()
     })
     ro.observe(el)
   }
   syncTopBtn()
+  measurePadTop()
+  updateAnchor()
+  installVsDebug()
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
   // 拖文件进窗口：全局拦掉，否则 Chromium 会直接「导航到那个文件」，整个应用被替换成一张图
@@ -314,6 +373,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   ro?.disconnect()
   ro = null
+  uninstallVsDebug()
   stopDragTrack()
   document.body.classList.remove('drag-moving')
   window.removeEventListener('keydown', onKeyDown)
@@ -349,7 +409,16 @@ const cardW = computed(() => {
 //   · 污染源很具体：音频/文本的占位图是 320×320 → 实测比例记成 **1**，
 //     切到图片库之后，相同 id 的图片就全被渲染成正方形。
 // 三处一起改：① 判断顺序改回「索引优先」；② 键改用 content_hash（跨库唯一）；③ 切库时清空。
-const measuredRatio = reactive(new Map<string, number>())
+//
+// ⚠️ 现在是**普通 Map**（不参与响应式），改动由 `ratioRev` 显式通知：
+// 一屏 60 张图几乎同帧加载完，逐个触发响应式更新就是 60 次 × 全量重排 = 几百毫秒卡顿；
+// 合并后是「一帧一次」。见下面的 `queueRatio()`。
+const measuredRatio = new Map<string, number>()
+/** 本帧待写入的比例（`onImgLoad` 收集，rAF 里一次性 flush） */
+const pendingRatio = new Map<string, number>()
+/** 本帧是否已经排了 flush（避免 60 张图排 60 个 rAF） */
+let ratioFlushQueued = false
+
 
 /**
  * 「按素材内容」定位的键 —— 全项目**只有这一份**（单一真相源，见铁律 A5/A6 的精神）。
@@ -388,6 +457,9 @@ function ratioOf(it: StashAssetRow): number {
 //   · thumbRetried：同理，键一旦跨库残留，新库里同 key 的素材会被误判「已补生成过」而不再自愈。
 watch(() => lib.info?.path, () => {
   measuredRatio.clear()
+  // 本帧还没 flush 的比例属于上一个库，必须一起丢掉（否则新库首帧会按旧比例排一次）
+  pendingRatio.clear()
+  ratioRev.value++
   thumbRetried.clear()
 })
 
@@ -434,27 +506,104 @@ interface Placed {
   thumb: number
 }
 
-/** 最短列优先装箱：每张卡片放进当前最矮的一列，得到绝对定位坐标 */
-const placed = computed<Placed[]>(() => {
+/**
+ * 当前视图的**布局索引**（唯一的几何真相）。
+ *
+ * 这是虚拟滚动的核心：**布局仍然对「已加载的全部条目」算**（纯算术，1 万条 1–3ms，
+ * 且只在数据 / 尺寸 / 比例变化时算），只是把 DOM 渲染切成窗口。
+ * 为什么不「跳过」不可见条目：变高瀑布里第 i 条的 y 依赖前 i 条占过的列高，
+ * 想省掉布局就得增量维护列高 + 支持任意位置校正，复杂度暴涨而收益只有几毫秒（设计 D1）。
+ *
+ * 瀑布视图在**同一个装箱循环**里顺手填 `tops` / `maxBottoms`，不新增遍历；
+ * 列表视图的 `tops` 是等差序列（`LIST_PAD_TOP + i * LIST_ROW_H`），直接线性生成。
+ */
+const layout = computed<LayoutIndex<Placed>>(() => {
+  // 显式依赖 ratioRev：measuredRatio 是普通 Map，不读它就跟不上比例回写。
+  void ratioRev.value
   const w = cardW.value
   const c = cols.value
-  if (w <= 0) return []
-  const heights = new Array<number>(c).fill(0)
-  const out: Placed[] = []
-  for (const it of assets.items) {
+  const items = assets.items
+  const n = items.length
+  // 空库 / 容器宽度还没量出来：都按空索引处理，等 RO 触发重算
+  if (n === 0 || w <= 0) return EMPTY_INDEX as LayoutIndex<Placed>
+
+  const ids = new Array<number>(n)
+  const tops = new Int32Array(n)
+  const heights = new Int32Array(n)
+
+  if (view.value === 'list') {
+    for (let i = 0; i < n; i++) {
+      ids[i] = items[i].id
+      tops[i] = LIST_PAD_TOP + i * LIST_ROW_H
+      heights[i] = LIST_ROW_H
+    }
+    return buildIndex<Placed>({
+      tops,
+      heights,
+      ids,
+      total: LIST_PAD_TOP + n * LIST_ROW_H + LIST_PAD_BOTTOM,
+      cols: c,
+      cardW: w,
+      rowH: LIST_ROW_H
+    })
+  }
+
+  // —— 瀑布：最短列优先装箱，每张卡片放进当前最矮的一列 ——
+  const colH = new Array<number>(c).fill(0)
+  const placedOut = new Array<Placed>(n)
+  for (let i = 0; i < n; i++) {
+    const it = items[i]
     let k = 0
-    for (let i = 1; i < c; i++) if (heights[i] < heights[k]) k = i
+    for (let j = 1; j < c; j++) if (colH[j] < colH[k]) k = j
     const th = thumbH(it)
     // 卡片总高 = 上下内边距 + 上下描边 + 缩略图 + 信息区（含分隔线）
     const h = th + infoH(it) + INFO_BORDER + CARD_PAD * 2 + CARD_BORDER * 2
-    out.push({ it, x: Math.round(k * (w + MASONRY_GAP)), y: Math.round(heights[k]), w: Math.round(w), h, thumb: th })
-    heights[k] += h + MASONRY_GAP
+    const y = Math.round(colH[k])
+    placedOut[i] = { it, x: Math.round(k * (w + MASONRY_GAP)), y, w: Math.round(w), h, thumb: th }
+    ids[i] = it.id
+    tops[i] = y
+    heights[i] = h
+    colH[k] += h + MASONRY_GAP
   }
-  return out
+  return buildIndex<Placed>({ tops, heights, ids, placed: placedOut, cols: c, cardW: w })
 })
 
-/** 瀑布容器总高度 = 最长列的底部 */
-const masonryHeight = computed(() => placed.value.reduce((m, p) => Math.max(m, p.y + p.h), 0))
+/**
+ * 瀑布容器总高度 = 布局算出的精确总高（最长列的底部）。
+ * 与旧的 `placed.reduce(max(y+h))` 数值完全等价，但不再二次遍历，也**绝不估算** ——
+ * 估算要维护「估算 → 渲染 → 实测 → 修正 scrollTop」的闭环，那正是滚动条抖动的经典来源（设计 D2）。
+ */
+const masonryHeight = computed(() => layout.value.total)
+
+// ==================== 窗口区间 ====================
+/** 视口在内容坐标系里的上沿（`padTop` 与滚动无关，缓存即可，不在 scroll 里读 rect） */
+const vpTop = computed(() => scrollTopPx.value - padTop.value)
+/** 缓冲像素：上下各一屏 */
+const overscan = computed(() => overscanPx(viewportH.value, OVERSCAN_MIN, OVERSCAN_MAX))
+/**
+ * 需要渲染的条目区间 `[start, end)`。
+ * 两个二分（`tops` 单调 → 上界；`maxBottoms` 前缀最大值单调 → 下界），O(log N) 且**精确**。
+ */
+const winRange = computed<[number, number]>(() =>
+  findRange(layout.value, vpTop.value, vpTop.value + viewportH.value, overscan.value, MAX_RENDER_NODES)
+)
+const winStart = computed(() => winRange.value[0])
+const winEnd = computed(() => winRange.value[1])
+/** 瀑布视图实际渲染的卡片（`:key="p.it.id"` 不变 —— DOM 复用是窗口化的关键） */
+const placedWindow = computed(() => layout.value.placed.slice(winStart.value, winEnd.value))
+/** 列表视图渲染的行；与瀑布**共用同一个区间**，只是布局提供者不同（设计 D4） */
+const listWindow = computed(() => assets.items.slice(winStart.value, winEnd.value))
+
+/**
+ * 列表视图的上下占位块高度。
+ *
+ * `.list` 自己已有 `padding: 8px`，而 `tops[0]` 也等于 `LIST_PAD_TOP`，
+ * 所以上占位块只需要补「第一行之前的行数 × 行高」，把 8px 的内边距减掉，否则会双计 8px。
+ */
+const listSpacerTop = computed(() => winStart.value * LIST_ROW_H)
+const listSpacerBottom = computed(() => Math.max(0, (layout.value.n - winEnd.value) * LIST_ROW_H))
+/** 列表视图里加载占位的落点：最后一行正下方（不含下内边距） */
+const listStripTop = computed(() => LIST_PAD_TOP + layout.value.n * LIST_ROW_H)
 
 function onImgErr(it: StashAssetRow, ev: Event): void {
   const img = ev.target as HTMLImageElement
@@ -487,13 +636,43 @@ function onImgErr(it: StashAssetRow, ev: Event): void {
   })()
 }
 
-/** 加载完成：恢复透明度；索引缺尺寸时用图片真实宽高补算比例，保证排布不歪 */
+/**
+ * 加载完成：恢复透明度；索引缺尺寸时用图片真实宽高补算比例，保证排布不歪。
+ *
+ * ⚠️ 比例**不在这里直接写进** `measuredRatio`（那会让布局立刻全量重排）：
+ * 一屏 60 张图几乎同帧加载完，逐个触发就是 60 次 × 1 万条重排 = 几百毫秒卡顿。
+ * `queueRatio` 把它们合并成「本帧一次」。
+ */
 function onImgLoad(it: StashAssetRow, ev: Event): void {
   const el = ev.target as HTMLImageElement
   el.style.opacity = '1'
   if (!(it.width && it.height) && el.naturalWidth > 0 && el.naturalHeight > 0) {
-    measuredRatio.set(assetKey(it), el.naturalHeight / el.naturalWidth)
+    queueRatio(assetKey(it), el.naturalHeight / el.naturalWidth)
   }
+}
+
+/**
+ * 把一次实测比例丢进「本帧待刷新」集合，只排**一个** rAF：flush 时统一写 Map + `ratioRev++`。
+ *
+ * 为什么用 rAF 而不是微任务：图片 `load` 事件是逐个派发的，微任务会在同一轮里被清空多次；
+ * 而 rAF 天然按帧对齐 —— 「这一帧内的所有回写只算一次重排」，正是我们要的粒度。
+ * 比例没变就完全跳过：窗口化后卡片会反复挂载/卸载，同一张图的 `load` 可能来好几次。
+ */
+function queueRatio(key: string, ratio: number): void {
+  if (measuredRatio.get(key) === ratio) return
+  pendingRatio.set(key, ratio)
+  if (ratioFlushQueued) return
+  ratioFlushQueued = true
+  const flush = (): void => {
+    ratioFlushQueued = false
+    if (!pendingRatio.size) return
+    for (const [k, v] of pendingRatio) measuredRatio.set(k, v)
+    pendingRatio.clear()
+    // 显式失效：measuredRatio 是普通 Map，布局只认这个版本号
+    ratioRev.value++
+  }
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(flush)
+  else setTimeout(flush, 16)
 }
 
 // ==================== 回到顶部浮标 ====================
@@ -516,11 +695,217 @@ function syncTopBtn(el?: HTMLElement | null): void {
   scrolledDown.value = !!node && node.scrollTop > TOP_BTN_AFTER
 }
 
+/**
+ * 重测「内容容器顶边相对滚动内容原点的偏移」（瀑布与列表都走这里）。
+ *
+ * 只在 ResizeObserver 里调用，**不在 scroll 里**：`getBoundingClientRect` 是布局读取，
+ * 每帧读一次会让滚动期间多出一次强制布局（设计 R14）。
+ * `.grid-wrap` 的 `has-totop` / `has-batchbar` 只改 `padding-bottom`，不影响这个值。
+ */
+function measurePadTop(): void {
+  const wrap = gridWrap.value
+  const content = view.value === 'masonry' ? masonryEl.value : listEl.value
+  if (!wrap || !content) return
+  const wr = wrap.getBoundingClientRect()
+  const cr = content.getBoundingClientRect()
+  const next = Math.round(cr.top - wr.top + wrap.scrollTop)
+  if (next !== padTop.value) padTop.value = next
+}
+
+/**
+ * 维护锚点：视口内**第一条**条目的 id，以及它顶边在视口内的 y。
+ * 布局重排后靠这两个值把画面「钉」回原位（设计 §4.4）。
+ * 成本是一次 O(log N) 二分，滚动里每帧一次可以忽略。
+ */
+function updateAnchor(): void {
+  const idx = layout.value
+  const el = gridWrap.value
+  if (!el) return
+  if (idx.n === 0) {
+    anchorId = null
+    anchorOffset = 0
+    return
+  }
+  const top = el.scrollTop - padTop.value
+  let i = firstGreater(idx.maxBottoms, top)
+  if (i >= idx.n) i = idx.n - 1
+  const it = assets.items[i]
+  if (!it) {
+    anchorId = null
+    anchorOffset = 0
+    return
+  }
+  anchorId = it.id
+  anchorOffset = idx.tops[i] - top
+}
+
+/**
+ * 距「已加载内容的底边」不足 `LOAD_MORE_AHEAD` 时追加下一页。
+ *
+ * 判定读的是**布局算出的 total**（精确），不是 DOM 的 `scrollHeight` ——
+ * 窗口化之后 `scrollHeight` 只反映已渲染的那一小段，用它判断会几乎立刻「到底」。
+ * 调用点有三个：`onScroll` 末尾、每次布局变化后、ResizeObserver 里。
+ * 后两个是新增的**关键**修复：如果第一页就没填满视口（窗口特别高 / 筛选后只剩几条），
+ * 永远不会有 scroll 事件，`loadMore` 就永远不触发 —— 列表卡在第一条，用户以为后面没内容了。
+ */
+function maybeLoadMore(): void {
+  if (assets.loading) return
+  const idx = layout.value
+  if (idx.n === 0) return
+  if (assets.items.length >= assets.total) return
+  const remaining = idx.total - (vpTop.value + viewportH.value)
+  if (remaining < LOAD_MORE_AHEAD) void assets.loadMore()
+}
+
+/**
+ * 布局变了之后按锚点恢复 `scrollTop`。
+ *
+ * ⚠️ 必须由 `flush: 'post'` 的 watcher 调用：此时 DOM 已经是新高度，
+ * 写 `scrollTop` 才不会被**旧的** `scrollHeight` 夹小。
+ * ⚠️ `.grid-wrap` 上有 `overflow-anchor: none` —— Chromium 自带的滚动锚定会和这里叠加，
+ * 变成「校正过头」的双倍位移（设计 §4.4 的粗体警告）。
+ * ⚠️ 收尾不调 `updateAnchor()`：它用**新布局**重算「视口内第一条」，同排多列时
+ * `firstGreater(maxBottoms, vpTop)` 只取索引最小的那条，会把 (9908, -75) 换成同排的 (9906, -7)。
+ * 恢复之后位置**已经确定**，锚点就该显式写成「本次恢复所用的那一对」。
+ *
+ * 📌 分清责任（QA Round 2 的单点注入结论，别再记错）：
+ *   · **修掉 68px 漂移的是 `onScroll` 那条护栏**（`scrollTop` 没变就不重算锚点）：
+ *     只删护栏 → QA-11 立刻变红、68px 逐字复现；
+ *     只删本函数的归一化 → 66/66 全绿、零漂移。
+ *   · 所以下面这段归一化是**防御性**的。它唯一的可观测作用在「scrollTop 被夹取 / 取整」的瞬态：
+ *     有它 → 滚到底后切视图再切回，落在距底 174px（锚点素材在视口 y=157）；
+ *     无它 → 精确回到最底（y=-17）。两者都在界内、都合法，**当前没有任何断言能证伪**。
+ *     保留它是因为它更贴 D6「钉住同一条素材」的语义（落点由锚点素材决定，而不是由
+ *     「内容底」这个与素材无关的量决定）。**别以为删了它会漂。**
+ */
+function restoreScrollByAnchor(idx: LayoutIndex<Placed>, allowTopFallback: boolean): void {
+  const el = gridWrap.value
+  if (!el) return
+  const r = anchorRestore(idx, anchorId, anchorOffset, padTop.value)
+  if (!r.ok) {
+    // 锚点已不在新结果里（refresh 被服务端上限截断 / 筛选把这屏整个换掉）→ 退回顶部。
+    // 不这么做就会停在一个「按旧坐标算出来的、随机的位置」上，比回顶部更令人困惑。
+    if (allowTopFallback && r.reason === 'gone' && el.scrollTop > 0) {
+      el.scrollTop = 0
+      scrollTopPx.value = 0
+      // 这个分支**可以**重算：锚点已经失效，回顶后「视口内第一条」才是对的新锚点
+      updateAnchor()
+    }
+    return
+  }
+  // 已经对上了就别写（免得白触发一次 scroll）——但锚点仍要归一化，见下面的注释
+  if (Math.abs(el.scrollTop - r.scrollTop) >= 0.5) {
+    el.scrollTop = r.scrollTop
+    // 读回真实值：浏览器可能把它夹到 [0, scrollHeight - clientHeight]
+    scrollTopPx.value = el.scrollTop
+  } else {
+    scrollTopPx.value = el.scrollTop
+  }
+  /**
+   * 把锚点归一化成「同一条素材 + 它此刻在视口内的真实偏移」。
+   * 用**读回后的** `scrollTop` 反算而不是直接用 `anchorOffset`：万一浏览器把 scrollTop 夹了，
+   * 真实偏移就不是原值，写回去仍能让下一次恢复与当前画面自洽。
+   * ⚠️ 这是**防御性**代码，不是修 68px 漂移的那一处（那靠 `onScroll` 的护栏，见函数头注释）。
+   */
+  const i = anchorId == null ? null : idx.indexById.get(anchorId)
+  if (i != null) anchorOffset = idx.tops[i] - (el.scrollTop - padTop.value)
+}
+
+/**
+ * 滚动：同步窗口 + 维护锚点 + 续页。
+ *
+ * **刻意不用 rAF 延后**（设计 §4.3）：Vue 的更新走微任务、在绘制前 flush，
+ * 所以同步写 `scrollTopPx` 不会出现「先画空白再补」；插一个 rAF 反而稳定地慢一帧。
+ * 读 `el.scrollTop` 不是布局读取（不触发 reflow），成本可忽略 —— 这里**故意**不读
+ * `scrollHeight` / `clientHeight` / `getBoundingClientRect`，那三个才会强制布局。
+ *
+ * ⚠️ 「位置没变就不重算锚点」**就是** 68px 锚点漂移的修法（QA Round 1 实测 / Round 2 单点注入复核）：
+ * 程序性写 `el.scrollTop`（锚点恢复）本身会异步派发一次 scroll 事件，此时 `scrollTop`
+ * 与我们刚记下的值**完全相等**；若在这里照常 `updateAnchor()`，它会在**新布局**里重新挑
+ * 「视口内第一条」—— 而列表与瀑布的行归属不同（列表 34px 一行、瀑布同排多列），
+ * 挑中的可能是同排/相邻的另一条，于是 (id, offset) 被换成另一对**自洽但与旧布局不等价**的值，
+ * 下一次按它恢复就漂（9908@-75 被换成 9906@-7 → 往返后 68px）。
+ * 既然位置没动，锚点就该原封不动。**删掉这条 return，漂移立刻复现**（QA-11 变红）。
+ */
 function onScroll(e: Event): void {
   const el = e.target as HTMLElement
   syncTopBtn(el)
-  if (el.scrollTop + el.clientHeight > el.scrollHeight - 800) assets.loadMore()
+  const next = el.scrollTop
+  if (next === scrollTopPx.value) return
+  scrollTopPx.value = next
+  updateAnchor()
+  maybeLoadMore()
 }
+
+/**
+ * 锚点：视口内第一条的素材 id 与它顶边在视口内的 y。
+ *
+ * 刻意做成**普通变量**而不是 ref：它不参与渲染，只在重排恢复时读一次；
+ * 做成响应式只会把「滚动」变成一次组件更新。
+ */
+let anchorId: number | null = null
+let anchorOffset = 0
+/** 上一次布局的条目数与总高（判断这次重算是「重排」还是「增删」） */
+let lastLayoutN = -1
+let lastLayoutTotal = -1
+
+/**
+ * 布局变化的统一收口（`flush: 'post'`：此时 DOM 已是新高度）。
+ *
+ * 三件事，顺序有讲究：
+ *  ① 重排（条目数不变、总高变了）→ 按锚点恢复 `scrollTop`。
+ *     覆盖：比例回写、列数变化（窗口 resize）、`cardFields` 开关、**视图切换**（因为锚是 id）。
+ *     追加/删除（条目数变了）**不做**校正 —— 追加发生在下方，不该动 scrollTop；
+ *     删除/筛选由下面的 `query` watcher 负责回顶。
+ *  ② `maybeLoadMore()`：首屏没填满视口时不会有 scroll 事件，必须在这里复查一次。
+ *  ③ `syncTopBtn()`：内容变短后 scrollTop 会被夹小，浮标得跟着收。
+ */
+watch(
+  layout,
+  (idx) => {
+    const reorder = idx.n === lastLayoutN && idx.total !== lastLayoutTotal
+    const listChanged = idx.n !== lastLayoutN
+    lastLayoutN = idx.n
+    lastLayoutTotal = idx.total
+
+    measurePadTop()
+    if (reorder && idx.n > 0) restoreScrollByAnchor(idx, false)
+    // 列表内容被整体换掉（refresh / keepDepth 被服务端上限截断）→ 锚点还在就守住位置，
+    // 锚点没了就退回顶部。这条是 R6 那个既有 bug 的兜底。
+    else if (listChanged && idx.n > 0) restoreScrollByAnchor(idx, true)
+
+    maybeLoadMore()
+    syncTopBtn()
+  },
+  { flush: 'post' }
+)
+
+/**
+ * 换了「看的是哪一份列表」（文件夹 / 标签 / 筛选 / 排序 / 关键词）→ 必须回到顶部。
+ *
+ * 为什么要显式处理，而不是交给上面的锚点恢复：锚点恢复的语义是「同一批数据重排后
+ * 把眼前的东西钉住」，而换查询是**另一批数据**，钉住旧位置毫无意义（用户要看的是新结果的第一屏）。
+ * 顺手把锚点清空：否则「新结果里恰好有同一个 id」时会被恢复到中间，看起来像没反应。
+ */
+watch(
+  () => [
+    assets.query.folderId,
+    assets.query.tagId,
+    assets.query.type,
+    assets.query.rating,
+    assets.query.fav,
+    assets.query.keyword,
+    assets.query.sort,
+    assets.query.order
+  ],
+  () => {
+    anchorId = null
+    anchorOffset = 0
+    const el = gridWrap.value
+    if (el) el.scrollTop = 0
+    scrollTopPx.value = 0
+  }
+)
 
 /**
  * 一键回到顶部。
@@ -538,9 +923,13 @@ function scrollToTop(): void {
 watch([view, () => assets.items.length], () => nextTick(() => syncTopBtn()))
 
 // ==================== 多选：Ctrl 点选 / 拖拽框选 / 点击空白取消 ====================
-// 框选命中判定直接用 placed 里的几何数据（卡片坐标、尺寸都是算出来的），
-// 不需要读 DOM，也不会因为图片未加载完而抖
+// 框选命中判定**继续对已加载的全部 `layout.placed` 做几何判定**（设计 D5 / R4）：
+// 用户框选时框比一屏大是常态，必须能选中「尚未渲染但已加载」的卡片；
+// 而几何判定天生不受图片加载 / 节点复用影响。只是先用 `findRange` 做一次垂直剪枝，
+// 把 O(N) 的遍历压成 O(log N + 命中数) —— 否则每次 mousemove 都要扫 1 万条。
 const masonryEl = ref<HTMLElement | null>(null)
+/** 列表视图的容器（测 padTop、给加载条定位） */
+const listEl = ref<HTMLElement | null>(null)
 
 /** 拖拽框（坐标与卡片同一坐标系：.masonry 内容区原点） */
 const band = ref<{ x1: number; y1: number; x2: number; y2: number } | null>(null)
@@ -623,10 +1012,29 @@ function onGridPointerMove(e: MouseEvent): void {
   if (!a || !b) return
   const rect = { x1: Math.min(a.x, b.x), y1: Math.min(a.y, b.y), x2: Math.max(a.x, b.x), y2: Math.max(a.y, b.y) }
   band.value = rect
-  bandHits.value = placed.value
-    .filter((p) => p.x < rect.x2 && rect.x1 < p.x + p.w && p.y < rect.y2 && rect.y1 < p.y + p.h)
-    .map((p) => p.it.id)
+  bandHits.value = hitsInRect(rect)
 }
+
+/**
+ * 落在这个框里的卡片 id（语义与改造前的「对全量 placed 做矩形相交」**完全一致**）。
+ *
+ * 两步：① `findRange(layout, y1, y2, 0, ∞)` 取出「垂直方向可能相交」的连续区间；
+ * ② 在区间内做完整的四边相交判定（x 与 y 都要比 —— `maxBottoms` 是前缀最大值，
+ * 一张超长卡片会让区间比真实交集宽，所以不能省掉逐条的 y 判定）。
+ */
+function hitsInRect(rect: { x1: number; y1: number; x2: number; y2: number }): number[] {
+  const idx = layout.value
+  if (idx.n === 0) return []
+  const [s, e] = findRange(idx, rect.y1, rect.y2, 0, Number.MAX_SAFE_INTEGER)
+  const out: number[] = []
+  for (let i = s; i < e; i++) {
+    const p = idx.placed[i]
+    if (!p) continue
+    if (p.x < rect.x2 && rect.x1 < p.x + p.w && p.y < rect.y2 && rect.y1 < p.y + p.h) out.push(p.it.id)
+  }
+  return out
+}
+
 
 function onGridPointerUp(): void {
   stopDragTrack()
@@ -992,6 +1400,67 @@ function onWindowMouseDown(e: MouseEvent): void {
   if (chipMenu.value && !t.closest('.chip-menu') && !t.closest('.chip-menu-trigger')) chipMenu.value = null
   if (menu.value && !t.closest('.ctx-menu')) closeMenu()
 }
+
+// ==================== 调试出口（冒烟读，生产无害）====================
+/**
+ * 一份只读快照，供 `--smoke-vscroll` 读（设计 §4.8）。
+ *
+ * 为什么必须有它：窗口化之后「DOM 节点数 ≠ 数据条数」。靠 `querySelectorAll('.masonry-card')`
+ * 既慢又会随滚动变化，而 M1/M6/M8 要断的是**布局真相**（窗口区间、总高、单调性、锚点），
+ * 这些只能从组件内部拿。纯函数、无副作用，所以生产构建保留。
+ */
+function vsSnapshot(): StashVsDebug | null {
+  const el = gridWrap.value
+  const idx = layout.value
+  if (!el) return null
+  const [start, end] = winRange.value
+  const top = vpTop.value
+  const bottom = top + viewportH.value
+
+  let monotonic = true
+  let maxBottom = 0
+  let coverMiss = 0
+  for (let i = 0; i < idx.n; i++) {
+    const t = idx.tops[i]
+    if (i > 0 && (t < idx.tops[i - 1] || idx.maxBottoms[i] < idx.maxBottoms[i - 1])) monotonic = false
+    const h = idx.placed.length ? idx.placed[i].h : idx.rowH || LIST_ROW_H
+    const b = t + h
+    if (b > maxBottom) maxBottom = b
+    // 覆盖自检：与视口相交却落在窗口区间之外 = findRange 少渲染了（M8 的核心断言）
+    if (t < bottom && b > top && (i < start || i >= end)) coverMiss++
+  }
+  // 列表视图的 total 含上下内边距，不能直接和「最长底边」比 —— 按视图各自的口径算期望值
+  const expected = idx.rowH > 0 ? LIST_PAD_TOP + idx.n * idx.rowH + LIST_PAD_BOTTOM : maxBottom
+
+  return {
+    n: idx.n,
+    dataTotal: assets.total,
+    total: idx.total,
+    start,
+    end,
+    rendered: end - start,
+    vpTop: Math.round(top),
+    vpBottom: Math.round(bottom),
+    scrollTop: Math.round(el.scrollTop),
+    clientHeight: el.clientHeight,
+    cols: cols.value,
+    cardW: Math.round(cardW.value),
+    anchorId,
+    anchorOffset: Math.round(anchorOffset),
+    monotonic,
+    maxDiff: Math.abs(idx.total - expected),
+    coverMiss,
+    view: view.value
+  }
+}
+
+function installVsDebug(): void {
+  window.__vsDebug = vsSnapshot
+}
+
+function uninstallVsDebug(): void {
+  delete window.__vsDebug
+}
 </script>
 
 <template>
@@ -1170,9 +1639,10 @@ function onWindowMouseDown(e: MouseEvent): void {
       @contextmenu.prevent
     >
       <!-- 瀑布视图 -->
+      <!-- `height` 用布局算出的**精确**总高（不是估算），卡片绝对定位在窗口区间内 -->
       <div v-if="view === 'masonry'" ref="masonryEl" class="masonry" :style="{ height: masonryHeight + 'px' }">
         <div
-          v-for="p in placed"
+          v-for="p in placedWindow"
           :key="p.it.id"
           class="card masonry-card"
           :data-id="p.it.id"
@@ -1232,12 +1702,27 @@ function onWindowMouseDown(e: MouseEvent): void {
             height: band.y2 - band.y1 + 'px'
           }"
         ></div>
+
+        <!--
+          加载占位：**绝对定位在内容底，不计入 masonryHeight**。
+          一旦进入布局，scrollHeight 就会随「正在加载 / 加载完」来回变、滚动条跟着抖；
+          而总高现在是布局算出的精确值，更不能被这个占位污染（设计 R8）。
+        -->
+        <div v-if="assets.loading" class="load-strip" :style="{ top: masonryHeight + 'px' }" data-load-strip>
+          加载中…
+        </div>
       </div>
 
-      <!-- 列表视图 -->
-      <div v-else class="list">
+      <!-- 列表视图：**与瀑布共用同一套窗口区间**，只换布局提供者；上下用两个定高空块把行顶到位 -->
+      <div v-else ref="listEl" class="list">
         <div
-          v-for="it in assets.items"
+          v-if="listSpacerTop > 0"
+          class="list-spacer"
+          :style="{ height: listSpacerTop + 'px' }"
+          data-list-spacer="top"
+        ></div>
+        <div
+          v-for="it in listWindow"
           :key="it.id"
           class="list-row"
           :data-id="it.id"
@@ -1253,6 +1738,15 @@ function onWindowMouseDown(e: MouseEvent): void {
           <span v-if="assets.cardFields.aiBadge && it.ai_source" class="list-ai" :data-list-ai="it.ai_source">AI</span>
           <span v-if="assets.cardFields.time" class="list-date">{{ fmtDate(it.imported_at) }}</span>
         </div>
+        <div
+          v-if="listSpacerBottom > 0"
+          class="list-spacer"
+          :style="{ height: listSpacerBottom + 'px' }"
+          data-list-spacer="bottom"
+        ></div>
+        <div v-if="assets.loading" class="load-strip" :style="{ top: listStripTop + 'px' }" data-load-strip>
+          加载中…
+        </div>
       </div>
 
       <div v-if="!assets.items.length && !assets.loading" class="empty">
@@ -1266,7 +1760,6 @@ function onWindowMouseDown(e: MouseEvent): void {
           <p class="empty-sub">点击上方「导入」添加文件</p>
         </template>
       </div>
-      <div v-if="assets.loading" class="loading-tip">加载中…</div>
 
       <!-- 拖文件进窗口时的导入提示（松手即导入到当前文件夹） -->
       <div v-if="dropActive" class="drop-hint" data-drop-hint>
