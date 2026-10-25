@@ -114,7 +114,7 @@ npm run package:win    # 打包 Windows 安装版 + 便携版（产物在 dist/�
 
 ## 测试
 
-项目里带 **15 个冒烟入口**（14 个套件模块 + 1 个内联分支），全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
+项目里带 **16 个冒烟入口**（15 个套件模块 + 1 个内联分支），全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
 
 ```bash
 env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
@@ -134,6 +134,7 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 | `--smoke-compress` | 压缩、保护规则、原地替换顺序 |
 | `--smoke-watch` | 外部变更同步（库根/新目录/已存在文件夹/非素材/隐藏目录） |
 | `--smoke-welcome` | 欢迎页与窗口控制 |
+| `--smoke-vscroll` | **虚拟滚动**：1 万条夹具下的渲染节点数 / 帧率 / 首屏 / 分页 / 内存 / 视图切换 / 高度单调 / 布局不变量（M1–M8）+ 纯算法边界 |
 
 新增断言都会做「注入验证」——把对应实现暂时改坏，确认断言真的会红。
 
@@ -148,6 +149,9 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
   编解码器，所以 `heic / heif / hif` 没有列入支持的格式 —— 拖进来会被当作「格式不支持」跳过。
   要用请先转成 JPG / PNG / TIFF
 - 「未知」来源的图不会被强行标记成 AI 生成
+- **虚拟滚动只窗口化 DOM，不卸载数据**：卡片节点数恒定（1 万条实测 ~24–36 个），
+  但已浏览过的行对象仍留在内存里（1 万条约 29 MB 增量，实测 `--smoke-vscroll`）。
+  真正的大库（10 万条以上）需要再做一层「数据层窗口化」，见开发文档 §9.2
 
 ## 许可
 
