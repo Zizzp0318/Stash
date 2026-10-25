@@ -1,4 +1,4 @@
-// 标签冒烟：添加 / 从素材上摘掉 / 删除标签本体 / 关联级联清空 / 筛选重置 / **归零自删** / **最近标签快捷区**
+// 标签冒烟：添加 / 从素材上摘掉 / 删除标签本体 / 关联级联清空 / 筛选重置 / **归零自删** / **最近标签快捷区** / **批量打标**
 //
 // 缘起：用户报「标签只能添加，不能删除」。根因是 `tags` 表只有 `createTag` 没有删除入口，
 // 侧栏标签行也没有任何管理操作。这里覆盖两层语义，别混：
@@ -17,6 +17,17 @@
 //     两者相等才算真的没占位（改回 static/relative 立刻变红）；
 //   - 「4 行」是布局行为，只能靠行 top 坐标去重计数来断言（内容断言 3 行/5 行都能过）。
 //
+// H10 覆盖**批量打标**（多选批量条的「标签」按钮 + 浮层 → `asset:bulk-tags` / `bulkUpdateTags`）。
+// 与前 9 段最大的不同：那一层是**增量**语义，不是「整体替换」。三条最容易写错、也最容易假绿的：
+//   - `attach` 只是 `INSERT OR IGNORE` 追加。若被写成复用 `setTags`（先 DELETE 再插），
+//     每张素材原有的其他标签会被抹掉 —— 所以断言必须**同时**看「新标签挂上了」与「原标签还在」，
+//     只看前者是测不出来的；
+//   - `detach` 后标签归零要自动删除，但候选集是「原本真挂着、这次被摘掉」的标签，且**在 DELETE 之前取**。
+//     拿请求参数当候选，会把「刚建好、还没挂过任何素材」的标签当场删掉（创建与挂载之间有窗口期）；
+//   - 浮层是 `position:absolute`：打开它批量条高度 / `--bb-extra` / 网格底部留白三者都不得动，
+//     否则底部让位与「回到顶部」浮标会整体漂移。
+// 上述「追加不覆盖」与「候选集在 DELETE 前取」两条都做过注入验证（改坏实现 → 断言变红 → 改回）。
+//
 // 断言全部同时核对**数据库**与**DOM**：本项目出过「DB 写成功、UI 不刷新」的假绿
 // （store 把 camelCase 字段 assign 到 snake_case 行对象上），只查 DB 会漏。
 import { app, BrowserWindow } from 'electron'
@@ -28,6 +39,7 @@ import { unwatchLibrary } from './watcher'
 import { closeCurrent, createLibrary, forgetLibrary, requireCurrent } from './library'
 import { createTag, deleteTag, setTags } from './assets'
 import { importFiles } from './importer'
+import { makeWaitUntil, type InputModifiers } from './smoke-util'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
@@ -64,6 +76,8 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
 
   let dir: string | null = null
   let libPath = ''
+  /** 有界轮询（G4）：共享实现见 smoke-util.ts —— 超时返回 false，调用方必须把结果并入断言/诊断 */
+  const waitUntil = makeWaitUntil(js)
   /** 每次取实时手柄：渲染层 bootstrap() 会重新 openLibrary，缓存下来的旧 db 会变成 not open */
   const D = (): ReturnType<typeof requireCurrent>['db'] => requireCurrent().db
   const step = (s: string): void => console.log('[SMOKE-TAG-STEP] ' + s)
@@ -110,11 +124,37 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       (r) => r.tag_id
     )
 
+  /** 某个素材当前挂着的标签名（批量打标要核对「原标签是否还在」，名字比 id 更直观） */
+  const assetTagNames = (assetId: number): string[] =>
+    (
+      D()
+        .prepare(
+          `SELECT t.name AS name FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+            WHERE at.asset_id=? ORDER BY t.name`
+        )
+        .all(assetId) as Array<{ name: string }>
+    ).map((r) => r.name)
+
+  /** 某个标签当前挂着几个素材 */
+  const tagLinkCount = (tagId: number): number =>
+    (D().prepare('SELECT COUNT(*) AS c FROM asset_tags WHERE tag_id=?').get(tagId) as { c: number }).c
+
+  /** 某个标签当前挂在哪些素材上（按素材名） */
+  const tagAssetNames = (tagId: number): string[] =>
+    (
+      D()
+        .prepare(
+          `SELECT a.name AS name FROM asset_tags at JOIN assets a ON a.id = at.asset_id
+            WHERE at.tag_id=? ORDER BY a.name`
+        )
+        .all(tagId) as Array<{ name: string }>
+    ).map((r) => r.name)
+
   // ==================== DOM 助手 ====================
-  const click = (x: number, y: number): void => {
-    win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(x), y: Math.round(y) })
-    win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1 })
-    win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1 })
+  const click = (x: number, y: number, mods: InputModifiers = []): void => {
+    win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(x), y: Math.round(y), modifiers: mods })
+    win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1, modifiers: mods })
+    win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(x), y: Math.round(y), button: 'left', clickCount: 1, modifiers: mods })
   }
   const elPoint = async (selector: string, index = 0): Promise<{ x: number; y: number } | null> => {
     const s = (await js(`(() => {
@@ -130,6 +170,13 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     const p = await elPoint(selector, index)
     if (!p) return false
     click(p.x, p.y)
+    return true
+  }
+  /** 带修饰键的真实点击（Ctrl+点 = 多选追加）。坐标每次现取：详情面板展开会让瀑布流重排 */
+  const clickElWith = async (selector: string, mods: InputModifiers, index = 0): Promise<boolean> => {
+    const p = await elPoint(selector, index)
+    if (!p) return false
+    click(p.x, p.y, mods)
     return true
   }
   /** 把鼠标挪开：避免 :hover 样式污染「可见性」类断言 */
@@ -212,6 +259,74 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
 
   /** 点下拉第 idx 行（真实鼠标；输入框会 blur，靠 @mousedown.prevent 兜住） */
   const clickRecent = async (idx: number): Promise<boolean> => clickEl('.detail .tag-menu-item', idx)
+
+  /**
+   * 底部批量条 + 「标签」浮层的联合快照。
+   *
+   * 一次求值同时采三组证据，避免分多次读导致「读条高时浮层还没开」这类错位：
+   *   ① 条高 / `--bb-extra` / `.grid-wrap` 底部留白 —— 浮层是 `position:absolute`，
+   *      打开它这三项必须分毫不动（改了 static/relative 就会把条子撑高、留白整体漂移）；
+   *   ② 浮层几何 —— 是否真的浮在条子上方（不是把条子顶开）；
+   *   ③ 每一行的三态（all/some/none）与行尾计数 —— 三态是「选中集合里挂了这个标签的个数」
+   *      与 `selectedCount` 比出来的，只查 DB 看不出来。
+   */
+  interface BulkSnap {
+    bar: boolean
+    rows: number
+    ids: number[]
+    names: string[]
+    counts: number[]
+    states: string[]
+    barH: number
+    barTop: number
+    panel: boolean
+    panelPosition: string | null
+    panelTop: number
+    panelBottom: number
+    extra: string | null
+    padBottom: number
+    countText: string | null
+  }
+  const bulkSnap = async (): Promise<BulkSnap> =>
+    JSON.parse(
+      ((await js(`(() => {
+        const bar = document.querySelector('.batchbar')
+        const panel = document.querySelector('[data-bb-tag-panel]')
+        const gallery = document.querySelector('.gallery')
+        const wrap = document.querySelector('.grid-wrap')
+        const rows = panel ? [...panel.querySelectorAll('[data-bb-tag-option-id]')] : []
+        const stateOf = (e) => {
+          const s = e.querySelector('.bb-tag-state')
+          if (!s) return ''
+          return ['all', 'some', 'none'].find(x => s.classList.contains(x)) ?? ''
+        }
+        const br = bar ? bar.getBoundingClientRect() : null
+        const pr = panel ? panel.getBoundingClientRect() : null
+        return JSON.stringify({
+          bar: !!bar,
+          rows: rows.length,
+          ids: rows.map(e => +e.dataset.bbTagOptionId),
+          names: rows.map(e => e.querySelector('.tag-menu-name')?.textContent ?? ''),
+          counts: rows.map(e => +(e.querySelector('.tag-menu-count')?.textContent ?? '0')),
+          states: rows.map(stateOf),
+          barH: br ? Math.round(br.height) : -1,
+          barTop: br ? Math.round(br.top) : -1,
+          panel: !!panel,
+          panelPosition: panel ? getComputedStyle(panel).position : null,
+          panelTop: pr ? Math.round(pr.top) : -1,
+          panelBottom: pr ? Math.round(pr.bottom) : -1,
+          extra: gallery ? getComputedStyle(gallery).getPropertyValue('--bb-extra').trim() : null,
+          padBottom: wrap ? Math.round(parseFloat(getComputedStyle(wrap).paddingBottom)) : -1,
+          countText: bar ? (bar.querySelector('.bb-count')?.textContent ?? '').replace(/\\s+/g, ' ').trim() : null
+        })
+      })()`)) as string | null) ?? '{}'
+    ) as BulkSnap
+
+  /** 浮层里某一行（按 tag id）的三态与行尾计数 */
+  const rowOf = (s: BulkSnap, tagId: number): { state: string; count: number; name: string } | null => {
+    const i = s.ids.indexOf(tagId)
+    return i < 0 ? null : { state: s.states[i] ?? '', count: s.counts[i] ?? -1, name: s.names[i] ?? '' }
+  }
 
   /**
    * 侧栏标签行。
@@ -705,6 +820,242 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     R.h9_allAttached = await recentSnap()
     await capture('shot-tag-recent-all.png')
 
+    // ==================== H10. 批量打标：多选批量条上的「标签」浮层 ====================
+    //
+    // 入口是 `asset:bulk-tags`（服务层 `bulkUpdateTags`），UI 是批量条里的「标签」按钮 + 浮层。
+    // 本段重点**证伪**工程师自述的三条语义，任何一条被写错都应该是红：
+    //   ① attach 是 `INSERT OR IGNORE` **追加**，不是覆盖 —— 若偷偷复用 `setTags` 的整体替换，
+    //      一张挂了 12 个标签的素材在批量挂 1 个新标签后会**只剩 1 个**（select 时必须同时断言「原标签还在」，
+    //      只看「新标签挂上了」是测不出来的）；
+    //   ② detach 后标签归零会自动删除，但候选集必须是「原本真挂着、这次被摘掉」的那些标签，
+    //      且**在 DELETE 之前取** —— 拿请求参数当候选，会把「刚建好、还没挂过任何素材」的标签当场删掉；
+    //   ③ 浮层 `position:absolute` 不进文档流：打开前后批量条高度、`--bb-extra`、网格底部留白三者都不得动
+    //      （浮层一旦占位会把条子撑高，底部让位与「回到顶部」浮标整体漂移）。
+    //
+    // 另外顺手锁死几个「已经写进文档但不测就会飘」的点：错误码（ERR_ASSET_NOT_FOUND /
+    // ERR_TAG_NOT_FOUND / ERR_INVALID_MODE）、`tag:create` 的 trim + ERR_EMPTY_NAME + ERR_TAG_EXISTS、
+    // `asset:bulk-update` 仍然只认 rating/isFav（批量打标没被塞进那条通道）。
+    step('H10-批量打标')
+
+    // 再导入 3 张（尺寸各异，避免瀑布流叠在一起点错）——「多选 3 项挂同一标签」要有足够素材
+    const bulkSrc: string[] = []
+    const BULK_IMAGES: Array<[string, number]> = [
+      ['甲.png', 100],
+      ['乙.png', 130],
+      ['丙.png', 160]
+    ]
+    for (const [name, size] of BULK_IMAGES) {
+      const p = join(dir, name)
+      await sharp({ create: { width: size, height: size, channels: 3, background: { r: 210, g: 120, b: 70 } } })
+        .png()
+        .toFile(p)
+      bulkSrc.push(p)
+    }
+    const imp10 = await new Promise<{ added: number }>((resolve) =>
+      importFiles({ paths: bulkSrc, folderId: null, mode: 'copy', onDone: (x) => resolve(x) })
+    )
+
+    // 三个标签各有分工，别混用：
+    //   批量A  —— 待挂 → 再摘到归零 → 必须被自动清除（H10f）
+    //   预挂P  —— 预先只挂在 甲.png 上 → 浮层三态里必须是「部分挂 some」
+    //   未挂过 —— 建好后**一个素材都没挂** → 对它 detach 绝不能把它删掉（候选集语义的靶子）
+    const tBulkA = createTag({ name: '批量A' })
+    const tSome = createTag({ name: '预挂P' })
+    const tFresh = createTag({ name: '未挂过' })
+    setTags(assetIdOf('甲.png'), [tSome.id])
+
+    const reloadedH10 = onceLoaded(win)
+    await rawJs(`location.reload()`)
+    await reloadedH10
+    // 等「新导入的 3 张 + 原有 2 张」全部上卡并且标签行渲染出来，再开始点（不用固定 sleep）
+    const h10Ready = await waitUntil(
+      `document.querySelectorAll('.masonry-card').length >= 5 && !!document.querySelector('.side-item[data-tag-id="${tSome.id}"]')`,
+      20000
+    )
+    const idJia = assetIdOf('甲.png')
+    const idYi = assetIdOf('乙.png')
+    const idBing = assetIdOf('丙.png')
+    R.h10_setup = {
+      ready: h10Ready,
+      imported: imp10.added,
+      cards: await cardNames(),
+      tags: tagRows().map((t) => t.name),
+      sidebar: await sideMap(),
+      // 红.png 此刻挂着 H9h 那 12 个标签 —— 它就是「追加不覆盖」的靶子
+      redTags: assetTagNames(idRedCard),
+      // 前置：批量A 一个都没挂、预挂P 只挂 甲、未挂过 一个都没挂
+      preAttach: { a: tagLinkCount(tBulkA.id), p: tagAssetNames(tSome.id), fresh: tagLinkCount(tFresh.id) }
+    }
+
+    // H10a 多选 3 项：红（原有 12 标签）+ 甲 + 乙
+    await clickEl(`.masonry-card[data-id="${idRedCard}"]`)
+    const selOne = await waitUntil(
+      `document.querySelectorAll('.masonry-card.selected').length === 1 && !!document.querySelector('.detail')`,
+      8000
+    )
+    const ctrlJia = await clickElWith(`.masonry-card[data-id="${idJia}"]`, ['control'])
+    const selTwo = await waitUntil(`document.querySelectorAll('.masonry-card.selected').length === 2`, 8000)
+    const ctrlYi = await clickElWith(`.masonry-card[data-id="${idYi}"]`, ['control'])
+    const selThree = await waitUntil(`document.querySelectorAll('.masonry-card.selected').length === 3`, 8000)
+    R.h10_select = {
+      selOne,
+      ctrlJia,
+      selTwo,
+      ctrlYi,
+      selThree,
+      selected: await js(`document.querySelectorAll('.masonry-card.selected').length`)
+    }
+
+    // H10b 浮层关闭时的批量条基线（条高 / --bb-extra / 网格底部留白）
+    const barClosed = await bulkSnap()
+
+    // H10c 点「标签」→ 浮层出现，且条子几何分毫不动
+    const tagsBtnClicked = await clickEl('.batchbar [data-bb-tags]')
+    const panelShown = await waitUntil(`!!document.querySelector('[data-bb-tag-panel]')`, 8000)
+    const barOpen = await bulkSnap()
+    R.h10_panel = { tagsBtnClicked, panelShown, barClosed, barOpen }
+    // 按钮顺序：「标签」必须排在「喜欢」之后 —— `--smoke-m4` 的 h13 用 `.bb-btn` 索引 0 点「喜欢」，
+    // 把「标签」插到前面会让那条几何断言点错按钮（点开浮层而不是切换喜欢）
+    R.h10_btnOrder = await js(`[...document.querySelectorAll('.batchbar .bb-btn')].map(b => b.textContent.trim())`)
+    await capture('shot-bulk-tag.png')
+
+    // H10d 三态：批量A「都没挂」、预挂P「部分挂」、行尾计数等于 DB 里的全局挂载数
+    const rowA0 = rowOf(barOpen, tBulkA.id)
+    const rowP0 = rowOf(barOpen, tSome.id)
+    const rowF0 = rowOf(barOpen, tFresh.id)
+    R.h10_tristate = {
+      rows: barOpen.rows,
+      a: rowA0,
+      p: rowP0,
+      fresh: rowF0,
+      // 行尾计数是 `counts.byTag`（全局挂载数），与 DB 逐一对账
+      dbCountA: tagLinkCount(tBulkA.id),
+      dbCountP: tagLinkCount(tSome.id),
+      // 悬浮语义：浮层下沿贴住条子上沿（实测净空 0~12px），既不与条子重叠、也没把它顶开
+      gapAboveBar: barOpen.barTop - barOpen.panelBottom
+    }
+
+    // H10e 挂上「批量A」：3 项各 +1 行关联、红.png 的原 12 个标签必须一个不少
+    // 先用输入框把列表收到「批量」一行（下拉有 15+ 个标签、要滚动，按名字过滤比滚着点稳）
+    await js(`(() => { const i = document.querySelector('[data-bb-tag-input]'); if (!i) return false; i.focus(); return true })()`)
+    win.webContents.insertText('批量')
+    const filteredA = await waitUntil(`document.querySelectorAll('[data-bb-tag-option-id]').length === 1`, 8000)
+    const attachClicked = await clickEl(`[data-bb-tag-option-id="${tBulkA.id}"]`)
+    // ⚠️ 提示文案按 `\s*` 写：`已为${n} 项…` 的模板里，数字前没有空格、后面有一个
+    //（`已为3 项挂上标签`）。断言对齐的是「谁 + 几项 + 哪个标签」这个语义，
+    // 不锁死标点/空格的排版细节 —— 那属于文案打磨，不该让冒烟红。
+    const attachNoticeSeen = await waitUntil(
+      `/已为\\s*3\\s*项挂上标签「批量A」/.test(document.querySelector('.notice-toast')?.textContent ?? '')`,
+      10000
+    )
+    const afterAttach = await bulkSnap()
+    R.h10_attach = {
+      filteredA,
+      attachClicked,
+      attachNoticeSeen,
+      notice: await noticeText(),
+      linkCount: tagLinkCount(tBulkA.id),
+      assets: tagAssetNames(tBulkA.id),
+      // ① 追加不覆盖的核心证据：红.png 仍是 13 个标签（原 12 + 批量A）
+      redTags: assetTagNames(idRedCard),
+      // 同样重要的反面证据：没被选中的 蓝.png 一个字节都不该动
+      blueTags: assetTagNames(assetIdOf('蓝.png')),
+      sidebar: await sideMap(),
+      row: rowOf(afterAttach, tBulkA.id),
+      dbCount: tagLinkCount(tBulkA.id)
+    }
+
+    // H10f 再点同一行（三态已变 all）→ detach → 批量A 归零 → 自动清除 + 提示带「已自动清除」
+    const detachClicked = await clickEl(`[data-bb-tag-option-id="${tBulkA.id}"]`)
+    const pruneNoticeSeen = await waitUntil(
+      `/已自动清除/.test(document.querySelector('.notice-toast')?.textContent ?? '')`,
+      10000
+    )
+    const afterDetach = await bulkSnap()
+    R.h10_detach = {
+      detachClicked,
+      pruneNoticeSeen,
+      notice: await noticeText(),
+      tagGone: tagIdOf('批量A') == null,
+      tags: tagRows().map((t) => t.name),
+      linkRows: links().filter((l) => l.endsWith('→批量A')).length,
+      orphans: orphans(),
+      sidebar: await sideMap(),
+      zeroRows: (await sidebarTags()).filter((t) => t.count === 0).map((t) => t.name),
+      // ② 反向证据：摘掉批量A 之后，红.png 必须回到原来那 12 个标签，一个不多一个不少
+      //（若 detach 写成了「整体替换/清空」，这里会变成 0）
+      redTags: assetTagNames(idRedCard),
+      panelStillOpen: afterDetach.panel
+    }
+    await capture('shot-bulk-tag-pruned.png')
+
+    // H10g Esc 只收浮层，不该把整批选中一起清掉（GalleryGrid 在 window 上有全局 Esc=取消多选）
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+    const escClosedPanel = await waitUntil(`!document.querySelector('[data-bb-tag-panel]')`, 6000)
+    R.h10_esc = {
+      escClosedPanel,
+      selectedAfterEsc: (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number | null,
+      barStillThere: (await bulkSnap()).bar
+    }
+
+    // ==================== H10h. IPC 层负例与「候选集」语义（走真实 preload → IPC → 服务层）====================
+    const idsJson = JSON.stringify([idRedCard, idJia, idYi])
+    type IpcRes = { ok: boolean; data?: unknown; error?: string } | null
+    const ipc = async (code: string): Promise<IpcRes> => (await js(code)) as IpcRes
+
+    const attachPartial = await ipc(
+      `window.stash.asset.bulkTags(${JSON.stringify([idJia, idYi])}, [${tSome.id}], 'attach')`
+    )
+    // 再挂一次完全相同的组合：INSERT OR IGNORE → 0 行变更，而不是报错/重复插入
+    const attachAgain = await ipc(
+      `window.stash.asset.bulkTags(${JSON.stringify([idJia, idYi])}, [${tSome.id}], 'attach')`
+    )
+    // ② 的核心靶子：detach 一个「建好后没挂过任何素材」的标签 → 关联 0 行、且**绝不能**把它清掉
+    const detachUnlinked = await ipc(`window.stash.asset.bulkTags(${idsJson}, [${tFresh.id}], 'detach')`)
+    R.h10_ipc = {
+      attachPartial,
+      attachAgain,
+      detachUnlinked,
+      pAfterAttach: tagAssetNames(tSome.id),
+      pLinkCount: tagLinkCount(tSome.id),
+      freshStillExists: tagIdOf('未挂过') != null,
+      freshLinkCount: tagLinkCount(tFresh.id),
+      orphans: orphans()
+    }
+
+    // H10i 错误码 + tag:create 硬化（纯 IPC，不碰界面）
+    const assetMissing = await ipc(`window.stash.asset.bulkTags([999999], [${tSome.id}], 'attach')`)
+    const tagMissing = await ipc(`window.stash.asset.bulkTags([${idRedCard}], [999999], 'attach')`)
+    const badMode = await ipc(`window.stash.asset.bulkTags([${idRedCard}], [${tSome.id}], 'toggle')`)
+    const emptyName = await ipc(`window.stash.tag.create({ name: '   ' })`)
+    const paddedExisting = await ipc(`window.stash.tag.create({ name: ' 预挂P ' })`)
+    const paddedNew = await ipc(`window.stash.tag.create({ name: '  新空格标签  ' })`)
+    R.h10_errors = {
+      assetMissing,
+      tagMissing,
+      badMode,
+      emptyName,
+      paddedExisting,
+      paddedNew,
+      tags: tagRows().map((t) => t.name)
+    }
+
+    // H10j `asset:bulk-update` 仍然只认 rating/isFav：塞进去的 tagIds 必须被完全忽略
+    //（批量打标刻意走独立通道，没被塞进这条老接口 —— 否则「只改评分」会顺手改标签）
+    const bingTagsBefore = assetTagNames(idBing)
+    const bulkUpdateWithTags = await ipc(
+      `window.stash.asset.bulkUpdate([${idBing}], { rating: 2, tagIds: [${tSome.id}] })`
+    )
+    R.h10_bulkUpdate = {
+      res: bulkUpdateWithTags,
+      ratingAfter:
+        (D().prepare('SELECT rating FROM assets WHERE id=?').get(idBing) as { rating: number } | undefined)?.rating ?? -1,
+      tagsBefore: bingTagsBefore,
+      tagsAfter: assetTagNames(idBing),
+      pLinkCountUnchanged: tagLinkCount(tSome.id)
+    }
+
     // ==================== 断言汇总 ====================
     const a = R.a_setup as { added: number; tags: string[]; links: string[]; orphans: number }
     const h0 = R.h0_sidebar as Record<string, number>
@@ -761,6 +1112,52 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       snap: RecentSnap; attached: number[]; expect: number[]; pickedName: string | null
     }
     const h9all = R.h9_allAttached as RecentSnap
+    const h10s = R.h10_setup as {
+      ready: boolean; imported: number; cards: string[]; tags: string[]; sidebar: Record<string, number>
+      redTags: string[]; preAttach: { a: number; p: string[]; fresh: number }
+    }
+    const h10sel = R.h10_select as {
+      selOne: boolean; ctrlJia: boolean; selTwo: boolean; ctrlYi: boolean; selThree: boolean
+      selected: number | null
+    }
+    const h10p = R.h10_panel as { tagsBtnClicked: boolean; panelShown: boolean; barClosed: BulkSnap; barOpen: BulkSnap }
+    const h10t = R.h10_tristate as {
+      rows: number
+      a: { state: string; count: number; name: string } | null
+      p: { state: string; count: number; name: string } | null
+      fresh: { state: string; count: number; name: string } | null
+      dbCountA: number; dbCountP: number; gapAboveBar: number
+    }
+    const h10a = R.h10_attach as {
+      filteredA: boolean; attachClicked: boolean; attachNoticeSeen: boolean; notice: string | null
+      linkCount: number; assets: string[]; redTags: string[]; blueTags: string[]; sidebar: Record<string, number>
+      row: { state: string; count: number; name: string } | null; dbCount: number
+    }
+    const h10d = R.h10_detach as {
+      detachClicked: boolean; pruneNoticeSeen: boolean; notice: string | null; tagGone: boolean
+      tags: string[]; linkRows: number; orphans: number; sidebar: Record<string, number>; zeroRows: string[]
+      redTags: string[]; panelStillOpen: boolean
+    }
+    const h10e = R.h10_esc as { escClosedPanel: boolean; selectedAfterEsc: number | null; barStillThere: boolean }
+    const h10i = R.h10_ipc as {
+      attachPartial: { ok: boolean; data?: unknown } | null
+      attachAgain: { ok: boolean; data?: unknown } | null
+      detachUnlinked: { ok: boolean; data?: unknown } | null
+      pAfterAttach: string[]; pLinkCount: number; freshStillExists: boolean; freshLinkCount: number; orphans: number
+    }
+    const h10er = R.h10_errors as {
+      assetMissing: { ok: boolean; error?: string } | null
+      tagMissing: { ok: boolean; error?: string } | null
+      badMode: { ok: boolean; error?: string } | null
+      emptyName: { ok: boolean; error?: string } | null
+      paddedExisting: { ok: boolean; error?: string } | null
+      paddedNew: { ok: boolean; error?: string } | null
+      tags: string[]
+    }
+    const h10b = R.h10_bulkUpdate as {
+      res: { ok: boolean; data?: unknown } | null
+      ratingAfter: number; tagsBefore: string[]; tagsAfter: string[]; pLinkCountUnchanged: number
+    }
 
     R.checks = {
       // A 素材与标签就位
@@ -897,6 +1294,91 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       // ⑦ 12 个标签全挂上后：没有可加的了，提示换成「都已添加」
       recentAllAttachedHint: h9all?.present === true && (h9all?.ids?.length ?? -1) === 0 &&
         h9all?.hint === '近期标签都已添加' && h9all?.inputShown === true,
+
+      // ==================== H10 批量打标（多选批量条的「标签」浮层）====================
+      // 前置：3 张新素材上卡、三个靶子标签各就各位、红.png 仍挂着 12 个标签
+      bulkSetupOk: h10s?.ready === true && h10s?.imported === 3 && (h10s?.cards?.length ?? -1) === 5 &&
+        (h10s?.redTags?.length ?? -1) === 12 &&
+        h10s?.preAttach?.a === 0 && (h10s?.preAttach?.p ?? []).join('|') === '甲.png' &&
+        h10s?.preAttach?.fresh === 0,
+      // 多选 3 项：每一下点击都必须真的生效（等待也是断言的一部分，G11）
+      bulkSelectThree: h10sel?.selOne === true && h10sel?.ctrlJia === true && h10sel?.selTwo === true &&
+        h10sel?.ctrlYi === true && h10sel?.selThree === true && h10sel?.selected === 3,
+      // ③ 浮层绝对定位、浮在条子上方留缝（不是把条子顶开）
+      bulkPanelFloats: h10p?.panelShown === true && h10p?.tagsBtnClicked === true &&
+        h10p?.barOpen?.panel === true && h10p?.barOpen?.panelPosition === 'absolute' &&
+        (h10t?.gapAboveBar ?? -99) >= 0 && (h10t?.gapAboveBar ?? 99) <= 12,
+      // 「标签」按钮排在「喜欢」之后（否则 --smoke-m4 的 h13 会点到它）
+      bulkTagsBtnAfterFav: ((R.h10_btnOrder as string[] | null)?.[0] ?? '') === '喜欢' &&
+        ((R.h10_btnOrder as string[] | null)?.[1] ?? '') === '标签',
+      // ③ 关键：打开浮层前后，条高 / --bb-extra / 网格底部留白三者**分毫不动**
+      //（改成 static/relative 立刻变红：条子被撑高 → 三项一起漂）
+      bulkPanelDoesNotShiftBar: h10p?.barClosed?.barH === h10p?.barOpen?.barH &&
+        h10p?.barClosed?.extra === h10p?.barOpen?.extra &&
+        h10p?.barClosed?.padBottom === h10p?.barOpen?.padBottom,
+      // 单行高度必须仍是 44（.to-top 让位与 --smoke-m4 的 h13 几何断言都按 44 算），
+      // 且 --bb-extra 应为 0px、网格底部留白 84
+      bulkBarSingleLine44: h10p?.barOpen?.barH === 44 && h10p?.barOpen?.extra === '0px' &&
+        h10p?.barOpen?.padBottom === 84,
+      // 三态：批量A 都没挂 → none；预挂P 只在 3 项中的 1 项上 → some；行尾计数与 DB 一致
+      bulkTriState: h10t?.a?.state === 'none' && h10t?.p?.state === 'some' && h10t?.fresh?.state === 'none' &&
+        h10t?.a?.count === h10t?.dbCountA && h10t?.p?.count === h10t?.dbCountP,
+      // ② 多选 3 项挂同一标签 → DB 关联 +3、侧栏计数 +3（从 0 到 3）
+      bulkAttachClickLanded: h10a?.filteredA === true && h10a?.attachClicked === true,
+      bulkAttachCountsDb: h10a?.linkCount === 3 &&
+        sameSet(h10a?.assets, ['甲.png', '乙.png', '红.png']) && h10a?.dbCount === 3,
+      bulkAttachSidebarPlus3: h10a?.sidebar?.['批量A'] === 3,
+      bulkAttachRowAll: h10a?.row?.state === 'all' && h10a?.row?.count === 3,
+      bulkAttachNotifies: h10a?.attachNoticeSeen === true && /已为\s*3\s*项挂上标签「批量A」/.test(h10a?.notice ?? ''),
+      // ① 追加不覆盖：红.png 原本 12 个标签，挂完仍是 13 个（12 + 批量A），一个都不许少
+      bulkAttachAppendsNotOverwrites: (h10a?.redTags?.length ?? -1) === 13 &&
+        h10a.redTags!.includes('批量A') && h10a.redTags!.includes('标签01') && h10a.redTags!.includes('标签12'),
+      // 反面证据：没被选中的 蓝.png 一个字节都没动
+      bulkAttachLeavesOthersAlone: sameSet(h10a?.blueTags, ['标签11', '标签10', '标签09']),
+
+      // ② detach 到归零 → 标签自动删除，提示带「已自动清除」
+      bulkDetachClickLanded: h10d?.detachClicked === true,
+      bulkDetachPrunesTag: h10d?.tagGone === true && h10d?.tags?.includes('批量A') === false,
+      bulkDetachClearsLinks: h10d?.linkRows === 0 && h10d?.orphans === 0,
+      bulkDetachRemovesSidebarRow: h10d?.sidebar?.['批量A'] === undefined &&
+        // 此刻侧栏允许存在**一个**计数 0 的行：`未挂过` 是刚建好、还没挂任何素材的标签，
+        // 「创建与挂载之间有窗口期」正是 `selectEmptyTags` 刻意保护的状态（见其注释），
+        // 它本来就该留着。批量A 这种「刚被摘空」的必须消失 —— 两者的区别就是本段要守的边界。
+        (h10d?.zeroRows ?? []).join('|') === '未挂过',
+      bulkDetachNotifiesPruned: h10d?.pruneNoticeSeen === true &&
+        /已从\s*3\s*项上摘除标签「批量A」/.test(h10d?.notice ?? '') &&
+        /已自动清除/.test(h10d?.notice ?? ''),
+      // 摘掉之后红.png 必须回到原来那 12 个标签（写错成「整体替换」会变成 0）
+      bulkDetachKeepsOtherTags: (h10d?.redTags?.length ?? -1) === 12 && h10d?.redTags?.includes('标签12') === true &&
+        h10d?.redTags?.includes('批量A') === false,
+      // Esc 只收浮层、不清选中（GalleryGrid 的全局 Esc 被捕获阶段拦掉了）
+      bulkEscClosesPanelOnly: h10e?.escClosedPanel === true && h10e?.selectedAfterEsc === 3 && h10e?.barStillThere === true,
+
+      // ② 候选集语义（IPC 直调）：detach 一个「建好后没挂过素材」的标签 → 0 行变更 + 返回 pruned 空 + 标签仍在
+      bulkIpcAttachPartial: (h10i?.attachPartial?.data as { attached?: number } | undefined)?.attached === 1 &&
+        (h10i?.pLinkCount ?? -1) === 2,
+      // INSERT OR IGNORE：同一组合再挂一次是 0 行变更，不是报错也不是重复行
+      bulkIpcAttachIdempotent: (h10i?.attachAgain?.data as { attached?: number } | undefined)?.attached === 0 &&
+        (h10i?.pAfterAttach?.length ?? -1) === 2,
+      bulkIpcDetachUnlinked: h10i?.detachUnlinked?.ok === true &&
+        (h10i?.detachUnlinked?.data as { detached?: number; pruned?: unknown[] } | undefined)?.detached === 0 &&
+        ((h10i?.detachUnlinked?.data as { pruned?: unknown[] } | undefined)?.pruned?.length ?? -1) === 0,
+      // 核心：摘一个从没挂过的标签，标签本体必须还在（拿请求参数当候选集就会把它删掉）
+      bulkDetachUnlinkedKeepsTag: h10i?.freshStillExists === true && h10i?.freshLinkCount === 0 && h10i?.orphans === 0,
+
+      // 错误码
+      bulkErrAssetNotFound: h10er?.assetMissing?.ok === false && h10er?.assetMissing?.error === 'ERR_ASSET_NOT_FOUND',
+      bulkErrTagNotFound: h10er?.tagMissing?.ok === false && h10er?.tagMissing?.error === 'ERR_TAG_NOT_FOUND',
+      bulkErrInvalidMode: h10er?.badMode?.ok === false && h10er?.badMode?.error === 'ERR_INVALID_MODE',
+      // tag:create 硬化：空名（含纯空格）报 ERR_EMPTY_NAME，trim 后重名报 ERR_TAG_EXISTS
+      bulkTagCreateEmptyName: h10er?.emptyName?.ok === false && h10er?.emptyName?.error === 'ERR_EMPTY_NAME',
+      bulkTagCreateTrimRejectsDup: h10er?.paddedExisting?.ok === false && h10er?.paddedExisting?.error === 'ERR_TAG_EXISTS',
+      // 带空格的新名要按 trim 后落库（不是原样存进去）
+      bulkTagCreateTrimmed: h10er?.paddedNew?.ok === true && h10er?.tags?.includes('新空格标签') === true &&
+        h10er?.tags?.some((n) => n !== n.trim()) === false,
+      // `asset:bulk-update` 仍然只认 rating/isFav：塞进去的 tagIds 被完全忽略
+      bulkUpdateIgnoresTags: h10b?.ratingAfter === 2 && sameSet(h10b?.tagsAfter, h10b?.tagsBefore ?? []) &&
+        (h10b?.pLinkCountUnchanged ?? -1) === 2,
 
       // 渲染层不应有 JS 报错
       noJsErrors: jsErrors.length === 0

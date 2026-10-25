@@ -154,6 +154,16 @@ export interface StashAssetApi {
   }>
   /** 重写素材的标签集合；摘空的标签会被自动删除，清单见 `pruned` */
   setTags: (id: number, tagIds: number[]) => Promise<{ ok: boolean; data?: { pruned: StashPrunedTag[] }; error?: string }>
+  /**
+   * 批量挂 / 摘标签（多选批量条用）。**增量语义**，与 `setTags` 的整体替换不同：
+   * `attach` = 追加（`INSERT OR IGNORE`，绝不覆盖素材已有的其他标签）；
+   * `detach` = 只摘掉指定标签。摘空的标签会被自动删除，清单见 `pruned`。
+   */
+  bulkTags: (ids: number[], tagIds: number[], mode: 'attach' | 'detach') => Promise<{
+    ok: boolean
+    data?: { attached: number; detached: number; pruned: StashPrunedTag[] }
+    error?: string
+  }>
   /** 重命名素材文件名（物理文件 + 索引同步；扩展名不可修改）。
    *  `name` 是最终生效的名字；`renamedFrom` 非空表示原名被占用、已自动改名 */
   rename: (id: number, name: string) => Promise<{

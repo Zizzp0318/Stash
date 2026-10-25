@@ -508,6 +508,11 @@ function bootstrap(): void {
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（分流在服务层） */
     ipcMain.handle('asset:paste', (_e, { paths, folderId }) => wrap(() => assetsSvc.pastePaths(paths ?? [], folderId ?? null)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
+    // 批量打标：**增量**语义（attach = 追加，绝不覆盖素材已有的其他标签），
+    // 与上面 setTags 的「单素材整体替换」刻意分开 —— 复用 setTags 会把每张素材原有的标签抹掉
+    ipcMain.handle('asset:bulk-tags', (_e, { ids, tagIds, mode }) =>
+      wrap(() => assetsSvc.bulkUpdateTags((ids ?? []) as number[], (tagIds ?? []) as number[], mode))
+    )
 
     // 放大预览：先问「这张该怎么给」（原文件直出 / 要派生 / 不支持），需要派生时再显式发起生成。
     // 生成是长任务，IPC 不等它 —— 进度与结果走 preview:progress / preview:done 事件。

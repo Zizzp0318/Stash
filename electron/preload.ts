@@ -73,6 +73,13 @@ contextBridge.exposeInMainWorld('stash', {
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线 */
     paste: (paths: string[], folderId?: number | null) => ipcRenderer.invoke('asset:paste', { paths, folderId }),
     setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds }),
+    /**
+     * 批量挂 / 摘标签（多选批量条用）。
+     * **追加语义**：attach 只往素材上加，不覆盖已有的其他标签；detach 只摘指定标签。
+     * 与上面 setTags（单素材整体替换）是两套语义，别混。
+     */
+    bulkTags: (ids: number[], tagIds: number[], mode: 'attach' | 'detach') =>
+      ipcRenderer.invoke('asset:bulk-tags', { ids, tagIds, mode }),
     /** 读文本素材内容（主进程负责编码兜底与大小上限，回传 encoding / readOnly） */
     text: (id: number) => ipcRenderer.invoke('asset:text', { id }),
     /**

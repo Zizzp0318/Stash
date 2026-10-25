@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // 底部悬浮批量操作条：选中 ≥1 项时出现
-// 只做「批量该做的事」——打标按需求不提供，标签仍在右侧详情里单个编辑
-import { ref, watch, onBeforeUnmount } from 'vue'
+// 只做「批量该做的事」——评分 / 喜欢 / 标签 / 压缩 / 移动 / 删除
+import { ref, computed, watch, onBeforeUnmount } from 'vue'
 import { useAssetStore } from '../stores/assets'
+import { useLibraryStore } from '../stores/library'
 
 const assets = useAssetStore()
+const lib = useLibraryStore()
 const emit = defineEmits<{ (e: 'move'): void; (e: 'remove'): void; (e: 'compress'): void }>()
 
 // 悬停时预览评分（不影响已选中的公共评分）
@@ -67,7 +69,8 @@ watch(
   barEl,
   (el) => {
     detach()
-    if (!el) return
+    // 条子撤了（取消选择 / 选中数归零）→ 标签浮层一并收起，别留一个悬空的操作面板
+    if (!el) return closeTagPanel()
     hostEl = el.parentElement
     // 首帧同步量一次：变量在挂载这帧就位，避免「先 84、下一帧才 118」的闪跳
     applyHeight(el.getBoundingClientRect().height)
@@ -77,7 +80,134 @@ watch(
   { flush: 'post' }
 )
 
-onBeforeUnmount(detach)
+// ==================== 批量打标（标签浮层）====================
+/**
+ * 浮层贴条子（准确说是贴「标签」按钮）上方浮起，**必须 `position:absolute`、不进文档流**：
+ * 条子的高度由 ResizeObserver 实测成 `--bb-extra` 驱动网格底部让位，
+ * 浮层若参与 flex 布局会把条子撑高，让位量跟着整体漂移。
+ * 这与详情页 `tag-menu` 是同一条约束（见开发文档 §6 标签 chips 行）。
+ */
+const tagPanelOpen = ref(false)
+const tagQuery = ref('')
+/** `.bb-tags` 容器：按钮 + 浮层，用来判定「点到浮层外面了」 */
+const tagBoxEl = ref<HTMLElement | null>(null)
+/**
+ * `tagId → 选中项里挂了它的个数`。
+ *
+ * 打开浮层时实测一次（列表行不带 tags，见 store 的 `selectedTagCounts`），
+ * 之后每次挂/摘只在本地维护这一个数，不必反复拉全部详情。
+ */
+const selTagCounts = ref<Record<number, number>>({})
+
+/** 浮层列出的标签 = **全部**已有标签（后端 `tag:list` 已按名字排序），按输入做名字包含过滤 */
+const tagRows = computed(() => {
+  const q = tagQuery.value.trim().toLowerCase()
+  return q ? lib.tags.filter((t) => t.name.toLowerCase().includes(q)) : lib.tags
+})
+
+const tagPanelHint = computed(() =>
+  tagQuery.value.trim() ? `回车新建「${tagQuery.value.trim()}」并挂到选中项` : '还没有标签，输入名称回车新建'
+)
+
+/** 某标签在选中集合里的三态：全挂 / 部分挂 / 都没挂（决定点击是摘还是挂、以及行尾标记） */
+function tagState(tagId: number): 'all' | 'some' | 'none' {
+  const n = selTagCounts.value[tagId] ?? 0
+  if (n <= 0) return 'none'
+  return n >= assets.selectedCount ? 'all' : 'some'
+}
+
+function tagRowTitle(t: { id: number; name: string }): string {
+  const s = tagState(t.id)
+  if (s === 'all') return `从所有选中项上摘除「${t.name}」`
+  if (s === 'some') return `部分选中项已挂「${t.name}」，点击挂到全部`
+  return `把「${t.name}」挂到所有选中项`
+}
+
+function closeTagPanel(): void {
+  tagPanelOpen.value = false
+  tagQuery.value = ''
+}
+
+/** 点浮层外面就收起：用 document 的 mousedown，而不是靠输入框 blur 兜 */
+const onDocMouseDown = (e: MouseEvent): void => {
+  const el = tagBoxEl.value
+  if (el && !el.contains(e.target as Node)) closeTagPanel()
+}
+
+/**
+ * Esc 走**捕获阶段**并 `stopPropagation`：GalleryGrid 在 window 上挂了一份全局 keydown
+ * （Esc = 取消多选）。浮层开着时按 Esc 只该收浮层，不该把整批选中一起清掉
+ * —— 与 SettingsPanel / PreviewStage 同一套处理方式。
+ */
+const onEscCapture = (e: KeyboardEvent): void => {
+  if (e.key !== 'Escape' || !tagPanelOpen.value) return
+  e.stopPropagation()
+  closeTagPanel()
+}
+
+window.addEventListener('keydown', onEscCapture, true)
+
+// 浮层开着时才挂「点外面收起」的监听，收起即摘，避免常驻一个 document 级监听
+watch(tagPanelOpen, (open) => {
+  if (open) document.addEventListener('mousedown', onDocMouseDown, true)
+  else document.removeEventListener('mousedown', onDocMouseDown, true)
+})
+
+/** 开/关浮层。打开时实测一次「每个标签挂了几个选中项」，用于三态显示 */
+async function toggleTagPanel(): Promise<void> {
+  if (tagPanelOpen.value) {
+    closeTagPanel()
+    return
+  }
+  tagPanelOpen.value = true
+  tagQuery.value = ''
+  selTagCounts.value = await assets.selectedTagCounts()
+}
+
+/** 点标签行：全挂 → 从所有选中项摘掉；其余（部分挂 / 没挂）→ 挂到全部 */
+async function toggleTag(tagId: number): Promise<void> {
+  const mode = tagState(tagId) === 'all' ? 'detach' : 'attach'
+  const ok = await assets.bulkTag(tagId, mode)
+  if (!ok) return
+  selTagCounts.value = { ...selTagCounts.value, [tagId]: mode === 'attach' ? assets.selectedCount : 0 }
+}
+
+/**
+ * 输入框回车：重名就用已有的，否则先新建，然后挂到所有选中项。
+ * 顺序与详情页 `addTag` 一致（先查本地标签列表，减少一次注定失败的 IPC），
+ * 重名最终由服务层兜底报 `ERR_TAG_EXISTS`（`createTag` 与 `renameTag` 同一条约定）。
+ *
+ * ⚠️ 刻意**不做** `@blur` 自动提交（详情页单张编辑是 blur 即保存）：
+ * 多选场景下一失焦就把半截查询词建成标签并批量挂到几十项上，代价太大。
+ */
+async function createAndAttach(): Promise<void> {
+  const name = tagQuery.value.trim()
+  if (!name) return
+  const existing = lib.tags.find((t) => t.name === name)
+  let tagId = existing ? existing.id : null
+  if (tagId == null) {
+    const r = await window.stash.tag.create({ name })
+    if (!r.ok || r.data?.id == null) {
+      assets.notify(
+        'error',
+        r.error === 'ERR_TAG_EXISTS' ? `标签「${name}」已存在` : `新建标签失败：${r.error ?? '未知错误'}`
+      )
+      return
+    }
+    tagId = r.data.id
+    // 新标签先进侧栏与浮层列表（此刻计数 0）；挂上之后 bulkTag 会再刷一次计数
+    await lib.loadMeta()
+  }
+  tagQuery.value = ''
+  const ok = await assets.bulkTag(tagId, 'attach')
+  if (ok) selTagCounts.value = { ...selTagCounts.value, [tagId]: assets.selectedCount }
+}
+
+onBeforeUnmount(() => {
+  detach()
+  document.removeEventListener('mousedown', onDocMouseDown, true)
+  window.removeEventListener('keydown', onEscCapture, true)
+})
 
 /**
  * 星标是否点亮：悬停预览优先，未悬停时用选中项的公共评分（0 = 全部未评分）。
@@ -122,7 +252,59 @@ const starOn = (n: number): boolean => n <= (hoverStar.value || assets.selectedR
         {{ assets.selectedAllFav ? '取消喜欢' : '喜欢' }}
       </button>
 
-      <!-- 压缩：四角向内的「收拢」图标，和删除/移动区分得开 -->
+      <!--
+        标签：批量挂 / 摘。按钮 + 浮层同包在 .bb-tags 里（position:relative 的定位锚点）。
+        浮层绝对定位、不进文档流，所以条子高度不受它影响（--bb-extra 不会跟着漂）。
+        ⚠️ 按钮排在「喜欢」之后：--smoke-m4 用 `.bb-btn` 的索引 0 点「喜欢」，插到前面会让它点错按钮。
+      -->
+      <div ref="tagBoxEl" class="bb-tags">
+        <button class="bb-btn" :class="{ on: tagPanelOpen }" data-bb-tags @click="toggleTagPanel">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M1.9 2.2h4.3l4.6 4.6-4.3 4.3-4.6-4.6V2.2z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+            <circle cx="4.5" cy="4.5" r="0.95" fill="currentColor" />
+          </svg>
+          标签
+        </button>
+
+        <div v-if="tagPanelOpen" class="bb-tag-panel" data-bb-tag-panel>
+          <div class="bb-tag-input-row">
+            <input
+              v-model="tagQuery"
+              data-bb-tag-input
+              placeholder="搜索或新建标签…"
+              spellcheck="false"
+              @keyup.enter="createAndAttach"
+            />
+          </div>
+          <div class="bb-tag-list">
+            <span v-if="!tagRows.length" class="tag-menu-empty" data-bb-tag-empty>{{ tagPanelHint }}</span>
+            <button
+              v-for="t in tagRows"
+              :key="t.id"
+              class="tag-menu-item"
+              :data-bb-tag-option-id="t.id"
+              :title="tagRowTitle(t)"
+              @mousedown.prevent
+              @click="toggleTag(t.id)"
+            >
+              <span class="tag-dot" :style="{ background: t.color }"></span>
+              <span class="tag-menu-name">{{ t.name }}</span>
+              <!-- 三态标记：✓ 全部选中项都挂了；— 只有部分挂了；无标记 = 都没挂 -->
+              <span class="bb-tag-state" :class="tagState(t.id)">
+                <svg v-if="tagState(t.id) === 'all'" viewBox="0 0 12 12" fill="none">
+                  <path d="M2.2 6.4l2.5 2.5 5.1-5.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <svg v-else-if="tagState(t.id) === 'some'" viewBox="0 0 12 12" fill="none">
+                  <path d="M2.6 6h6.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                </svg>
+              </span>
+              <span class="tag-menu-count">{{ lib.tagCount(t.id) }}</span>
+            </button>
+          </div>
+          <div class="bb-tag-foot">点标签行即挂/摘；✓ 已挂在全部选中项上</div>
+        </div>
+      </div>
+
       <button class="bb-btn" data-bb-compress @click="emit('compress')">
         <svg viewBox="0 0 13 13" fill="none">
           <path

@@ -555,13 +555,104 @@ export function setTags(assetId: number, tagIds: number[]): { pruned: Array<{ id
   return { pruned: pruneUnlinkedTags(db, unlinked) }
 }
 
+/**
+ * 批量挂 / 摘标签（多条素材共用同一次标签操作）。
+ *
+ * ⚠️ 与 `setTags` 的语义边界，别复用错：
+ *  - `setTags` 是**单张素材的整体替换**（先 DELETE 全部关联再按新集合插回），
+ *    用在批量上会把每张素材原有的其他标签一并抹掉；
+ *  - 这里是**增量**：`attach` = `INSERT OR IGNORE` 追加（素材已有的标签一概不动，
+ *    重复挂同一标签只是 0 行变更，不是错误）；`detach` = 只摘掉指定的那几个标签，
+ *    同样不碰其他标签。
+ *
+ * 归零清理与既有约定一致（见 `pruneUnlinkedTags` 的注释）：
+ *  - `detach` 可能让某个标签一个素材都不剩 → 拿**本次真正摘掉了关联**的标签作候选集清理
+ *    （候选在 DELETE 之前取，绝不把「刚建好、还没挂上任何素材」的标签误删），
+ *    与 `setTags` / `deleteAssets` 走同一条路径，返回 `pruned` 供 UI 提示并清掉失效筛选；
+ *  - `attach` 只会让标签更"满"，不产生归零，不清理。
+ *
+ * 素材与标签都先验存在性：`attach` 走外键，不存在的 `tag_id` 会撞裸的
+ * `FOREIGN KEY constraint failed`，提前报业务错误码比裸约束错好读（同 `renameTag` 的取舍）。
+ */
+export function bulkUpdateTags(
+  ids: number[],
+  tagIds: number[],
+  mode: 'attach' | 'detach'
+): { attached: number; detached: number; pruned: Array<{ id: number; name: string }> } {
+  const { db } = requireCurrent()
+  if (mode !== 'attach' && mode !== 'detach') throw new Error('ERR_INVALID_MODE')
+  // 去重：选中集合理论上不含重复 id，但入参来自渲染层，别把重复项当成「找不到素材」
+  const assetIds = Array.from(new Set(ids.filter((x) => Number.isInteger(x))))
+  const tagIdList = Array.from(new Set(tagIds.filter((x) => Number.isInteger(x))))
+  if (!assetIds.length || !tagIdList.length) return { attached: 0, detached: 0, pruned: [] }
+
+  const aPh = assetIds.map(() => '?').join(',')
+  const tPh = tagIdList.map(() => '?').join(',')
+  const assetFound = (db.prepare(`SELECT count(*) AS c FROM assets WHERE id IN (${aPh})`).get(...assetIds) as { c: number }).c
+  if (assetFound !== assetIds.length) throw new Error('ERR_ASSET_NOT_FOUND')
+  const tagFound = (db.prepare(`SELECT count(*) AS c FROM tags WHERE id IN (${tPh})`).get(...tagIdList) as { c: number }).c
+  if (tagFound !== tagIdList.length) throw new Error('ERR_TAG_NOT_FOUND')
+
+  let attached = 0
+  let detached = 0
+  /**
+   * 归零清理的候选集 = **原本真挂着、这次被摘掉**的标签。
+   *
+   * 必须在 DELETE **之前**取（同 `deleteAssets` 的「先取受影响候选集再删」约定）：
+   * 若直接拿请求里的 `tagIds` 当候选，摘一个刚建好、还没挂上任何素材的标签会把它
+   * 当场删掉（`library.selectEmptyTags` 的注释里记着这个坑：创建与挂载之间有窗口期，
+   * 「此刻是空的」不等于「该被清理」）。
+   */
+  const affectedTagIds =
+    mode === 'detach'
+      ? (
+          db
+            .prepare(`SELECT DISTINCT tag_id FROM asset_tags WHERE asset_id IN (${aPh}) AND tag_id IN (${tPh})`)
+            .all(...assetIds, ...tagIdList) as Array<{ tag_id: number }>
+        ).map((r) => r.tag_id)
+      : []
+
+  db.exec('BEGIN')
+  try {
+    if (mode === 'attach') {
+      // OR IGNORE：已经挂着这张标签的素材只是 0 行变更，不影响其他标签
+      const ins = db.prepare('INSERT OR IGNORE INTO asset_tags(asset_id, tag_id) VALUES(?,?)')
+      for (const aid of assetIds) for (const tid of tagIdList) attached += Number(ins.run(aid, tid).changes)
+    } else {
+      detached = Number(
+        db.prepare(`DELETE FROM asset_tags WHERE asset_id IN (${aPh}) AND tag_id IN (${tPh})`).run(...assetIds, ...tagIdList)
+          .changes
+      )
+    }
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
+  // 清理放在 COMMIT 之后（同 setTags）：读的是已提交状态，清理失败也不会倒灌回关联写入。
+  // 候选集为空时 pruneUnlinkedTags 直接返回 []，不必额外判空
+  const pruned = affectedTagIds.length ? pruneUnlinkedTags(db, affectedTagIds) : []
+  return { attached, detached, pruned }
+}
+
 export function listTags(): unknown[] {
   const { db } = requireCurrent()
   return db.prepare('SELECT id, name, color FROM tags ORDER BY name').all()
 }
 
-export function createTag({ name, color }: { name: string; color?: string }): { id: number } {
+/**
+ * 新建标签本体。
+ *
+ * `tags.name` 有 UNIQUE 约束：这里与 `renameTag` 走**同一条约定** ——
+ * 空名报 `ERR_EMPTY_NAME`、重名报 `ERR_TAG_EXISTS`，比让 SQLite 抛
+ * `UNIQUE constraint failed: tags.name` 好读，渲染层也能直接据此出中文提示。
+ * 名字统一 trim：标签输入框失焦/回车两条路径都会带进用户随手敲的空格。
+ */
+export function createTag({ name: rawName, color }: { name: string; color?: string }): { id: number } {
   const { db } = requireCurrent()
+  const name = (rawName ?? '').trim()
+  if (!name) throw new Error('ERR_EMPTY_NAME')
+  if (db.prepare('SELECT id FROM tags WHERE name=?').get(name)) throw new Error('ERR_TAG_EXISTS')
   const r = db.prepare('INSERT INTO tags(name,color) VALUES(?,?)').run(name, color ?? '#7FA8D9')
   return { id: Number(r.lastInsertRowid) }
 }

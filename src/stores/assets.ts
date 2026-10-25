@@ -497,6 +497,75 @@ export const useAssetStore = defineStore('assets', () => {
   }
 
   /**
+   * 选中集合的标签分布：`tagId → 选中项里挂了它的个数`。
+   *
+   * 批量打标浮层要显示每个标签的三态（全部挂 / 部分挂 / 都没挂），而列表行
+   * （`StashAssetRow`）**不带 tags** —— 标签只挂在详情对象上。所以打开浮层时
+   * 逐张拉一次详情（并发 invoke；主进程是同步 DB 查询，几十到几百张也是毫秒级）。
+   * 选中规模本来就是用户手框/手点的结果，不值得为它再加一条 IPC。
+   */
+  async function selectedTagCounts(): Promise<Record<number, number>> {
+    const ids = selectedIds.value.slice()
+    const map: Record<number, number> = {}
+    if (!ids.length) return map
+    const rs = await Promise.all(ids.map((id) => window.stash.asset.get(id)))
+    for (const r of rs) {
+      if (!r.ok || !r.data) continue
+      for (const t of r.data.tags) map[t.id] = (map[t.id] ?? 0) + 1
+    }
+    return map
+  }
+
+  /**
+   * 批量挂 / 摘一张标签（多选批量条的「标签」浮层）。
+   *
+   * 与详情页的单张编辑语义不同：服务层 `asset:bulk-tags` 是**增量**的 ——
+   * attach 只追加，绝不覆盖每张素材原有的其他标签；detach 只摘指定标签。
+   *
+   * 收尾与 `bulkDelete` 对齐：detach 可能让标签归零，服务层会把它自动删掉
+   * （`pruned`），此时先清掉指向它的筛选再刷新，否则列表会卡在一个永远查不到东西的条件上。
+   * 刷新走 `keepDepth`：批量打标不改变"看哪一屏"，把用户弹回第一页是纯打扰。
+   *
+   * @returns 是否成功（调用方据此决定要不要更新自己的三态缓存）
+   */
+  async function bulkTag(tagId: number, mode: 'attach' | 'detach'): Promise<boolean> {
+    const ids = selectedIds.value.slice()
+    if (!ids.length) return false
+    const lib = useLibraryStore()
+    // 名字要在 IPC **之前**取：detach 若把标签摘到归零，服务层会顺手删掉它，
+    // 事后再查 lib.tags 就查不到了，提示会变成空的「标签「」」
+    const tagName = lib.tags.find((t) => t.id === tagId)?.name ?? ''
+    const r = await window.stash.asset.bulkTags(ids, [tagId], mode)
+    if (!r.ok) {
+      notify('error', `${mode === 'attach' ? '挂' : '摘'}标签失败：${r.error ?? '未知错误'}`)
+      return false
+    }
+    const pruned = r.data?.pruned
+    // detach 可能让标签归零并被服务层自动删除 → 先清掉指向它的筛选（必须在 refresh 之前）
+    dropPrunedTagFilter(pruned)
+    // 标签列表与侧栏计数：挂/摘都会变（挂上去 +N，摘下来 -N，归零的标签直接消失）
+    await lib.loadMeta()
+    // 列表本身也可能受影响：正按这个标签筛选时，摘掉后该素材就不该再出现在结果里
+    await refresh({ keepDepth: true })
+    // 详情栏若正显示其中一张选中素材，它的标签 chips 要跟着变
+    await reloadDetail()
+    const note = prunedNote(pruned)
+    const tail = note ? `；${note}` : ''
+    /**
+     * 数量文案。数字分支**自带前导空格**：拼出来是「已为 3 项…」而不是「已为3 项…」，
+     * 与邻近的「已删除 3 项（…）」「已取消喜欢 1 项」排版一致
+     * （挂/摘两条提示共用这个片段，摘除分支同样是「已从 3 项上摘除…」）。
+     * 单张走「该素材」，此时不需要空格：中文里「已为该素材挂上标签」本来就通顺。
+     */
+    const who = ids.length === 1 ? '该素材' : ` ${ids.length} 项`
+    notify(
+      'info',
+      mode === 'attach' ? `已为${who}挂上标签「${tagName}」${tail}` : `已从${who}上摘除标签「${tagName}」${tail}`
+    )
+    return true
+  }
+
+  /**
    * 详情页 / 卡片上的即时改评分与喜欢。
    *
    * ⚠️ 入参用 **DB 列名**（`is_fav`）而不是 IPC 那边的 camelCase `isFav`，
@@ -617,6 +686,7 @@ export const useAssetStore = defineStore('assets', () => {
     refresh, loadMore, select, loadDetail, toggleSelect, selectMany, clearSelection,
     dragIds, dragOverFolderId, dragOriginFolderId, beginDragMove, setDragOver, endDragMove,
     patchLocal, saveNote, copySelection, pasteInto, bulkRate, bulkFav, bulkMove, bulkDelete, reset,
+    bulkTag, selectedTagCounts,
     prunedNote, dropPrunedTagFilter
   }
 })

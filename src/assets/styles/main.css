@@ -1382,6 +1382,59 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .bb-btn.ghost { color: var(--text-3); font-size: 11px; }
 .bb-btn.ghost:hover { color: var(--text-1); }
 
+/* ============ 批量打标浮层（BatchBar 的「标签」按钮） ============ */
+/* .bb-tags 是浮层的定位锚点：inline-flex 让按钮尺寸不受浮层影响（浮层 absolute，已脱离文档流） */
+.bb-tags { position: relative; display: inline-flex; }
+/*
+ * 浮层贴按钮上方浮起。**绝不能进文档流**（改 static/relative）：
+ * 条子的高度被 ResizeObserver 实测成 `--bb-extra` 用来给网格底部与回到顶部浮标让位，
+ * 浮层一旦占位会把条子撑高，让位量整体漂移（与详情页 .tag-menu 同一条约束）。
+ * 条子本身带 `white-space:nowrap`，这里要显式复原，否则标签名与提示行不换行、宽度炸开。
+ */
+.bb-tag-panel {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  z-index: 41;
+  width: 232px;
+  padding: 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-raised);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+  white-space: normal;
+}
+.bb-tag-input-row { padding: 0 1px 5px; }
+.bb-tag-input-row input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-border);
+  background: var(--bg-input);
+  color: var(--text-1);
+  font-size: 11.5px;
+  font-family: var(--font);
+  outline: none;
+}
+/* 列表 8 行封顶（26px/行 + 内边距），再多就滚动：浮层不能一路长到盖住工具条 */
+.bb-tag-list { max-height: 216px; overflow-y: auto; }
+/* 三态标记：✓ = 全部选中项都挂着；— = 只有部分挂着；都没有 = 全没挂 */
+.bb-tag-state { display: inline-flex; width: 12px; height: 12px; flex-shrink: 0; color: var(--accent); }
+.bb-tag-state svg { width: 12px; height: 12px; }
+.bb-tag-state.none { color: transparent; }
+.bb-tag-state.some { color: var(--text-3); }
+.bb-tag-foot {
+  padding: 5px 3px 1px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 3px;
+}
+
 /* 悬浮条出入场 */
 .raise-enter-active, .raise-leave-active { transition: opacity 0.16s ease, transform 0.16s ease; }
 .raise-enter-from, .raise-leave-to { opacity: 0; transform: translate(-50%, 12px); }
