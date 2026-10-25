@@ -259,9 +259,11 @@ export interface StashClipboardApi {
 
 export interface StashTagApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ id: number; name: string; color: string }>; error?: string }>
-  create: (args: { name: string; color?: string }) => Promise<{ ok: boolean; data?: { id: number }; error?: string }>
+  create: (args: { name: string; color?: string }) => Promise<{ ok: boolean; data?: { id: number; color: string }; error?: string }>
   /** 重命名标签本体（素材关联不受影响） */
   rename: (id: number, name: string) => Promise<{ ok: boolean; data?: { id: number; name: string }; error?: string }>
+  /** 改标签颜色（只动配色，不动名字与素材关联）；颜色必须是 `#RRGGBB` */
+  setColor: (id: number, color: string) => Promise<{ ok: boolean; data?: { id: number; color: string }; error?: string }>
   /** 彻底删除标签（不是从素材上摘掉），返回被解绑的素材数 */
   remove: (id: number) => Promise<{ ok: boolean; data?: { unlinked: number }; error?: string }>
 }

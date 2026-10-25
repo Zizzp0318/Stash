@@ -1056,6 +1056,68 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       pLinkCountUnchanged: tagLinkCount(tSome.id)
     }
 
+    // ==================== H11. 标签配色：新建自动分配 + 右键手动改色 ====================
+    step('H11-标签配色')
+
+    // H11a 连续新建 3 个标签 → 颜色两两不同，且都不是历史统一默认蓝
+    //（自动配色按「用得最少的颜色」分配；库里原本全蓝，所以新标签必然拿到别的色）
+    const mkColor1 = await ipc(`window.stash.tag.create({ name: '配色甲' })`)
+    const mkColor2 = await ipc(`window.stash.tag.create({ name: '配色乙' })`)
+    const mkColor3 = await ipc(`window.stash.tag.create({ name: '配色丙' })`)
+    const colorListRes = await ipc(`window.stash.tag.list()`)
+    const colorRows = ((colorListRes?.data ?? []) as Array<{ id: number; name: string; color: string }>)
+    const colorByName = (n: string): string => colorRows.find((t) => t.name === n)?.color ?? ''
+    R.h11_palette = {
+      ids: [mkColor1, mkColor2, mkColor3].map((r) => (r?.data as { id?: number } | undefined)?.id ?? 0),
+      colors: ['配色甲', '配色乙', '配色丙'].map(colorByName),
+      defaultBlueHit: ['配色甲', '配色乙', '配色丙'].some((n) => colorByName(n).toUpperCase() === '#7FA8D9')
+    }
+
+    // H11b 右键侧栏标签行 → 菜单里出现 10 个色块、当前色被 .on 圈出；点紫 → DB 与色点同步变
+    // 注意靶子必须是**已有的**标签（用「标签01」）：H11a 里的新标签是走 IPC 建的，
+    // 渲染层 store 还没刷新，侧栏 DOM 里没有那一行，右键点不到。
+    const idUiTarget = Number(
+      (D().prepare(`SELECT id FROM tags WHERE name='标签01'`).get() as { id: number } | undefined)?.id ?? 0
+    )
+    // 复用 H5 的 openTagCtx（真实右键优先、dispatch 兜底），按 data-tag-id 找行号
+    const uiIdx = JSON.parse(
+      ((await js(
+        `JSON.stringify([...document.querySelectorAll('.side-item[data-tag-id]')].findIndex(e => e.getAttribute('data-tag-id') === '${idUiTarget}'))`
+      )) as string | null) ?? '-1'
+    ) as number
+    const ctxMode = uiIdx >= 0 ? await openTagCtx(uiIdx) : 'ROW_NOT_FOUND'
+    const ctxOpened = ctxMode === 'real' || ctxMode === 'dispatch'
+    await waitUntil(`!!document.querySelector('[data-ctx="tag-color-row"]')`, 3000)
+    const swatchSnap = JSON.parse(((await js(
+      `JSON.stringify({
+        row: !!document.querySelector('[data-ctx="tag-color-row"]'),
+        count: document.querySelectorAll('.ctx-color-swatch[data-tag-color]').length,
+        on: [...document.querySelectorAll('.ctx-color-swatch.on')].map(e => e.getAttribute('data-tag-color')),
+        sideRows: document.querySelectorAll('.side-item[data-tag-id]').length
+      })`
+    )) as string | null) ?? '{}') as { row?: boolean; count?: number; on?: string[]; sideRows?: number }
+
+    // 点紫色 → DB 改色 + 侧栏色点跟着变（证明 loadMeta 真的重刷了，不是只改了数据库）
+    const pickPurple = await clickEl('.ctx-color-swatch[data-tag-color="#A97CD9"]')
+    const dotTurnedPurple = await waitUntil(
+      `(() => {
+        const el = document.querySelector('.side-item[data-tag-id="${idUiTarget}"] .tag-dot')
+        return !!el && getComputedStyle(el).backgroundColor === 'rgb(169, 124, 217)'
+      })()`,
+      3000
+    )
+    const colorAfterPick = await ipc(`window.stash.tag.list()`)
+    const colorNow =
+      (((colorAfterPick?.data ?? []) as Array<{ name: string; color: string }>).find((t) => t.name === '标签01')
+        ?.color ?? '')
+    const menuClosedAfterPick = (await js(`!document.querySelector('.ctx-menu')`)) === true
+    R.h11_pick = { ctxMode, uiIdx, idUiTarget, ctxOpened, swatchSnap, pickPurple, dotTurnedPurple, colorNow, menuClosedAfterPick }
+
+    // H11c 负例：颜色必须是 #RRGGBB（颜色最终进 CSS，放开等于把用户输入拼进样式）；不存在的标签要报业务码
+    const badColor = await ipc(`window.stash.tag.setColor(${idUiTarget}, 'red;background:url(x)')`)
+    const missingTag = await ipc(`window.stash.tag.setColor(999999, '#E06C6C')`)
+    R.h11_errors = { badColor, missingTag }
+
     // ==================== 断言汇总 ====================
     const a = R.a_setup as { added: number; tags: string[]; links: string[]; orphans: number }
     const h0 = R.h0_sidebar as Record<string, number>
@@ -1158,6 +1220,16 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       res: { ok: boolean; data?: unknown } | null
       ratingAfter: number; tagsBefore: string[]; tagsAfter: string[]; pLinkCountUnchanged: number
     }
+    const h11p = R.h11_palette as { ids: number[]; colors: string[]; defaultBlueHit: boolean } | null
+    const h11k = R.h11_pick as {
+      ctxMode: string; uiIdx: number; idUiTarget: number; ctxOpened: boolean
+      swatchSnap: { row?: boolean; count?: number; on?: string[]; sideRows?: number } | null
+      pickPurple: boolean; dotTurnedPurple: boolean; colorNow: string; menuClosedAfterPick: boolean
+    } | null
+    const h11e = R.h11_errors as {
+      badColor: { ok: boolean; error?: string } | null
+      missingTag: { ok: boolean; error?: string } | null
+    } | null
 
     R.checks = {
       // A 素材与标签就位
@@ -1379,6 +1451,22 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       // `asset:bulk-update` 仍然只认 rating/isFav：塞进去的 tagIds 被完全忽略
       bulkUpdateIgnoresTags: h10b?.ratingAfter === 2 && sameSet(h10b?.tagsAfter, h10b?.tagsBefore ?? []) &&
         (h10b?.pLinkCountUnchanged ?? -1) === 2,
+
+      // ==================== H11 标签配色 ====================
+      // 新建标签不再一律写死同一个蓝：三个新标签颜色两两不同，且都没落到历史默认蓝
+      tagColorAutoVaries:
+        (h11p?.colors?.length ?? 0) === 3 &&
+        new Set((h11p?.colors ?? []).map((c) => c.toUpperCase())).size === 3 &&
+        h11p?.defaultBlueHit === false,
+      // 右键菜单里 10 个色块齐全，且恰好只有 1 个被标成当前色（否则用户分不清正在用哪个）
+      tagColorSwatches: h11k?.ctxOpened === true && h11k?.swatchSnap?.row === true &&
+        h11k?.swatchSnap?.count === 10 && (h11k?.swatchSnap?.on?.length ?? 0) === 1,
+      // 点色块真的改色：DB 变 #A97CD9、侧栏色点跟着变、菜单自动收起
+      tagColorPickWorks: h11k?.pickPurple === true && h11k?.dotTurnedPurple === true &&
+        String(h11k?.colorNow ?? '').toUpperCase() === '#A97CD9' && h11k?.menuClosedAfterPick === true,
+      // 颜色只接受 #RRGGBB（最终进 CSS，放开等于把用户输入拼进样式）
+      tagColorInvalidRejected: h11e?.badColor?.ok === false && h11e?.badColor?.error === 'ERR_INVALID_COLOR',
+      tagColorMissingTag: h11e?.missingTag?.ok === false && h11e?.missingTag?.error === 'ERR_TAG_NOT_FOUND',
 
       // 渲染层不应有 JS 报错
       noJsErrors: jsErrors.length === 0

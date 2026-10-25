@@ -533,6 +533,8 @@ function bootstrap(): void {
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))
     ipcMain.handle('tag:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameTag(id, name)))
+    // 改标签颜色：只动配色（名字与素材关联都不动），换色后侧栏/详情页的色点一起跟着变
+    ipcMain.handle('tag:set-color', (_e, { id, color }) => wrap(() => assetsSvc.setTagColor(id, color)))
     ipcMain.handle('tag:delete', (_e, { id }) => wrap(() => assetsSvc.deleteTag(id)))
 
     // 系统剪贴板：读/写「文件列表」（复制源文件 / 粘贴外部文件）与纯文本

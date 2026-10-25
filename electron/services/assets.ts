@@ -651,20 +651,84 @@ export function listTags(): unknown[] {
 }
 
 /**
+ * 标签调色板（10 色，深色主题下都能看清、彼此可区分）。
+ *
+ * ⚠️ 这份列表与渲染层的 `src/utils/tagColors.ts` **必须保持一致**（跨进程无共享模块，
+ * 主进程不能 import 渲染层代码）；改色板时两边一起改。渲染层那份负责画色块供用户挑，
+ * 这份负责「新建标签时自动配色」。
+ */
+export const TAG_PALETTE = [
+  '#E06C6C', // 红
+  '#E0925F', // 橙
+  '#D9B45B', // 琥珀
+  '#8FBF6A', // 绿
+  '#5FBFA8', // 青绿
+  '#5AA9D6', // 蓝
+  '#7C8FD9', // indigo
+  '#A97CD9', // 紫
+  '#D07CB0', // 粉
+  '#8C8F96' // 灰
+] as const
+
+/**
+ * 给新标签挑一个颜色：**用得最少的那个**，并列时取色板里靠前的。
+ *
+ * 为什么不是「按 id 轮转」：轮转在「用户手动改过颜色 / 删过标签」之后会撞色，
+ * 而「最小使用计数」天然把颜色摊平——现有库里全是默认蓝时，第一个新标签会拿到红，
+ * 第二个拿橙……不需要用户做任何事就有颜色差异。
+ */
+function nextTagColor(db: DB): string {
+  const rows = db.prepare('SELECT color, count(*) AS c FROM tags GROUP BY color').all() as Array<{
+    color: string
+    c: number
+  }>
+  const used = new Map(rows.map((r) => [String(r.color).toUpperCase(), r.c]))
+  let best = TAG_PALETTE[0] as string
+  let bestCount = Number.POSITIVE_INFINITY
+  for (const c of TAG_PALETTE) {
+    const n = used.get(c.toUpperCase()) ?? 0
+    if (n < bestCount) {
+      best = c
+      bestCount = n
+    }
+  }
+  return best
+}
+
+/**
  * 新建标签本体。
  *
  * `tags.name` 有 UNIQUE 约束：这里与 `renameTag` 走**同一条约定** ——
  * 空名报 `ERR_EMPTY_NAME`、重名报 `ERR_TAG_EXISTS`，比让 SQLite 抛
  * `UNIQUE constraint failed: tags.name` 好读，渲染层也能直接据此出中文提示。
  * 名字统一 trim：标签输入框失焦/回车两条路径都会带进用户随手敲的空格。
+ *
+ * 颜色：调用方没指定就自动配色（见 `nextTagColor`）—— 不再一律写死蓝色，
+ * 否则侧栏一排标签长得一模一样，只能靠读字区分。
  */
-export function createTag({ name: rawName, color }: { name: string; color?: string }): { id: number } {
+export function createTag({ name: rawName, color }: { name: string; color?: string }): { id: number; color: string } {
   const { db } = requireCurrent()
   const name = (rawName ?? '').trim()
   if (!name) throw new Error('ERR_EMPTY_NAME')
   if (db.prepare('SELECT id FROM tags WHERE name=?').get(name)) throw new Error('ERR_TAG_EXISTS')
-  const r = db.prepare('INSERT INTO tags(name,color) VALUES(?,?)').run(name, color ?? '#7FA8D9')
-  return { id: Number(r.lastInsertRowid) }
+  const picked = color && /^#[0-9a-fA-F]{6}$/.test(color) ? color : nextTagColor(db)
+  const r = db.prepare('INSERT INTO tags(name,color) VALUES(?,?)').run(name, picked)
+  return { id: Number(r.lastInsertRowid), color: picked }
+}
+
+/**
+ * 改标签颜色（只动配色，不动名字、不动素材关联）。
+ *
+ * 只接受 `#RRGGBB`：颜色最终写进行内样式 `background`，随便放开等于把用户输入
+ * 直接拼进 CSS（`red;background:url(...)` 这类）。校验失败报 `ERR_INVALID_COLOR`。
+ */
+export function setTagColor(id: number, color: string): { id: number; color: string } {
+  const { db } = requireCurrent()
+  if (!/^#[0-9a-fA-F]{6}$/.test(color ?? '')) throw new Error('ERR_INVALID_COLOR')
+  const cur = db.prepare('SELECT id FROM tags WHERE id=?').get(id) as { id: number } | undefined
+  if (!cur) throw new Error('ERR_TAG_NOT_FOUND')
+  db.prepare('UPDATE tags SET color=? WHERE id=?').run(color, id)
+  return { id, color }
 }
 
 /**

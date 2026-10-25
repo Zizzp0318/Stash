@@ -121,6 +121,8 @@ contextBridge.exposeInMainWorld('stash', {
     list: () => ipcRenderer.invoke('tag:list'),
     create: (args: { name: string; color?: string }) => ipcRenderer.invoke('tag:create', args),
     rename: (id: number, name: string) => ipcRenderer.invoke('tag:rename', { id, name }),
+    /** 改标签颜色（只动配色，不动名字与素材关联） */
+    setColor: (id: number, color: string) => ipcRenderer.invoke('tag:set-color', { id, color }),
     remove: (id: number) => ipcRenderer.invoke('tag:delete', { id })
   },
   dialog: {

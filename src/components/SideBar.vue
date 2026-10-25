@@ -5,6 +5,7 @@ import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { useSettingsStore } from '../stores/settings'
 import { fmtCount, fmtSize } from '../utils/format'
+import { TAG_COLORS } from '../utils/tagColors'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -393,7 +394,8 @@ let tagDraftSeq = 0
 const TAG_ERR: Record<string, string> = {
   ERR_EMPTY_NAME: '标签名不能为空',
   ERR_TAG_EXISTS: '已存在同名标签',
-  ERR_TAG_NOT_FOUND: '标签不存在（可能已被删除）'
+  ERR_TAG_NOT_FOUND: '标签不存在（可能已被删除）',
+  ERR_INVALID_COLOR: '颜色格式不对（应为 #RRGGBB）'
 }
 function tagErrText(code?: string): string {
   return TAG_ERR[code ?? ''] ?? String(code ?? '未知错误')
@@ -401,6 +403,28 @@ function tagErrText(code?: string): string {
 
 function setTagDraftInput(el: unknown): void {
   if (el) tagDraftInput.value = el as HTMLInputElement
+}
+
+/**
+ * 改标签颜色：只动配色，不动名字与素材关联。
+ *
+ * 选中的颜色与当前一致就只关菜单（先 `return` 避免一次无意义 IPC）。
+ * 成功后 `loadMeta()` 重刷标签列表 —— 侧栏色点、详情页 chip 的色点都读同一份数据，
+ * 不需要各自再改一遍；详情页若是展开的，让它重拉一次详情把 chip 颜色带回来。
+ */
+async function pickTagColor(hex: string): Promise<void> {
+  const t = tagMenu.value?.tag
+  closeTagMenu()
+  if (!t) return
+  if ((t.color ?? '').toUpperCase() === hex.toUpperCase()) return
+  const r = await window.stash.tag.setColor(t.id, hex)
+  if (!r.ok) {
+    fail(`改颜色失败：${tagErrText(r.error)}`)
+    return
+  }
+  await lib.loadMeta()
+  const openId = assets.selectedId
+  if (openId != null) await assets.loadDetail(openId)
 }
 
 function startRenameTag(): void {
@@ -414,12 +438,6 @@ function startRenameTag(): void {
     tagDraftInput.value?.focus()
     tagDraftInput.value?.select() // 预填原名并全选，便于直接覆盖
   })
-}
-
-function cancelTagRename(): void {
-  tagDraftSeq++
-  renamingTagId.value = null
-  tagDraftName.value = ''
 }
 
 function onTagDraftEnter(e: KeyboardEvent): void {
@@ -796,6 +814,25 @@ onBeforeUnmount(() => {
           </svg>
           重命名标签
         </button>
+        <!--
+          改颜色：一排色块，点一下立即生效（不弹二次确认——颜色可随时再改，没有破坏性）。
+          当前颜色用外圈高亮标出来，否则一排圆点里分不清哪个是正在用的。
+        -->
+        <div class="ctx-color-row" data-ctx="tag-color-row">
+          <span class="ctx-color-label">颜色</span>
+          <div class="ctx-color-grid">
+            <button
+              v-for="c in TAG_COLORS"
+              :key="c.hex"
+              class="ctx-color-swatch"
+              :class="{ on: (tagMenu.tag.color ?? '').toUpperCase() === c.hex.toUpperCase() }"
+              :style="{ background: c.hex }"
+              :title="c.label"
+              :data-tag-color="c.hex"
+              @click="pickTagColor(c.hex)"
+            />
+          </div>
+        </div>
         <div class="ctx-sep"></div>
         <button class="ctx-item danger" @click="askDeleteTag">
           <svg viewBox="0 0 13 13" fill="none">

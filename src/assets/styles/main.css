@@ -1531,6 +1531,22 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
 .ctx-label { font-size: 11.5px; color: var(--text-2); }
+/* 标签改色：5×2 色块。当前色用 outline 圈出来（outline 跟随 border-radius，
+   比 box-shadow 叠加更干净，也不会因为 background 是实色而看不见） */
+.ctx-color-row { padding: 2px 8px 8px; }
+.ctx-color-label { display: block; font-size: 11.5px; color: var(--text-2); margin-bottom: 7px; }
+.ctx-color-grid { display: grid; grid-template-columns: repeat(5, 18px); gap: 7px; }
+.ctx-color-swatch {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  transition: transform 0.1s ease;
+}
+.ctx-color-swatch:hover { transform: scale(1.16); }
+.ctx-color-swatch.on { outline: 2px solid var(--text-1); outline-offset: 2px; }
 .ctx-stars { display: flex; gap: 3px; }
 .ctx-star {
   width: 15px; height: 15px;
