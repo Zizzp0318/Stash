@@ -278,13 +278,21 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     // 原来只有空态那一步等到位，前三次是「打字后立即抓」→ 抢跑会一次抓取级联红 6 条。
     // 每一步都把 `waitUntil` 的返回值并入该步的断言：**超时必须能红**，不能只靠后面的快照兜底（G11）。
 
-    // '100%'：唯一命中 100%.png —— 等卡片集合真的变成它
+    // '100%'：唯一命中 100%.png —— 等「数据基数真的变成 1 + 目标卡真的渲染出来」。
+    //
+    // ⚠️ 口径（§10.3 纪律 4「DOM 基数 ≠ 数据基数」，虚拟滚动起立）：**不许**再用
+    // `querySelectorAll('.masonry-card').length === 1` 表达「列表里只有一条」——
+    // 那只有在「items ≤ 窗口容量」时碰巧等价，库一大就会把「窗口里渲染了几条」
+    // 误当成「查到了几条」（窗口化后两者不再相等）。
+    // 改法：数据基数读 `__vsDebug().dataTotal`（= `assets.total`），
+    //       可见性只断「那张卡的名字对」，不对 DOM 数量下等号。
     await typeSearch('100%')
     const gSearchReady = await waitUntil(
-      "document.querySelectorAll('.masonry-card').length === 1 && document.querySelector('.masonry-card .ci-name')?.textContent?.trim() === '100%.png'"
+      "!!window.__vsDebug && window.__vsDebug().dataTotal === 1 && document.querySelector('.masonry-card .ci-name')?.textContent?.trim() === '100%.png'"
     )
     R.gSearch = {
       ready: gSearchReady,
+      dataTotal: await js(`window.__vsDebug ? window.__vsDebug().dataTotal : null`),
       cards: await cardNames(),
       total: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
       clearChip: await js(`document.querySelector('.chip-clear')?.getAttribute('data-count') ?? null`)
@@ -333,15 +341,18 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       clearBtn: await js(`document.querySelector('.empty .w-btn')?.textContent.trim() ?? null`)
     }
 
-    // 清除筛选：列表恢复全量、搜索框同步清空、清除按钮消失
+    // 清除筛选：数据基数回到 11、搜索框同步清空、清除按钮消失
     // 原来固定 sleep(500) 等它生效 —— Round 1 注入验证时这一步的 4 条断言正是「同一次抓取的级联红」。
-    // 改成有界轮询「列表回到 11 项 + 搜索框清空 + 清除按钮消失」，并把结果并入断言（超时→明确红）。
+    // 改成有界轮询「数据基数回到 11 + 搜索框清空 + 清除按钮消失」，并把结果并入断言（超时→明确红）。
+    // ⚠️ 同 G-UI 第一条：`length === 11` 属于 §10.3 纪律 4 明令禁止的 DOM 基数口径，
+    // 这里换成 `__vsDebug().dataTotal === 11`（= `assets.total`）。
     await js(`document.querySelector('.empty .w-btn')?.click(); true`)
     const gClearedReady = await waitUntil(
-      "document.querySelectorAll('.masonry-card').length === 11 && document.querySelector('.search-input')?.value === '' && !document.querySelector('.chip-clear')"
+      "!!window.__vsDebug && window.__vsDebug().dataTotal === 11 && document.querySelector('.search-input')?.value === '' && !document.querySelector('.chip-clear')"
     )
     R.g_cleared = {
       ready: gClearedReady,
+      dataTotal: await js(`window.__vsDebug ? window.__vsDebug().dataTotal : null`),
       count: (await cardNames()).length,
       total: await js(`document.querySelector('.toolbar .total')?.textContent.trim() ?? null`),
       searchValue: await js(`document.querySelector('.search-input')?.value ?? null`),
@@ -505,12 +516,19 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     const gEm = R.g_empty as { ready: boolean; items: number; text: string | null; clearBtn: string | null }
     const gCl = R.g_cleared as {
       ready: boolean
+      dataTotal: number | null
       count: number
       total: string | null
       searchValue: string | null
       clearChipGone: boolean
     }
-    const gSe = R.gSearch as { ready: boolean; cards: string[] | null; total: string | null; clearChip: string | null }
+    const gSe = R.gSearch as {
+      ready: boolean
+      dataTotal: number | null
+      cards: string[] | null
+      total: string | null
+      clearChip: string | null
+    }
     const hTm = R.h_typeMenu as { items: string[] | null; active: string | null }
     const hIc = R.h_iconOnly as {
       chips: Array<{ key: string; text?: string; svgCount?: number; w?: number; h?: number; iconW?: number; missing?: boolean }>
@@ -585,7 +603,10 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       pageWalksAll: f?.walkedCoversAll === true,
 
       // G UI 搜索（`ready` 是防假绿的闸门：没等到「该关键词对应的结果」就不算通过 —— 见 G11）
-      uiSearchResult: gSe?.ready === true && gSe?.cards?.length === 1 && gSe?.cards?.[0] === '100%.png',
+      // 数据基数看 dataTotal（§10.3 纪律 4）；可见部分只要求「目标卡看得见 + DOM 数有上界」，
+      // 不对 `.masonry-card` 的数量下等号（窗口化后 DOM 数 ≠ 数据条数）。
+      uiSearchResult: gSe?.ready === true && gSe?.dataTotal === 1 &&
+        gSe?.cards?.[0] === '100%.png' && (gSe?.cards?.length ?? 0) >= 1 && (gSe?.cards?.length ?? 0) <= 120,
       uiSearchCount: gSe?.ready === true && gSe?.total?.includes('/') === true,
       uiClearChipShown: gSe?.ready === true && gSe?.clearChip === '1',
 
@@ -606,7 +627,9 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
 
       // G 清除筛选：列表恢复、搜索框同步清空、按钮消失、分母回归「个文件」
       // （`ready` = 「清除筛选已生效」这一步的轮询结果，防假绿闸门，见 G11：超时→这几条明确红）
-      clearRestoresAll: gCl?.ready === true && gCl?.count === 11,
+      // 同样：11 条是**数据基数**，读 dataTotal；`count`（DOM 卡数）只作诊断 + 上界（§10.3 纪律 4）
+      clearRestoresAll: gCl?.ready === true && gCl?.dataTotal === 11 &&
+        (gCl?.count ?? 0) >= 1 && (gCl?.count ?? 0) <= 120,
       clearSyncsSearchBox: gCl?.ready === true && gCl?.searchValue === '',
       clearHidesChip: gCl?.ready === true && gCl?.clearChipGone === true,
       clearCountLabel: gCl?.ready === true && /个文件/.test(gCl?.total ?? '') && !/\//.test(gCl?.total ?? ''),

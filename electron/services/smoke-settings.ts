@@ -1218,6 +1218,14 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
        * 等「切库真的生效 + 这一库的列表真的渲染完 + 目标卡片的图真的加载完」。
        * 三重判据缺一不可：只等卡片的话，上一个库的旧卡片还在 DOM 里（两库的 id 都是 1），
        * 会立刻命中 → 量到旧库的几何 → 断言假绿。
+       *
+       * ⚠️ 「渲染完」的判据**不能**是 `querySelectorAll('.masonry-card').length === expectCards`
+       * （§10.3 纪律 4「DOM 基数 ≠ 数据基数」）：容器宽度 / viewZoom / 卡片高度稍有不同，
+       * 窗口渲染的条数就可能少于库里的条数，那条等号会永远等不到 → 假红；
+       * 反过来，切库瞬间旧库的卡还没换掉 → 假绿。两个方向都错过。
+       * 现在读 `__vsDebug().dataTotal`（= `assets.total`，即「这一库查出来几条」），
+       * 再靠后面的「目标卡片的 img 真的加载完」证明**渲染**也到位。
+       * `__vsDebug` 在切库瞬间可能短暂缺失（组件重建），所以用 `!!window.__vsDebug &&` 继续轮询。
        */
       const settledLib = async (libName: string, expectCards: number, id: number): Promise<boolean> => {
         const nameOk = await waitFor(
@@ -1225,7 +1233,10 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
           20000
         )
         if (!nameOk) return false
-        const countOk = await waitFor(`document.querySelectorAll('.masonry-card').length === ${expectCards}`, 20000)
+        const countOk = await waitFor(
+          `!!window.__vsDebug && window.__vsDebug().dataTotal === ${expectCards}`,
+          20000
+        )
         if (!countOk) return false
         return waitFor(
           `(() => { const im = document.querySelector('.masonry-card[data-id="${id}"] img.thumb-img'); return !!im && im.complete && im.naturalWidth > 0 })()`,
