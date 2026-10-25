@@ -62,6 +62,10 @@
 逐个核对磁盘，找出「索引里还在、文件已经不在」的失效记录并清理。
 只删索引行与对应缓存，**磁盘上的用户文件一个都不碰**。
 
+**关闭到托盘**
+点 × 默认是最小化到系统托盘（不是退出），托盘右键「退出」才真关闭；
+设置 → 外观与浏览 可改回直接关闭。
+
 ## 下载安装
 
 到 [**Releases**](https://github.com/Zizzp0318/Stash/releases) 页面下载：
@@ -110,7 +114,7 @@ npm run package:win    # 打包 Windows 安装版 + 便携版（产物在 dist/�
 
 ## 测试
 
-项目里带 **12 套冒烟测试**，全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
+项目里带 **15 个冒烟入口**（14 个套件模块 + 1 个内联分支），全部是「真实启动应用 + 驱动界面 + 同时断言数据库与 DOM」的自检脚本：
 
 ```bash
 env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
@@ -119,6 +123,7 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 | 入口 | 覆盖 |
 |---|---|
 | `--smoke-m1/-m2/-m4` | 建库 / 导入 / 多选与批量操作 / 右键菜单 / 详情页 |
+| `--smoke-forget` | 移除库：记录被移除，目录 / 索引 / 缓存原样保留 |
 | `--smoke-folder` | 文件夹多级新建、重命名、物理删除 |
 | `--smoke-search` | 关键词、标签、评分、类型、排序、分页、组合 |
 | `--smoke-tag` | 标签挂摘、重命名、删除、归零清理 |
@@ -135,6 +140,8 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 ## 已知限制
 
 - **删除素材 = 直接从磁盘删除**（无回收站），所以刻意做了二次确认；请谨慎对待
+- 关闭按钮默认是**最小化到托盘**（不是退出）；设置 → 外观与浏览 可改回直接关闭
+- 跑冒烟测试前先 `npm run build`：`out/` 产物缺失时应用会挂死而不是报错
 - 仅支持 Windows（打包目标 x64）
 - 未做代码签名，首次运行安装包会被 SmartScreen 拦一下（「更多信息 → 仍要运行」）
 - **不支持 HEIC / HEIF**（iPhone 默认照片格式）：预编译的 `sharp` 里那套 libheif 不带 HEVC
