@@ -3,6 +3,9 @@ out/
 dist/
 *.log
 
+# 本机 npm 代理配置（换机器会拖挂 npm install，各机自建）
+.npmrc
+
 # 库数据（若误在项目内建库，不要把索引和缩略图缓存提交）
 .stash
 .thumbs/
