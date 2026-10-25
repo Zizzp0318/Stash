@@ -12,13 +12,13 @@
 //   - 粘贴读的是系统剪贴板，冒烟里必须先 `clipboard.clear()` 把不确定的系统内容清掉，
 //     让它落到「内部剪贴板」这条确定性路径上（复制时写入的那份记录）。
 import { app, BrowserWindow, clipboard } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import { closeCurrent, createLibrary, forgetLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
 import { readFiles, writeFiles } from './clipboard'
-import { copyAssets, createTag, pastePaths, renameAsset, renameTag, updateAsset } from './assets'
+import { copyAssets, createTag, moveAssets, pastePaths, renameAsset, renameTag, setTags, updateAsset } from './assets'
 import { importFiles, type ImportResult } from './importer'
 import { getSettings, patchSettings } from './config'
 
@@ -50,6 +50,22 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       return null
     }
   }
+  /**
+   * 渲染层**运行期错误**收集（`error` / `unhandledrejection`）。
+   *
+   * ⚠️ 上面那条 `console-message` 监听在本项目的 Electron 版本下拿不到级别（`_lvl` 已废弃），
+   * 等于空转：`noJsErrors` 过去只能证明「我们注入的脚本没抛」，证明不了「点菜单没引发运行时异常」。
+   * 与 smoke-settings / smoke-preview 同口径，改为在**页面内**收（reload 会清掉数组，靠 `__seArmed`
+   * 标记重新挂一次，不会重复注册监听）。
+   */
+  const armErrors = async (): Promise<void> => {
+    await js(
+      'if (!window.__seArmed) { window.__seArmed = 1; window.__seErrors = [];' +
+        "window.addEventListener('error', (e) => window.__seErrors.push('error: ' + String(e.message)));" +
+        "window.addEventListener('unhandledrejection', (e) => window.__seErrors.push('reject: ' + String(e.reason))); }"
+    )
+  }
+  const pageErrors = async (): Promise<string[]> => ((await js('window.__seErrors ?? []')) as string[] | null) ?? []
 
   let dir: string | null = null
   let libPath = ''
@@ -897,6 +913,463 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     await sleep(400)
     R.u8_cleared = (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number
 
+    // ==================== U9 右键菜单：系统打开 / 系统定位 / 跳库内文件夹 ====================
+    // 需求：在「复制 / 粘贴」这一组**上方**插入三项。这里盯住四件最容易悄悄坏掉的事：
+    //   ① 三项在场且顺序在「复制」之上（追加到菜单末尾是最常见的返工点）；
+    //   ② 单选可见 / 多选**隐藏**（多选时「用默认应用打开」会弹 N 个窗口、「定位」会开 N 个资源管理器，
+    //      所以是隐藏而不是禁用 —— 禁用还得额外解释原因）；
+    //   ③ 点第 3 项后**真的能看见这张素材**（文件夹定位 + 侧栏展开且 active + 清掉挡路的筛选 + 选中）；
+    //   ④ 第 1、2 项点了不报错。
+    //      ⚠️ 真实弹系统窗口不在冒烟里做（会把 Photos / 资源管理器糊到用户脸上）。做法：先把靶子的
+    //      **文件**从磁盘删掉、索引行留着 —— 主进程在 `assetAbsPath` 里就抛 ERR_ASSET_MISSING
+    //      （发生在 `shell.openPath` / `showItemInFolder` 之前），于是这一下走的是完整链路
+    //      「菜单 → IPC → 主进程 → 错误码 → 中文提示」，却一个窗口都不会弹，
+    //      顺带把失败分支的提示文案也验了。真正的 openPath/showItemInFolder 由主进程负责，不在冒烟范围。
+    step('U9-右键三项')
+    const gotoInner = mkdirRel('跳转目标/内层')
+    const gotoA = assetIdOf('批量 30.png') // U8 灌进来的：尺寸/颜色各异，不会撞名
+    const goneB = assetIdOf('批量 29.png') // ④ 的靶子（文件待会儿会被删掉）
+    R.u9_setup = {
+      id: gotoA,
+      folderId: gotoInner.id,
+      folderPath: gotoInner.path,
+      moved: gotoA > 0 ? tryCall(() => moveAssets([gotoA], gotoInner.id)) : { error: 'ERR_ASSET_NOT_FOUND' },
+      relPath: gotoA > 0 ? (assetRow(gotoA)?.rel_path ?? null) : null,
+      goneB
+    }
+
+    // 服务层的改动渲染层不会自己知道 → 重开库 + reload，让新文件夹 / 搬过去的素材进入侧栏与列表
+    await rawJs(`window.stash.library.open(${JSON.stringify(libPath)}).then(() => location.reload())`)
+    await onceLoaded(win)
+    // reload 把页面里的收集数组清了 → 从这里开始重新挂监听（覆盖 U9 之后的全部交互 + U10）
+    await armErrors()
+    await waitFor(async () => ((await js(`document.querySelectorAll('.masonry-card').length`)) as number) > 5, 15000)
+
+    // 把二级文件夹的**父级**折叠起来：这样「内层」那一行根本渲染不出来，
+    // 正好用来验证 ③ 里的 `lib.expandTo`（祖先不展开就跳不过去，用户会以为点了没反应）
+    R.u9_foldClicked = await clickJs('[data-fold-path="跳转目标"]')
+    await sleep(320)
+    R.u9_collapsed = {
+      innerHidden: (await js(`!!document.querySelector('.side-item[data-folder-path="跳转目标/内层"]')`)) === false,
+      parentShown: (await js(`!!document.querySelector('.side-item[data-folder-path="跳转目标"]')`)) === true
+    }
+
+    // —— ① 单选时三项在场，且都排在「复制」之上 ——
+    await clickSel(`.masonry-card[data-id="${gotoA}"]`)
+    await sleep(420)
+    let u9pt = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (u9pt) rightClick(u9pt.x, u9pt.y)
+    await sleep(360)
+    R.u9_menu = (await js(`JSON.stringify({
+      items: [...document.querySelectorAll('.ctx-menu .ctx-item')].map(b => b.textContent.trim()),
+      order: [...document.querySelectorAll('.ctx-menu .ctx-item')].map(b => b.dataset.ctx ?? ''),
+      icons: document.querySelectorAll('.ctx-menu [data-ctx="open-shell"] svg, .ctx-menu [data-ctx="reveal"] svg, .ctx-menu [data-ctx="goto-folder"] svg').length,
+      openTitle: document.querySelector('.ctx-menu [data-ctx="open-shell"]')?.getAttribute('title') ?? null,
+      revealTitle: document.querySelector('.ctx-menu [data-ctx="reveal"]')?.getAttribute('title') ?? null,
+      gotoTitle: document.querySelector('.ctx-menu [data-ctx="goto-folder"]')?.getAttribute('title') ?? null
+    })`)) as string | null
+    await capture('shot-edit-ctxmenu3.png')
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+    await sleep(300)
+
+    // —— ② 多选（Ctrl 点第二张）时三项必须**消失** ——
+    await clickSel(`.masonry-card[data-id="${gotoA}"]`)
+    await sleep(260)
+    const u9bPt = await elPoint(`.masonry-card[data-id="${goneB}"]`)
+    if (u9bPt) {
+      win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(u9bPt.x), y: Math.round(u9bPt.y), modifiers: ['control'] })
+      win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(u9bPt.x), y: Math.round(u9bPt.y), button: 'left', clickCount: 1, modifiers: ['control'] })
+      win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(u9bPt.x), y: Math.round(u9bPt.y), button: 'left', clickCount: 1, modifiers: ['control'] })
+    }
+    await sleep(420)
+    u9pt = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (u9pt) rightClick(u9pt.x, u9pt.y)
+    await sleep(360)
+    R.u9_multi = (await js(`JSON.stringify({
+      selected: document.querySelectorAll('.masonry-card.selected').length,
+      head: document.querySelector('.ctx-menu .ctx-head')?.textContent.trim() ?? null,
+      open: document.querySelectorAll('.ctx-menu [data-ctx="open-shell"]').length,
+      reveal: document.querySelectorAll('.ctx-menu [data-ctx="reveal"]').length,
+      goto: document.querySelectorAll('.ctx-menu [data-ctx="goto-folder"]').length,
+      copy: document.querySelectorAll('.ctx-menu [data-ctx="copy"]').length
+    })`)) as string | null
+    win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+    win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+    await sleep(300)
+
+    // —— ④ 第 1、2 项「点了不报错」：删掉靶子的文件后走完整链路（不弹窗口，见本段开头说明）——
+    if (goneB > 0) {
+      const bRel = assetRow(goneB)?.rel_path ?? ''
+      if (bRel) {
+        try {
+          unlinkSync(join(libPath, ...bRel.split('/')))
+        } catch {
+          /* 删不掉就退化成「真的会开窗口」，下面的断言会明确变红，不静默 */
+        }
+      }
+    }
+    // 先把上一段可能残留的轻提示点掉，否则接着读到的会是旧文案
+    await js(`(() => { document.querySelector('.notice-toast')?.click(); return true })()`)
+    await clickSel(`.masonry-card[data-id="${goneB}"]`)
+    await sleep(360)
+    const u9bErrPt = await elPoint(`.masonry-card[data-id="${goneB}"]`)
+    if (u9bErrPt) rightClick(u9bErrPt.x, u9bErrPt.y)
+    await sleep(300)
+    const u9OpenClicked = await clickJs('.ctx-menu [data-ctx="open-shell"]')
+    // 轮询等提示出现（比固定 sleep 稳，也不会把断言拖慢）
+    await waitFor(async () => (await noticeText()) != null, 4000, 60)
+    const u9OpenNotice = await noticeText()
+    const u9OpenClosed = (await js(`!!document.querySelector('.ctx-menu')`)) === false
+    if (u9bErrPt) rightClick(u9bErrPt.x, u9bErrPt.y)
+    await sleep(300)
+    const u9RevealClicked = await clickJs('.ctx-menu [data-ctx="reveal"]')
+    await waitFor(async () => (await noticeText()) != null, 4000, 60)
+    const u9RevealNotice = await noticeText()
+    const u9RevealClosed = (await js(`!!document.querySelector('.ctx-menu')`)) === false
+    R.u9_errPath = {
+      openClicked: u9OpenClicked,
+      openNotice: u9OpenNotice,
+      openClosed: u9OpenClosed,
+      revealClicked: u9RevealClicked,
+      revealNotice: u9RevealNotice,
+      revealClosed: u9RevealClosed
+    }
+
+    // —— ③ 在所在文件夹中显示：跳到库内该素材所在的文件夹 ——
+    await clickSel(`.masonry-card[data-id="${gotoA}"]`)
+    await sleep(400)
+    // 先加一道「会跟着跳过去」的筛选：按名字搜「批量」。目标仍可见，但列表被收窄 ——
+    // 跳转后这条必须被清掉，否则搜索框还留着词，用户会以为「筛选没清干净」（另一个版本的「点了没反应」）
+    await typeInto('.search-input', '批量')
+    await sleep(900) // TitleBar 里是 300ms 防抖 + 一次 refresh
+    R.u9_filtered = {
+      search: (await js(`document.querySelector('.search-input')?.value ?? null`)) as string | null,
+      cards: (await js(`document.querySelectorAll('.masonry-card').length`)) as number,
+      targetShown: (await js(`!!document.querySelector('.masonry-card[data-id="${gotoA}"]')`)) === true
+    }
+    const u9gotoPt = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (u9gotoPt) rightClick(u9gotoPt.x, u9gotoPt.y)
+    await sleep(340)
+    const u9GotoClicked = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    await sleep(1200)
+    R.u9_goto = {
+      clicked: u9GotoClicked,
+      title: (await js(`document.querySelector('.toolbar h1')?.textContent.trim() ?? null`)) as string | null,
+      // 侧栏 active 行 = `assets.query.folderId` 的**视觉等价物**（SideBar 就是拿它判 active 的）
+      activeId: Number((await js(`document.querySelector('.side-item[data-folder-id].active')?.dataset.folderId ?? -1`)) as number),
+      activePath: (await js(`document.querySelector('.side-item[data-folder-id].active')?.dataset.folderPath ?? null`)) as
+        | string
+        | null,
+      innerShown: (await js(`!!document.querySelector('.side-item[data-folder-path="跳转目标/内层"]')`)) === true,
+      search: (await js(`document.querySelector('.search-input')?.value ?? null`)) as string | null,
+      cardIds: (await js(`[...document.querySelectorAll('.masonry-card')].map(c => Number(c.dataset.id))`)) as number[],
+      selectedId: Number((await js(`document.querySelector('.masonry-card.selected')?.dataset.id ?? -1`)) as number),
+      menuClosed: (await js(`!!document.querySelector('.ctx-menu')`)) === false,
+      notice: await noticeText()
+    }
+    await capture('shot-edit-gotofolder.png')
+
+    // ==================== U10 右键三项的边界（QA 补强）====================
+    // U9 验的是「在不在、顺序对不对、跳过去看不看得见」。这一段补 U9 结构上覆盖不到的边角：
+    //   ① 菜单几何：`onCardContext` 的预留高度 h 是**手写常数**，两个方向都会坏 ——
+    //      预留少了 → 贴着窗口底边时最后一项「删除」被裁；预留多了 → 菜单离鼠标很远（"飘")。
+    //      只截一张图看不出来，必须量矩形。
+    //   ② 多选态菜单比单选矮 3 行，同一份预留会让它飘得更远（多选态内容根本撑不满 h）。
+    //   ③ 第 3 项在**标签筛选**（`query.tagId`）下是否也清 —— `clearFilters()` 不含 tagId，
+    //      靠的是 `menuGotoFolder` 里那行显式 `query.tagId = null`（U9 只验了关键词）。
+    //   ④ 排序偏好不被跳转改动（U9 只验了筛选被清，没验「排序没被动」）。
+    //   ⑤ 脏数据：`folder_id` 在 `folderById` 里查不到时必须出声，不能静默。
+    //   ⑥ Esc 关菜单（U9 只发了 Esc，从没断言它真的关掉）+ 连点两次 goto-folder。
+    step('U10-右键菜单边界')
+
+    type MenuGeom = {
+      iw: number
+      ih: number
+      x: number
+      y: number
+      w: number
+      h: number
+      right: number
+      bottom: number
+      lastText: string | null
+      lastBottom: number | null
+      lastVisible: boolean
+      head: string | null
+    }
+    /** 菜单几何快照：矩形 + 最后一项（单选态=「删除」）是否完整落在视口内 */
+    const menuGeom = async (): Promise<MenuGeom | null> => {
+      const s = (await js(`(() => {
+        const m = document.querySelector('.ctx-menu')
+        if (!m) return 'null'
+        const r = m.getBoundingClientRect()
+        const items = [...m.querySelectorAll('.ctx-item')]
+        const last = items[items.length - 1] ?? null
+        const lr = last ? last.getBoundingClientRect() : null
+        return JSON.stringify({
+          iw: window.innerWidth, ih: window.innerHeight,
+          x: r.x, y: r.y, w: r.width, h: r.height, right: r.right, bottom: r.bottom,
+          lastText: last ? last.textContent.trim() : null,
+          lastBottom: lr ? lr.bottom : null,
+          lastVisible: !!lr && lr.top >= -0.5 && lr.bottom <= window.innerHeight + 0.5,
+          head: m.querySelector('.ctx-head')?.textContent.trim() ?? null
+        })
+      })()`)) as string | null
+      if (!s || s === 'null') return null
+      try {
+        return JSON.parse(s) as MenuGeom
+      } catch {
+        return null
+      }
+    }
+    /**
+     * 在**指定的视口坐标**上触发右键（靶卡片由选择器指定）。
+     *
+     * 为什么合成事件：`clientX/Y` 要精确压在 `innerWidth-2 / innerHeight-2` 这种角上，
+     * 而那里没有卡片，真实鼠标送不进去；被断言的也正是 `onCardContext` 对 `clientX/Y` 的收边逻辑。
+     * 靶子必须选「已选中」的那张卡，否则 `onCardContext` 里「右键的卡不在选中集合 → 改成单选」
+     * 会把多选态打散，量到的就不是多选态的菜单了。
+     */
+    const ctxAt = async (clientX: number, clientY: number, sel: string): Promise<boolean> => {
+      const ok =
+        (await js(`(() => {
+          const el = document.querySelector(${JSON.stringify(sel)})
+          if (!el) return false
+          el.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: ${clientX}, clientY: ${clientY} }))
+          return true
+        })()`)) === true
+      await sleep(340)
+      return ok
+    }
+    const pressEsc = async (): Promise<void> => {
+      win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+      win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+      await sleep(300)
+    }
+    /** 通知是单槽位、info 也活 5 秒 → 读之前先点掉，免得读到上一条的文案 */
+    const dismissNotice = async (): Promise<void> => {
+      await js(`(() => { document.querySelector('.notice-toast')?.click(); return true })()`)
+      await sleep(120)
+    }
+    const pickAllFolders = async (): Promise<void> => {
+      await js(`[...document.querySelectorAll('.side-item')].find(e => e.textContent.includes('所有素材'))?.click()`)
+      await sleep(700)
+    }
+    /** 点侧栏某个文件夹行（虚拟滚动下「列表里有没有这张卡」取决于当前导航，必须显式定位过去） */
+    const clickFolderRow = async (path: string): Promise<void> => {
+      await js(`document.querySelector('.side-item[data-folder-path="${path}"]')?.click()`)
+      await sleep(700)
+    }
+    const clickTagRow = async (id: number): Promise<void> => {
+      await js(`document.querySelector('.side-item[data-tag-id="${id}"]')?.click()`)
+      await sleep(800)
+    }
+
+    // —— ① 贴边几何：找「视口里最靠近底边、且真的还能命中卡片」的那个点 ——
+    // 只取 getBoundingClientRect().bottom 最大的卡是不够的：卡片可能被网格容器裁掉一部分，
+    // 那段矩形还在、点上去命中的却是别的元素（右键会完全没反应 —— 这本身也得能看出来）。
+    // 所以用 elementFromPoint 自上而下探，取「命中卡片」的最大 y。
+    await pickAllFolders()
+    const hitRaw = (await js(`(() => {
+      let best = null
+      for (const c of document.querySelectorAll('.masonry-card')) {
+        const r = c.getBoundingClientRect()
+        const x = Math.round(r.left + 14)
+        const top = Math.max(0, Math.round(r.top))
+        for (let y = Math.min(Math.round(r.bottom) - 2, window.innerHeight - 2); y > top; y -= 4) {
+          const el = document.elementFromPoint(x, y)
+          if (el && el.closest('.masonry-card') === c) {
+            if (!best || y > best.y) best = { x, y, id: Number(c.dataset.id) }
+            break
+          }
+        }
+      }
+      return best ? JSON.stringify(best) : 'null'
+    })()`)) as string | null
+    const hit = hitRaw && hitRaw !== 'null' ? (JSON.parse(hitRaw) as { x: number; y: number; id: number }) : null
+    R.u10_hit = hit
+    if (hit) {
+      await clickSel(`.masonry-card[data-id="${hit.id}"]`)
+      await sleep(300)
+      // 真实鼠标：打在卡片上「最靠视口底边」的位置
+      rightClick(hit.x, hit.y)
+      await sleep(380)
+      const gBottom = await menuGeom()
+      // 再展开删除确认（菜单的最高态）—— 这决定 h 该预留多少，也是「最后一项被裁」最容易出事的形态
+      const confirmOpened = await clickJs('.ctx-menu .ctx-item.danger')
+      await sleep(320)
+      const gConfirm = await menuGeom()
+      R.u10_geomBottom = { cursorX: hit.x, cursorY: hit.y, menu: gBottom, confirmOpened, confirmMenu: gConfirm }
+      // Esc 必须真的关掉（U9 只发过 Esc，一次都没断言结果）
+      await pressEsc()
+      R.u10_escClosed =
+        (await js(`!!document.querySelector('.ctx-menu')`)) === false &&
+        (await js(`!!document.querySelector('.ctx-confirm')`)) === false
+    }
+
+    // —— ①b 极端角落：clientX/Y 压在右下角 2px 处，x 与 y 的收边同时被推到极限 ——
+    const vp = (await js(`JSON.stringify({ iw: window.innerWidth, ih: window.innerHeight })`)) as string | null
+    const vw = JSON.parse(vp ?? '{"iw":0,"ih":0}') as { iw: number; ih: number }
+    const cornerSel = hit ? `.masonry-card[data-id="${hit.id}"]` : '.masonry-card'
+    const cornerOpened = await ctxAt(vw.iw - 2, vw.ih - 2, cornerSel)
+    R.u10_geomCorner = { cursorX: vw.iw - 2, cursorY: vw.ih - 2, opened: cornerOpened, menu: await menuGeom() }
+    await pressEsc()
+
+    // —— ② 多选态：三项不渲染（U9 已断）+ 菜单实际高度比单选矮，同一份预留会把它推得更远 ——
+    const secondCard = (await js(`(() => {
+      const el = [...document.querySelectorAll('.masonry-card')].find(c => Number(c.dataset.id) !== ${hit?.id ?? -1})
+      if (!el) return 'null'
+      const r = el.getBoundingClientRect()
+      return JSON.stringify({ id: Number(el.dataset.id), x: r.left + r.width / 2, y: r.top + r.height / 2 })
+    })()`)) as string | null
+    const second = secondCard && secondCard !== 'null' ? (JSON.parse(secondCard) as { id: number; x: number; y: number }) : null
+    if (second) {
+      const sx = Math.round(second.x)
+      const sy = Math.round(second.y)
+      win.webContents.sendInputEvent({ type: 'mouseMove', x: sx, y: sy, modifiers: ['control'] })
+      win.webContents.sendInputEvent({ type: 'mouseDown', x: sx, y: sy, button: 'left', clickCount: 1, modifiers: ['control'] })
+      win.webContents.sendInputEvent({ type: 'mouseUp', x: sx, y: sy, button: 'left', clickCount: 1, modifiers: ['control'] })
+      await sleep(420)
+    }
+    const multiOpened = await ctxAt(vw.iw - 2, vw.ih - 2, cornerSel)
+    const multiGeom = await menuGeom()
+    R.u10_geomMulti = {
+      opened: multiOpened,
+      cursorX: vw.iw - 2,
+      cursorY: vw.ih - 2,
+      secondId: second?.id ?? -1,
+      selected: (await js(`document.querySelectorAll('.masonry-card.selected').length`)) as number,
+      menu: multiGeom
+    }
+    await pressEsc()
+
+    // —— ②b 多选态下右键**没被选中的那张卡**：选中集合 N → 1，三项在同一帧里出现，
+    //        菜单高度会从 263 长到 380。动态收边量的是「patch 之后」的尺寸，
+    //        靠的是 `select()` 先把 `selectedIds` 赋掉、与 `menu` 赋值同帧 flush ——
+    //        这个顺序一旦被后人改掉（比如 select 里先 await），贴底展开就会静默裁掉「删除」。
+    const unselSel = (await js(`(() => {
+      const el = [...document.querySelectorAll('.masonry-card')].find(c => !c.classList.contains('selected'))
+      return el ? '.masonry-card[data-id="' + el.dataset.id + '"]' : null
+    })()`)) as string | null
+    if (unselSel) {
+      const flipOpened = await ctxAt(vw.iw - 2, vw.ih - 2, unselSel)
+      R.u10_geomFlip = {
+        opened: flipOpened,
+        sel: unselSel,
+        triple: (await js(`document.querySelectorAll('.ctx-menu [data-ctx="open-shell"]').length`)) as number,
+        head: (await js(`document.querySelector('.ctx-menu .ctx-head')?.textContent.trim() ?? null`)) as string | null,
+        menu: await menuGeom()
+      }
+      await pressEsc()
+    }
+
+    // —— ③ 标签筛选下跳转：tagId 必须被显式清掉（`clearFilters()` 不含它）——
+    // 标签名用 U4 里改名后的「自然风光」（`风景` 早被 S3/U4 改掉了，写死旧名会静默跳过整段）
+    const tagName = '自然风光'
+    const tagId = tagRows().find((t) => t.name === tagName)?.id ?? -1
+    R.u10_tagSetup = {
+      tagName,
+      tagId,
+      attach: tagId > 0 && gotoA > 0 ? tryCall(() => setTags(gotoA, [tagId])) : { error: 'ERR_TAG_NOT_FOUND' }
+    }
+    // 先回「内层」把 gotoA 渲染出来（虚拟滚动：换导航后旧 DOM 节点就没了），再点标签筛选
+    await clickFolderRow('跳转目标/内层')
+    await clickTagRow(tagId)
+    R.u10_tagFiltered = {
+      active: (await js(`!!document.querySelector('.side-item[data-tag-id="${tagId}"].active')`)) === true,
+      targetShown: (await js(`!!document.querySelector('.masonry-card[data-id="${gotoA}"]')`)) === true,
+      cards: (await js(`document.querySelectorAll('.masonry-card').length`)) as number
+    }
+    // 顺手把排序换成非默认值：「跳转不动排序」只有在排序**不是默认值**时才算验过
+    await clickJs('[data-chip="sort"]')
+    await sleep(240)
+    await clickJs('.chip-menu [data-sort="name"]')
+    await sleep(700)
+    const sortBefore = (await js(`document.querySelector('[data-chip="sort"]')?.getAttribute('title') ?? null`)) as string | null
+    await dismissNotice()
+    const u10pt = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (u10pt) rightClick(u10pt.x, u10pt.y)
+    await sleep(340)
+    const u10GotoClicked = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    await sleep(1300)
+    R.u10_gotoTag = {
+      clicked: u10GotoClicked,
+      tagActive: (await js(`!!document.querySelector('.side-item[data-tag-id].active')`)) === true,
+      search: (await js(`document.querySelector('.search-input')?.value ?? null`)) as string | null,
+      sortBefore,
+      sortAfter: (await js(`document.querySelector('[data-chip="sort"]')?.getAttribute('title') ?? null`)) as string | null,
+      activePath: (await js(`document.querySelector('.side-item[data-folder-id].active')?.dataset.folderPath ?? null`)) as
+        | string
+        | null,
+      targetShown: (await js(`!!document.querySelector('.masonry-card[data-id="${gotoA}"]')`)) === true,
+      selectedId: Number((await js(`document.querySelector('.masonry-card.selected')?.dataset.id ?? -1`)) as number),
+      notice: await noticeText()
+    }
+
+    // —— ④ 脏数据：folder_id 指向库里不存在的文件夹（索引与列表不同步）——
+    // 构造方式：临时关外键约束改一行（SQLite 默认就是关的，本项目在 db.ts 里显式打开），改完立刻恢复。
+    // 列表行照样查得到（`listAssets` 是 `SELECT a.*`，不 join folders），`folderById` 却查不到 ——
+    // 正是「索引过期」在渲染层的表现，也是这条分支唯一现实的触发方式。
+    R.u10_dirtyWrite = tryCall(() => {
+      D().exec('PRAGMA foreign_keys = OFF')
+      D().prepare('UPDATE assets SET folder_id=? WHERE id=?').run(999999, gotoA)
+      D().exec('PRAGMA foreign_keys = ON')
+      return { ok: true }
+    })
+    // 刷新列表但**不改导航**：标签筛选不看 folder_id，所以素材仍在列表里；
+    // 换成「所有素材」会撞上虚拟滚动（换导航后 gotoA 不一定在窗口里，elPoint 会直接返回 null）
+    await clickTagRow(tagId)
+    await dismissNotice()
+    const u10pt2 = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (u10pt2) rightClick(u10pt2.x, u10pt2.y)
+    await sleep(340)
+    const u10DirtyClicked = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    await waitFor(async () => (await noticeText()) != null, 4000, 60)
+    R.u10_dirty = {
+      clicked: u10DirtyClicked,
+      notice: await noticeText(),
+      menuClosed: (await js(`!!document.querySelector('.ctx-menu')`)) === false,
+      // 失败时不该顺手把侧栏/列表定位改掉（那会表现成「跳到了一个空文件夹」）
+      activePath: (await js(`document.querySelector('.side-item[data-folder-id].active')?.dataset.folderPath ?? null`)) as
+        | string
+        | null,
+      selectedId: Number((await js(`document.querySelector('.masonry-card.selected')?.dataset.id ?? -1`)) as number)
+    }
+    R.u10_dirtyRestore = tryCall(() => {
+      D().exec('PRAGMA foreign_keys = OFF')
+      D().prepare('UPDATE assets SET folder_id=? WHERE id=?').run(gotoInner.id, gotoA)
+      D().exec('PRAGMA foreign_keys = ON')
+      return { ok: true }
+    })
+
+    // —— ⑤ 连点两次 goto-folder：首点即收菜单（第二次点不到），重开再点一次仍要正确 ——
+    // 回「内层」（gotoA 唯一所在地）保证卡片在 DOM 里；跳转目标与当前位置相同也能验证幂等
+    await clickFolderRow('跳转目标/内层')
+    await dismissNotice()
+    const dc1 = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (dc1) rightClick(dc1.x, dc1.y)
+    await sleep(300)
+    const dcFirst = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    const dcWhileClosed = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    await sleep(1300)
+    const dc2 = await elPoint(`.masonry-card[data-id="${gotoA}"]`)
+    if (dc2) rightClick(dc2.x, dc2.y)
+    await sleep(300)
+    const dcThird = await clickJs('.ctx-menu [data-ctx="goto-folder"]')
+    await sleep(1300)
+    R.u10_double = {
+      first: dcFirst,
+      whileClosed: dcWhileClosed,
+      third: dcThird,
+      activePath: (await js(`document.querySelector('.side-item[data-folder-id].active')?.dataset.folderPath ?? null`)) as
+        | string
+        | null,
+      selectedId: Number((await js(`document.querySelector('.masonry-card.selected')?.dataset.id ?? -1`)) as number),
+      menuClosed: (await js(`!!document.querySelector('.ctx-menu')`)) === false,
+      notice: await noticeText()
+    }
+    R.pageErrors = await pageErrors()
+
     // ==================== 断言 ====================
     const u1 = (() => {
       try {
@@ -1018,6 +1491,91 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     const u7s = R.u7_afterSelect as Record<string, unknown>
     const u7e = R.u7_expanded as Record<string, unknown>
     const u6c = R.u6c_palette as Record<string, unknown> | null
+    /** U9：单选态右键菜单快照（注入脚本返回的是 JSON 字符串，解析失败一律当「没拿到」） */
+    const u9m1 = (() => {
+      const s = R.u9_menu as string | null
+      try {
+        return s && s !== 'null'
+          ? (JSON.parse(s) as {
+              items: string[]
+              order: string[]
+              icons: number
+              openTitle: string | null
+              revealTitle: string | null
+              gotoTitle: string | null
+            })
+          : null
+      } catch {
+        return null
+      }
+    })()
+    const u9s = R.u9_setup as Record<string, unknown>
+    const u9c = R.u9_collapsed as Record<string, unknown>
+    /** U9：多选态菜单快照（注入脚本返回 JSON 字符串，必须解析后才能读字段） */
+    const u9multi = (() => {
+      const s = R.u9_multi as string | null
+      try {
+        return s && s !== 'null'
+          ? (JSON.parse(s) as {
+              selected: number
+              head: string | null
+              open: number
+              reveal: number
+              goto: number
+              copy: number
+            })
+          : null
+      } catch {
+        return null
+      }
+    })()
+    const u9filtered = R.u9_filtered as Record<string, unknown>
+    const u9err = R.u9_errPath as Record<string, unknown>
+    const u9goto = R.u9_goto as Record<string, unknown>
+
+    /** U10：从 `{ cursorY, menu }` 快照里取菜单矩形（拿不到一律 null，断言里按失败处理） */
+    type Geom = {
+      iw: number
+      ih: number
+      x: number
+      y: number
+      w: number
+      h: number
+      right: number
+      bottom: number
+      lastText: string | null
+      lastBottom: number | null
+      lastVisible: boolean
+      head: string | null
+    }
+    const geomOf = (snap: unknown): Geom | null => {
+      const m = (snap as { menu?: Geom | null } | null)?.menu
+      return m && typeof m.bottom === 'number' ? m : null
+    }
+    const u10b = R.u10_geomBottom as {
+      cursorX?: number
+      cursorY?: number
+      menu?: Geom | null
+      confirmOpened?: boolean
+      confirmMenu?: Geom | null
+    } | null
+    const u10c = R.u10_geomCorner as { cursorX?: number; cursorY?: number; menu?: Geom | null } | null
+    const u10m = R.u10_geomMulti as { selected?: number; cursorY?: number; menu?: Geom | null } | null
+    const u10f = R.u10_geomFlip as { opened?: boolean; triple?: number; head?: string | null; menu?: Geom | null } | null
+    const gB = geomOf(u10b)
+    const gC = geomOf(u10c)
+    const gM = geomOf(u10m)
+    const gF = geomOf(u10f)
+    /** 删除确认展开后的菜单矩形 = 菜单的**最高态**，`h` 至少要预留这么多 */
+    const gBc = (u10b?.confirmMenu ?? null) as Geom | null
+    /** 菜单底边到右键坐标的距离：菜单收边时应当紧贴鼠标（正常 ≤ 十几像素） */
+    const cursorGap = (snap: { cursorY?: number } | null, g: Geom | null): number | null =>
+      g && typeof snap?.cursorY === 'number' ? Math.round(snap.cursorY - g.bottom) : null
+    const u10tag = R.u10_tagFiltered as Record<string, unknown>
+    const u10tg = R.u10_gotoTag as Record<string, unknown>
+    const u10dirty = R.u10_dirty as Record<string, unknown>
+    const u10dbl = R.u10_double as Record<string, unknown>
+    const u10dirtyWrite = R.u10_dirtyWrite as Record<string, unknown>
 
     const checks: Record<string, boolean> = {
       // U0 preload 桥接
@@ -1287,7 +1845,136 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       // `u8ready.selReady` = 「点卡片后等选中生效」的轮询结果（超时 → 这条明确红）
       topBtnTestSelectionReset: R.u8_selected === 1 && R.u8_cleared === 0 && u8ready?.selReady === true,
 
-      noJsErrors: jsErrors.length === 0
+      // ==================== U9 右键菜单三项（系统打开 / 系统定位 / 跳库内文件夹）====================
+      // ① 三项在场（文案严格按用户给的三条）
+      ctxMenuHasOpenShell: (u9m1?.items ?? []).includes('用系统默认应用打开'),
+      ctxMenuHasReveal: (u9m1?.items ?? []).includes('在文件浏览器中显示'),
+      ctxMenuHasGotoFolder: (u9m1?.items ?? []).includes('在所在文件夹中显示'),
+      // 顺序：必须整组插在「复制」**上方**（这次需求的核心；追加到菜单末尾就不算做到）
+      ctxMenuThreeAboveCopy: (() => {
+        const order = (u9m1?.order ?? []).filter(Boolean)
+        const iCopy = order.indexOf('copy')
+        if (iCopy <= 0) return false
+        // 复制之前紧邻的三项必须正好是这三项，且顺序一致
+        return order.slice(iCopy - 3, iCopy).join('|') === 'open-shell|reveal|goto-folder'
+      })(),
+      // 每项一个 13×13 描边图标（菜单里不许用 emoji / 字符图标）
+      ctxMenuThreeHaveIcons: u9m1?.icons === 3,
+      // 两条文案接近（都是「显示」），必须靠 title 把「系统资源管理器」与「软件内文件夹」区分开
+      ctxMenuTitlesDisambiguate:
+        /资源管理器/.test(String(u9m1?.revealTitle ?? '')) && /软件内/.test(String(u9m1?.gotoTitle ?? '')),
+
+      // ② 单选可见 / 多选**隐藏**（多选时「用默认应用打开」会弹 N 个窗口、「定位」会开 N 个资源管理器）
+      ctxMenuThreeHiddenOnMulti:
+        u9multi?.selected === 2 &&
+        String(u9multi?.head ?? '').includes('已选 2 项') &&
+        u9multi?.open === 0 &&
+        u9multi?.reveal === 0 &&
+        u9multi?.goto === 0 &&
+        // 「复制」还在 → 证明菜单本身是开着且正常的，三项消失不是「菜单没渲染」
+        u9multi?.copy === 1,
+
+      // ④ 第 1、2 项：点下去不炸、菜单收掉、失败有中文提示
+      //（靶子文件已被删 → 主进程在开窗口之前返回 ERR_ASSET_MISSING，全程不弹任何系统窗口）
+      // 文案收紧到「打开失败 / 定位文件失败 + 磁盘上找不到该文件」：
+      // 原来那条 `找不到该素材` 的备选是「列表里查不到这一行」分支的文案，留着会让**错的失败原因**也变绿。
+      ctxMenuOpenFailsLoudly:
+        u9err?.openClicked === true &&
+        u9err?.openClosed === true &&
+        /^打开失败：磁盘上找不到该文件/.test(String(u9err?.openNotice ?? '')),
+      ctxMenuRevealFailsLoudly:
+        u9err?.revealClicked === true &&
+        u9err?.revealClosed === true &&
+        /^定位文件失败：磁盘上找不到该文件/.test(String(u9err?.revealNotice ?? '')),
+
+      // ③ 跳库内文件夹：定位正确（侧栏 active 行 = query.folderId 的视觉等价物）+ 祖先被展开
+      ctxGotoSetsFolder:
+        u9goto?.clicked === true &&
+        u9goto?.activeId === u9s?.folderId &&
+        u9goto?.activePath === '跳转目标/内层' &&
+        u9goto?.title === '内层',
+      // 祖先折叠时 expandTo 必须把它展开，否则侧栏里连目标那一行都没有（用户会以为没跳）
+      ctxGotoExpandsAncestors: u9c?.innerHidden === true && u9goto?.innerShown === true,
+      // 清筛选：跳转前输入框里确实有「批量」（不然「已清空」是空断言），跳完必须空
+      ctxGotoClearsFilters:
+        u9filtered?.search === '批量' && u9filtered?.targetShown === true && u9goto?.search === '',
+      // 素材真的在列表里、且被重新选中（右侧详情栏跟着回来）
+      ctxGotoShowsAndSelectsAsset:
+        (u9s?.id as number) > 0 &&
+        u9goto?.selectedId === u9s?.id &&
+        ((u9goto?.cardIds as number[]) ?? []).includes(u9s?.id as number) === true,
+
+      // ==================== U10 右键三项的边界（QA 补强）====================
+      // ① 几何：贴着底边 / 右下角右键，菜单必须完整落在视口内（x、y、right、bottom 四条边都要看）
+      ctxMenuFitsViewport: [gB, gC, gM].every(
+        (g) => g != null && g.bottom <= g.ih + 0.5 && g.right <= g.iw + 0.5 && g.x >= -0.5 && g.y >= -0.5
+      ),
+      // ① 单选态最后一项就是「删除」→ 它完整可见，才说明预留高度没算少
+      ctxMenuLastItemVisible:
+        gB?.lastText === '删除' && gB?.lastVisible === true && gC?.lastText === '删除' && gC?.lastVisible === true,
+      // ① 菜单最高态（展开删除确认后）也不能被裁：这个高度才是 h 该预留的下界
+      ctxMenuMaxStateFits:
+        u10b?.confirmOpened === true &&
+        gBc != null &&
+        gBc.bottom <= gBc.ih + 0.5 &&
+        gBc.y >= -0.5 &&
+        gBc.right <= gBc.iw + 0.5,
+      // ① 反向：预留**算多了**会让菜单离鼠标很远（"飘"）。收边后底边应紧贴右键坐标（≤16px）
+      ctxMenuAnchorsToCursor: (() => {
+        const g1 = cursorGap(u10b, gB)
+        const g2 = cursorGap(u10c, gC)
+        const g3 = cursorGap(u10m, gM)
+        if (g1 == null || g2 == null || g3 == null) return false
+        return g1 <= 16 && g2 <= 16 && g3 <= 16
+      })(),
+      // ② 多选态确实少了 3 行（≈84px）→ 说明「隐藏而不是禁用」在 DOM 上真的生效，也给了"飘"的量化依据
+      ctxMenuShorterOnMulti: gB != null && gM != null && gB.h - gM.h >= 70 && u10m?.selected === 2,
+      // ②b 多选态右键「未选中的卡」→ 集合从 N 变 1、三项出现、菜单**同一帧长高**：
+      // 动态收边必须量到长高之后的高度，否则贴底展开照样裁（钉住 select() 与 menu 的 flush 顺序）
+      ctxMenuRegrowStaysVisible:
+        u10f?.opened === true &&
+        u10f?.triple === 1 &&
+        String(u10f?.head ?? '') === '素材操作' &&
+        gF != null &&
+        gF.bottom <= gF.ih + 0.5 &&
+        gF.lastVisible === true,
+      // ③ 标签筛选：tagId 被显式清掉（clearFilters 不含 tagId），且素材可见并被重新选中
+      ctxGotoClearsTagFilter:
+        u10tag?.active === true &&
+        u10tag?.targetShown === true &&
+        u10tg?.clicked === true &&
+        u10tg?.tagActive === false &&
+        u10tg?.search === '' &&
+        u10tg?.targetShown === true &&
+        u10tg?.selectedId === u9s?.id &&
+        /已跳到/.test(String(u10tg?.notice ?? '')),
+      // ③ 排序是用户偏好：跳转只清筛选，不该顺手改排序（先换成非默认的「名称」再验）
+      // ⚠️ 必须带 `clicked === true`：菜单没点开时「前后一样」是恒真的空断言
+      ctxGotoKeepsSort:
+        u10tg?.clicked === true && /名称/.test(String(u10tg?.sortBefore ?? '')) && u10tg?.sortAfter === u10tg?.sortBefore,
+      // ④ 脏数据：folder_id 查不到文件夹时必须出声，且不许把侧栏/列表挪到一个不存在的位置
+      ctxGotoDirtyFolderSpeaks:
+        u10dirtyWrite?.ok === true &&
+        u10dirty?.clicked === true &&
+        u10dirty?.menuClosed === true &&
+        /找不到「/.test(String(u10dirty?.notice ?? '')) &&
+        /索引可能已过期/.test(String(u10dirty?.notice ?? '')) &&
+        u10dirty?.activePath === null &&
+        u10dirty?.selectedId === u9s?.id,
+      // ⑤ 连点两次：首点即收（第二次点不到 → false），重开再点仍正确、不报错
+      ctxGotoTwiceIsSafe:
+        u10dbl?.first === true &&
+        u10dbl?.whileClosed === false &&
+        u10dbl?.third === true &&
+        u10dbl?.activePath === '跳转目标/内层' &&
+        u10dbl?.selectedId === u9s?.id &&
+        u10dbl?.menuClosed === true &&
+        !/失败/.test(String(u10dbl?.notice ?? '')),
+      // ⑥ Esc 关菜单（U9 只发过按键，没断言结果）
+      ctxMenuEscCloses: R.u10_escClosed === true,
+
+      // 渲染层运行期错误：注入脚本抛错 + 页面 error / unhandledrejection 两路都算
+      noJsErrors: jsErrors.length === 0 && ((R.pageErrors as string[] | undefined) ?? []).length === 0
     }
 
     R.checks = checks

@@ -1132,6 +1132,38 @@ const menuHoverStar = ref(0)
  */
 const menuStarOn = (n: number): boolean => n <= (menuHoverStar.value || assets.selectedRating)
 
+/**
+ * 把菜单夹进视口：**先按鼠标坐标画，再量一次真实尺寸往回夹**。
+ *
+ * ⚠️ 为什么不再用「预留一个最大高度常数」算（448 → 532 那个方案已被实测否决）：
+ * 菜单有 4 种高度 —— 多选 263 / 单选常态 380 / 单选+删除确认 455（单位 px，1282×822 实测）。
+ * 常数法必然二选一地出错：
+ *   - 按最高态预留（532）→ 矮态被顶到屏幕上半部，多选态离鼠标 273px，看着像「菜单凭空出现在别处」；
+ *   - 按常态预留（448）→ 最高态下半截被裁掉。
+ * 实测尺寸后再夹，任何状态都**既不裁也不飘**，将来再加菜单项也不必回来改常数。
+ *
+ * `nextTick` 里量：此时 DOM 已 patch、浏览器尚未绘制（微任务早于 paint），
+ * 所以用户看不到「先出现在鼠标处再跳上去」的闪动。不用 `visibility` 之类先藏后显的抖动方案。
+ */
+
+/** 量不到菜单尺寸时的兜底：最高态 455.4 + 6 留白 —— 刚好装下「展开删除确认」，**别改回 532** */
+const MENU_FALLBACK_H = 462
+/** 菜单宽度是 CSS 里写死的 212px（`main.css` 的 `.ctx-menu`），兜底时用它 */
+const MENU_FALLBACK_W = 212
+
+function clampMenu(): void {
+  const m = menu.value
+  if (!m) return
+  const el = document.querySelector<HTMLElement>('.ctx-menu')
+  const pad = 6
+  // 元素还没挂上时按兜底常数夹：宁可保守一点，也不能让菜单跑出视口
+  const w = el ? el.offsetWidth : MENU_FALLBACK_W
+  const h = el ? el.offsetHeight : MENU_FALLBACK_H
+  const x = Math.min(Math.max(pad, m.x), Math.max(pad, window.innerWidth - w - pad))
+  const y = Math.min(Math.max(pad, m.y), Math.max(pad, window.innerHeight - h - pad))
+  if (x !== m.x || y !== m.y) menu.value = { x, y }
+}
+
 function onCardContext(e: MouseEvent, it: StashAssetRow): void {
   e.preventDefault()
   e.stopPropagation()
@@ -1139,13 +1171,18 @@ function onCardContext(e: MouseEvent, it: StashAssetRow): void {
   menuHoverStar.value = 0
   // 右键的卡片若不在选中集合里 → 先把它单独选中；已在集合里 → 保持整批
   if (!assets.isSelected(it.id)) void assets.select(it.id)
-  // 菜单靠近窗口右/下边缘时向内收，避免被裁掉；高度按「展开删除确认」后的最大态预留
-  const w = 212
-  const h = 448
-  menu.value = {
-    x: Math.max(6, Math.min(e.clientX, window.innerWidth - w - 6)),
-    y: Math.max(6, Math.min(e.clientY, window.innerHeight - h - 6))
-  }
+  // 先落在鼠标处（只挡住负坐标，避免第一帧跑到窗口外），下一帧按实测尺寸夹（见 clampMenu）
+  menu.value = { x: Math.max(6, e.clientX), y: Math.max(6, e.clientY) }
+  void nextTick(clampMenu)
+}
+
+/**
+ * 展开「删除确认」块。确认块比「删除」那一行高约 76px，菜单会从 380 长到 455 ——
+ * 所以这里必须**再夹一次**，否则贴着窗口底边展开时最后两个按钮会被裁掉。
+ */
+function openMenuConfirm(): void {
+  menuConfirm.value = true
+  void nextTick(clampMenu)
 }
 
 function closeMenu(): void {
@@ -1175,6 +1212,119 @@ async function menuPaste(): Promise<void> {
   const target = assets.query.folderId
   closeMenu()
   await assets.pasteInto(target)
+}
+
+// ==================== 用默认应用打开 / 系统文件夹定位 / 跳到库内文件夹 ====================
+/**
+ * 取「当前单选的那一张」。
+ *
+ * 为什么现查而不是在 `onCardContext` 时缓存：菜单是右键那一刻的快照，而用户真正点下去时
+ * 列表可能已经被后台刷新 / 外部文件变动整体替换过一批（`items` 是替换式赋值）。
+ * 先查一次，查不到就明确提示，而不是拿一个可能已失效的 id 去问主进程。
+ */
+function ctxSingleRow(): StashAssetRow | null {
+  const id = assets.selectedId ?? assets.selectedIds[0]
+  if (id == null) return null
+  return assets.items.find((x) => x.id === id) ?? null
+}
+
+/**
+ * ① 用系统默认应用打开（等价于在资源管理器里双击该文件）。
+ *
+ * 后端 `shell:open` 走 `shell.openPath`，两种失败形态都要翻成中文，否则用户点完毫无反馈：
+ *   - 文件已被外部删除 → 抛 `ERR_ASSET_MISSING` → `ok:false`；
+ *   - 系统没有该类型的默认程序 → **不抛错**，把 Windows 的原文案放进 `data.error`、
+ *     `data.opened=false`（原因只有系统知道，原样透出比我们瞎猜准确）。
+ */
+async function menuOpenWithShell(): Promise<void> {
+  const it = ctxSingleRow()
+  closeMenu()
+  if (!it) {
+    assets.notify('error', '找不到该素材（列表可能刚刚刷新过），请重新选中后再试')
+    return
+  }
+  const r = await window.stash.shell.open(it.id)
+  if (!r.ok) {
+    assets.notify('error', `打开失败：${assetErrText(r.error)}`)
+    return
+  }
+  if (r.data && r.data.opened === false) {
+    assets.notify('error', `打开失败：${r.data.error || '系统没有为该文件类型关联默认程序'}`)
+  }
+}
+
+/**
+ * ② 在 Windows 资源管理器里定位该文件（`explorer /select` 语义）。
+ * 与 ③ 的区别：这条去的是**系统文件夹**，③ 去的是软件自己的库内文件夹。
+ *
+ * 只判 `ok`：主进程的 `revealAsset` 恒返回 `{ revealed: true }`（`shell.showItemInFolder`
+ * 没有返回值、失败也不抛异常），所以「系统拒绝了请求」那种分支根本到不了 ——
+ * 以前这里留了一句 `data.revealed === false` 的提示，是**永远不执行的死代码**，已删。
+ * 真正的失败形态只有一种：文件已不在磁盘上 → `assetAbsPath` 抛 `ERR_ASSET_MISSING` → `ok:false`。
+ */
+async function menuRevealInShell(): Promise<void> {
+  const it = ctxSingleRow()
+  closeMenu()
+  if (!it) {
+    assets.notify('error', '找不到该素材（列表可能刚刚刷新过），请重新选中后再试')
+    return
+  }
+  const r = await window.stash.shell.reveal(it.id)
+  if (!r.ok) {
+    assets.notify('error', `定位文件失败：${assetErrText(r.error)}`)
+  }
+}
+
+/**
+ * ③ 跳到**库内**该素材所在的文件夹（软件自己的文件夹树，不是资源管理器）。
+ *
+ * 必须保证跳过去**真的能看见这张素材**，否则用户只会得出「点了没反应」的结论：
+ *   ① `lib.expandTo(folder.path)` 展开全部祖先层 —— 折叠着的话侧栏里连目标那一行都渲染不出来；
+ *   ② 清掉会把它挡在外面的筛选（关键词 / 标签 / 类型 / 评分 / 喜欢）——
+ *      **排序不动**：排序只影响先后，不影响「能不能看见」，动它等于擅自改用户偏好；
+ *   ③ 定位 + 走 store 现有的 `refresh()` 重新拉列表（不另开一条查询路径）；
+ *   ④ 显式重新选中，让右侧详情栏跟着回来。
+ * `folder_id` 在 `lib.folderById` 里查不到 = 索引与列表不同步（脏数据），
+ * 这种情况必须明说，不能静默失败。
+ */
+async function menuGotoFolder(): Promise<void> {
+  const it = ctxSingleRow()
+  closeMenu()
+  if (!it) {
+    assets.notify('error', '找不到该素材（列表可能刚刚刷新过），请重新选中后再试')
+    return
+  }
+  const folder = lib.folderById.get(it.folder_id)
+  if (!folder) {
+    assets.notify('error', `找不到「${it.name}」所在的文件夹（索引可能已过期），请重新打开库后再试`)
+    return
+  }
+  // 清筛选前先记一笔：真清掉了要跟用户说一声，否则「搜索框自己空了」会让人莫名其妙
+  const hadFilter = assets.activeFilterCount > 0 || assets.query.tagId != null
+  // ① 展开祖先层级
+  lib.expandTo(folder.path)
+  // ② 清掉会遮挡它的筛选（文件夹定位 + 排序保留）
+  assets.query.tagId = null
+  assets.clearFilters()
+  // ③ 定位到该文件夹：侧栏 active、工具栏标题、列表查询读的都是这一个字段
+  assets.query.folderId = folder.id
+  await assets.refresh()
+  // ④ 重新选中它（refresh 只在「原选中项已不在列表里」时才清选中，这里显式重选更稳）
+  if (!assets.items.some((x) => x.id === it.id)) {
+    assets.notify('error', `已跳到「${folder.name}」，但列表里找不到「${it.name}」（可能已被移动或删除）`)
+    return
+  }
+  await assets.select(it.id)
+  // ⑤ 侧栏那一行滚进视口：文件夹多到要滚动时，跳过去可能出现「列表对了、侧栏里却看不到它高亮」
+  //    （点文件夹的常规路径不会有这问题——那行本来就是用户自己点出来的）。
+  //    用 `block: 'nearest'`：已经在视口内就一动不动，不会平白把侧栏滚一下。
+  await nextTick()
+  document
+    .querySelector<HTMLElement>(`.side-item[data-folder-id="${folder.id}"]`)
+    ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  if (hadFilter) {
+    assets.notify('info', `已跳到「${folder.name}」，并清除了会挡住这张素材的搜索/筛选条件`)
+  }
 }
 
 // ==================== 重命名素材 ====================
@@ -1929,6 +2079,55 @@ function uninstallVsDebug(): void {
         </button>
 
         <div class="ctx-sep"></div>
+
+        <!--
+          三项「打开 / 定位」——只在单选时出现。
+          多选时直接**隐藏**而不是禁用：「用默认应用打开」会一口气弹出 N 个窗口、
+          「在资源管理器里定位」会开 N 个资源管理器窗口，把用户桌面淹掉；
+          而禁用的按钮还得额外解释原因，不如不给入口（与「重命名文件」同一条约定）。
+          第 2、3 条名字接近，靠 title 区分：一个去系统的资源管理器，一个去软件内的文件夹。
+        -->
+        <template v-if="assets.selectedCount === 1">
+          <button
+            class="ctx-item"
+            data-ctx="open-shell"
+            title="用系统默认程序打开该文件"
+            @click="menuOpenWithShell"
+          >
+            <svg viewBox="0 0 13 13" fill="none">
+              <path d="M7.7 1.9h3.4v3.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+              <path d="M11.1 1.9L6.5 6.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+              <path d="M10 7.6v2.9a1.1 1.1 0 0 1-1.1 1.1H2.9a1.1 1.1 0 0 1-1.1-1.1V4.5a1.1 1.1 0 0 1 1.1-1.1h2.9" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            用系统默认应用打开
+          </button>
+          <button
+            class="ctx-item"
+            data-ctx="reveal"
+            title="在 Windows 资源管理器中定位该文件"
+            @click="menuRevealInShell"
+          >
+            <svg viewBox="0 0 13 13" fill="none">
+              <path d="M1.3 3.5h3.2l1.1 1.5h5.9v5.9a1.1 1.1 0 0 1-1.1 1.1H2.4a1.1 1.1 0 0 1-1.1-1.1z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+              <circle cx="7.4" cy="7.5" r="1.8" stroke="currentColor" stroke-width="1.1" />
+              <path d="M8.8 8.9l1.5 1.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+            </svg>
+            在文件浏览器中显示
+          </button>
+          <button
+            class="ctx-item"
+            data-ctx="goto-folder"
+            title="跳到软件内该素材所在的文件夹"
+            @click="menuGotoFolder"
+          >
+            <svg viewBox="0 0 13 13" fill="none">
+              <path d="M1.3 3.5h3.2l1.1 1.5h5.9v5.9a1.1 1.1 0 0 1-1.1 1.1H2.4a1.1 1.1 0 0 1-1.1-1.1z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
+              <path d="M4.4 8.3h4.2M7.2 6.9l1.4 1.4-1.4 1.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            在所在文件夹中显示
+          </button>
+        </template>
+
         <button class="ctx-item" data-ctx="copy" @click="menuCopy">
           <svg viewBox="0 0 13 13" fill="none">
             <rect x="4.4" y="1.6" width="7" height="7.8" rx="1.3" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
@@ -1978,7 +2177,7 @@ function uninstallVsDebug(): void {
 
         <template v-if="!menuConfirm">
           <div class="ctx-sep"></div>
-          <button class="ctx-item danger" @click="menuConfirm = true">
+          <button class="ctx-item danger" @click="openMenuConfirm">
             <svg viewBox="0 0 13 13" fill="none">
               <path d="M2.4 3.6h8.2M5.1 3.6V2.4h2.8v1.2M3.4 3.6l.5 7h5.2l.5-7" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
