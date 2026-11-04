@@ -680,6 +680,44 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     await sleep(400)
     R.h9_emptyState = await recentSnap()
     await capture('shot-tag-recent-empty.png')
+
+    // ==================== H9x. 点输入框外面必须收起 ====================
+    //
+    // 用户实报：「点 ＋ 打开搜索框后不想建标签了，点软件任意位置，**有概率**收不回去」。
+    // 根因是收起只靠输入框的 `@blur`：标题栏是 `-webkit-app-region: drag` 区域（按下不派发到
+    // 渲染层）、原生滚动条、以及任何在 mousedown 上 preventDefault 的地方都不会让焦点离开，
+    // blur 自然永不触发。修法是把「点外面收起」挪到 document 的**捕获阶段** mousedown 上。
+    //
+    // 断言方式：在框外派发一次**不带走焦点**的 mousedown —— 这正是 blur 失效的那个场景。
+    // 修复前：表单一直挂着 → 红；修复后：立刻收起 → 绿。
+    // 只看「点一下会不会关」是测不出来的（真实点击会顺带 blur，修复前也能绿）。
+    R.h9x_openBefore = await js(`!!document.querySelector('.detail .inline-form input')`)
+    R.h9x_noBlurPath = await js(`(() => {
+      const input = document.querySelector('.detail .inline-form input')
+      const outside = document.querySelector('.detail .d-name')
+      if (!input || !outside) return null
+      input.focus()
+      outside.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+      // 合成事件不转移焦点 —— 就是要这个前提，它等价于「blur 不会来」
+      return { stillFocused: document.activeElement === input }
+    })()`)
+    await sleep(250)
+    R.h9x_formGone = await js(`!document.querySelector('.detail .inline-form')`)
+    // 框内按下（比如点下拉里的标签行）不能把表单收起来 —— 这条守着「别矫枉过正」
+    await clickEl('.detail .tag-chips .tag-add')
+    await sleep(300)
+    R.h9x_reopened = await js(`!!document.querySelector('.detail .inline-form input')`)
+    R.h9x_insideKept = await js(`(() => {
+      const form = document.querySelector('.detail .inline-form')
+      const input = document.querySelector('.detail .inline-form input')
+      if (!form || !input) return null
+      input.focus()
+      form.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+      return null
+    })()`)
+    await sleep(200)
+    R.h9x_formKeptOnInside = await js(`!!document.querySelector('.detail .inline-form')`)
+
     // 收起输入框，回到干净状态（后面还会 reload 重建整个 UI）
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
     win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
@@ -1320,6 +1358,11 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       // ① 库里一个标签都没有：下拉在，但没有行，提示指向「新建」
       recentEmptyWhenNoTags: h9e0?.present === true && (h9e0?.ids?.length ?? -1) === 0 &&
         h9e0?.hint === '输入名称新建第一个标签' && h9e0?.inputShown === true,
+      // ② 点框外必须收起 —— 用的是「不带走焦点的按下」这条 blur 失效路径（见 H9x 段注释）
+      tagInputDismissOnOutside: R.h9x_openBefore === true && R.h9x_formGone === true &&
+        (R.h9x_noBlurPath as { stillFocused?: boolean } | null)?.stillFocused === true,
+      // 框内按下不能收起（别矫枉过正：点下拉里的标签行要能连着加）
+      tagInputKeptOnInside: R.h9x_reopened === true && R.h9x_formKeptOnInside === true,
       // ② 12 个标签、红.png 已挂 1 个 → 可加 11 个，只显示最近 4 行
       recentSetupOk: h9s?.tagCount === 12 && (h9s?.attached?.length ?? -1) === 1 && h9s?.sidebar?.['标签12'] === 1,
       recentMenuShowsFourRows: (h9m?.ids?.length ?? -1) === 4 && h9m?.rows === 4,

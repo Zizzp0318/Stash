@@ -27,6 +27,8 @@ watch(
     noteCopied.value = false
     // 色板的「已复制」高亮同理：换了素材就不该还亮着上一张的某个色块
     copiedColor.value = null
+    // 标签输入框同理：若上一张的输入框还开着，接着打出来的字会挂到**新素材**上（用户毫无察觉）
+    if (addingTag.value) closeTagInput()
     if (id && asset.value?.content_hash) {
       await window.stash.thumb.ensure(id, 'detail')
       detailReady.value++
@@ -146,6 +148,9 @@ async function toggleFav(): Promise<void> {
 // —— 标签：点击已有标签移除；输入搜索或新建后挂上 ——
 const addingTag = ref(false)
 const newTag = ref('')
+/** 输入框那一整块（输入框 + 悬浮下拉）：判定「点在框内还是框外」用，见 onDocMouseDownCapture */
+const tagFormEl = ref<HTMLElement | null>(null)
+const tagInputEl = ref<HTMLInputElement | null>(null)
 
 /** 悬浮下拉最多 4 行：详情栏是窄条，再多就把下面的评分区盖住了 */
 const RECENT_LIMIT = 4
@@ -172,6 +177,41 @@ function closeTagInput(): void {
 }
 
 /**
+ * 打开输入框并把光标放进去。
+ * 不用模板上的 `autofocus`：那个属性只在「节点被插进文档的那一刻」生效，
+ * 靠不住（复用节点时会静默失效）；显式 focus 才保证「点了 ＋ 就能直接打字」。
+ */
+function openTagInput(): void {
+  addingTag.value = true
+  void nextTick(() => tagInputEl.value?.focus())
+}
+
+/**
+ * 点「输入框外面」就收起。
+ *
+ * 为什么不能只靠输入框自己的 `@blur`（用户报的「点软件任意位置，有概率收不回去」就是它）：
+ *   · 标题栏是 `-webkit-app-region: drag` 区域，那上面的按下**根本不派发到渲染层**；
+ *   · 原生滚动条、窗口边框同理 —— 焦点压根不转移，blur 永远不触发；
+ *   · 别的组件若在 mousedown 上 `preventDefault`，焦点同样留在输入框里。
+ * 所以改成在 document 的**捕获阶段**盯 mousedown：事件一到就先判内外，
+ * 既绕开各处的 stopPropagation，也不依赖「焦点到底有没有走」。
+ * BatchBar 的标签浮层早就是这么收的（见 BatchBar.vue 的 onDocMouseDown），这里对齐。
+ */
+const onDocMouseDownCapture = (e: MouseEvent): void => {
+  if (!addingTag.value) return
+  const el = tagFormEl.value
+  if (el && e.target instanceof Node && el.contains(e.target)) return
+  void addTag()
+}
+
+// 只在输入框打开期间挂监听，收起即摘：不留常驻的 document 级监听
+watch(addingTag, (open) => {
+  if (open) document.addEventListener('mousedown', onDocMouseDownCapture, true)
+  else document.removeEventListener('mousedown', onDocMouseDownCapture, true)
+})
+onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMouseDownCapture, true))
+
+/**
  * 把某个标签挂到当前素材上（只管挂，不碰输入框）。
  * 已经挂过就直接返回，避免 setTags 原样重写一遍。
  */
@@ -190,23 +230,35 @@ async function attachTag(tagId: number): Promise<boolean> {
   return true
 }
 
+/**
+ * 防重入闸：一次「点外面」会先后触发 document 捕获的 mousedown 与输入框的 blur，
+ * 两个入口都会调到这里；`addTag` 里还有 await，若不设闸，第二枪会在第一枪还没落库时
+ * 再 create 一次同名标签 → 第二个必然 ERR_TAG_EXISTS，用户白挨一个红条。
+ * 连按两次回车同理。
+ */
+let tagSubmitting = false
+
 async function addTag(): Promise<void> {
+  if (tagSubmitting) return
   const name = newTag.value.trim()
   if (!asset.value || !name) {
-    addingTag.value = false
+    closeTagInput()
     return
   }
-  const existing = lib.tags.find((t) => t.name === name)
-  const created = existing ? null : await window.stash.tag.create({ name })
-  if (created && !created.ok) {
-    addingTag.value = false
-    newTag.value = ''
-    return void assets.notify('error', `新建标签失败：${created.error ?? '未知错误'}`)
+  tagSubmitting = true
+  try {
+    const existing = lib.tags.find((t) => t.name === name)
+    const created = existing ? null : await window.stash.tag.create({ name })
+    if (created && !created.ok) {
+      closeTagInput()
+      return void assets.notify('error', `新建标签失败：${created.error ?? '未知错误'}`)
+    }
+    const tagId = existing ? existing.id : created?.data?.id
+    if (tagId) await attachTag(tagId)
+    closeTagInput()
+  } finally {
+    tagSubmitting = false
   }
-  const tagId = existing ? existing.id : created?.data?.id
-  if (tagId) await attachTag(tagId)
-  addingTag.value = false
-  newTag.value = ''
 }
 
 /** 点下拉里的标签：挂上后**不关输入框**，方便连着加好几个 */
@@ -337,17 +389,17 @@ async function copyNote(): Promise<void> {
               <span class="tag-dot" :style="{ background: t.color }"></span>{{ t.name }}<span class="tag-x" aria-hidden="true">×</span>
             </span>
             <span v-if="!asset.tags.length" class="d-hint">暂无标签</span>
-            <span class="tag-chip tag-add" data-add-tag @click="addingTag = true">＋</span>
+            <span class="tag-chip tag-add" data-add-tag @click="openTagInput">＋</span>
           </div>
-          <div v-if="addingTag" class="inline-form">
+          <div v-if="addingTag" ref="tagFormEl" class="inline-form">
             <svg class="tag-search-ico" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" aria-hidden="true">
               <path d="M1.7 2.4c0-.4.3-.7.7-.7h3.2c.2 0 .4.1.5.2l3.9 3.9c.3.3.3.7 0 1l-3 3c-.3.3-.7.3-1 0L2 5.9a.7.7 0 0 1-.2-.5V2.4z" />
               <circle cx="4.1" cy="4.1" r=".85" fill="currentColor" stroke="none" />
             </svg>
             <input
+              ref="tagInputEl"
               v-model="newTag"
               placeholder="搜索或创建标签…"
-              autofocus
               @keyup.enter="addTag"
               @blur="addTag"
               @keyup.esc="closeTagInput"
