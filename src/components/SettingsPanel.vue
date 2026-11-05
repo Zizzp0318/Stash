@@ -383,6 +383,50 @@ async function copyDiagnostics(): Promise<void> {
   if (r.ok) assets.notify('info', '诊断信息已复制')
   else assets.notify('error', `复制失败：${r.error ?? '未知原因'}`)
 }
+
+// ==================== 关于 · GitHub 入口 + 检查更新 ====================
+//
+// 边界（用户明确要求）：**只提示有新版本**。下载、安装、自动更新一概不做 ——
+// 点「去下载」把 Releases 页交给系统默认浏览器，剩下的事用户自己在 GitHub 上完成。
+//
+// 为什么不用 `window.open`：渲染进程里它会开出新的 BrowserWindow，或者被
+// `will-navigate` 拦掉，用户根本到不了浏览器。走 IPC → `shell.openExternal`
+// 才是「系统默认浏览器」，而且 URL 白名单判在主进程（渲染层的校验等于没校验）。
+const GITHUB_RELEASES_URL = 'https://github.com/Zizzp0318/Stash/releases'
+
+/** 检查更新状态：idle=还没点 / checking=转圈中 / newer=有新版 / latest=已最新 / failed=失败 */
+type UpdateState = 'idle' | 'checking' | 'newer' | 'latest' | 'failed'
+const updateState = ref<UpdateState>('idle')
+const latestVersion = ref('')
+/** 转圈中：按钮加 `.checking` 类旋转，同时 disabled 防连点 */
+const checking = computed(() => updateState.value === 'checking')
+
+/** 用系统默认浏览器打开仓库的发布下载页（GitHub 图标与「去下载」共用） */
+async function openReleases(): Promise<void> {
+  const r = await window.stash.shell.openExternal(GITHUB_RELEASES_URL)
+  if (!r.ok || !r.data?.opened) {
+    assets.notify('error', `打开浏览器失败：${r.error ?? '未知原因'}`)
+  }
+}
+
+/**
+ * 检查更新。三态全部收敛在 `updateState` 上，**不弹 alert / confirm** ——
+ * 结果就是版本行下方那行小字，失败也只是一句话（断网、超时都是常态）。
+ * `checking` 期间按钮已 disabled，这里再拦一道防重入。
+ */
+async function checkUpdate(): Promise<void> {
+  if (checking.value) return
+  updateState.value = 'checking'
+  const r = await window.stash.update.check()
+  if (r.ok && r.data) {
+    latestVersion.value = r.data.latest
+    // hasUpdate 由主进程逐段比较（渲染层拿不到 compareVersion，自己再比一遍迟早分叉）
+    updateState.value = r.data.hasUpdate ? 'newer' : 'latest'
+    return
+  }
+  updateState.value = 'failed'
+}
+
 </script>
 
 <template>
@@ -1067,7 +1111,66 @@ async function copyDiagnostics(): Promise<void> {
             <p class="sp-sub">本地素材库 · 所有数据都在你自己的磁盘上</p>
 
             <div class="sp-kv">
-              <span>版本</span><b data-sp-version>{{ info?.version ?? '—' }}</b>
+              <span>版本</span>
+              <!-- 版本号 + GitHub 入口 + 检查更新：三者同一行对齐；结果文案另起一行 -->
+              <div class="sp-ver">
+                <div class="sp-ver-line">
+                  <b data-sp-version>{{ info?.version ?? '—' }}</b>
+                  <button
+                    class="sp-icon-btn"
+                    type="button"
+                    title="在 GitHub 上查看发布版本"
+                    aria-label="在 GitHub 上查看发布版本"
+                    data-sp-github
+                    @click="openReleases"
+                  >
+                    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    class="sp-icon-btn"
+                    :class="{ checking }"
+                    type="button"
+                    :title="checking ? '正在检查更新…' : '检查更新'"
+                    :aria-label="checking ? '正在检查更新' : '检查更新'"
+                    :aria-busy="checking"
+                    data-sp-check-update
+                    :disabled="checking"
+                    @click="checkUpdate"
+                  >
+                    <svg
+                      viewBox="0 0 24 24"
+                      width="13"
+                      height="13"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <path d="M23 4v6h-6" />
+                      <path d="M1 20v-6h6" />
+                      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10" />
+                      <path d="M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                    </svg>
+                  </button>
+                </div>
+                <div v-if="updateState === 'newer'" class="sp-ver-result is-new" data-sp-update-state="newer">
+                  发现新版本 v{{ latestVersion }} ·
+                  <button class="sp-ver-link" type="button" data-sp-update-download @click="openReleases">去下载</button>
+                </div>
+                <div v-else-if="updateState === 'latest'" class="sp-ver-result is-ok" data-sp-update-state="latest">
+                  已是最新版本
+                </div>
+                <div v-else-if="updateState === 'failed'" class="sp-ver-result is-err" data-sp-update-state="failed">
+                  检查失败，请稍后再试
+                </div>
+              </div>
               <span>Electron</span><b>{{ info?.electron ?? '—' }}</b>
               <span>Chromium</span><b>{{ info?.chrome ?? '—' }}</b>
               <span>Node</span><b>{{ info?.node ?? '—' }}</b>
@@ -1080,7 +1183,8 @@ async function copyDiagnostics(): Promise<void> {
 
             <div class="sp-note">
               <b>第三方组件许可</b>：缩略图与转码用 sharp（Apache-2.0）与 ffmpeg-static 附带的 FFmpeg
-              （<b>GPL-3.0</b>，按需调用外部可执行文件）。字体与图标均为本地资源，不联网。
+              （<b>GPL-3.0</b>，按需调用外部可执行文件）。字体与图标均为本地资源；
+              除你<b>手动点「检查更新」</b>会访问 GitHub 之外，软件不联网。
             </div>
 
             <div class="sp-actions">

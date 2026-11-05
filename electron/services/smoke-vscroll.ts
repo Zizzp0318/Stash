@@ -504,6 +504,20 @@ export async function runSmokeVScroll(win: BrowserWindow): Promise<void> {
     const idleMean = baseSamples.length ? baseSamples.reduce((a, b) => a + b, 0) / baseSamples.length : 0
     // 相对阈值：滚动帧的 p95 不允许超过空闲基线的 2.5 倍（下限 8ms 防止基线过小导致抖动误判）
     const relP95 = Math.max(8, idleP95 * 2.5)
+    /**
+     * 滚动帧平均间隔的上限 = `max(20ms, 空闲基线均值 × 1.2)`。
+     *
+     * 为什么不再写死 20ms：rAF 的间隔由**屏幕刷新率**决定，与我们的代码无关。设计稿的
+     * 「平均 ≤20ms」是照 60Hz（16.67ms/帧）写的；在 --disable-gpu 下本机 rAF 曾被观测到
+     * ~160Hz（≈6ms），20ms 宽松到几乎不可能红。但同一台机器也可能被钳在 ~30Hz
+     * （实测基线 mean=31.3ms，纯空闲、零工作量）—— 那时 20ms 是**物理不可达**的，
+     * 这条会永久红并把「本机刷新率低」伪装成「代码性能回归」。
+     *
+     * 挂到基线上之后：idleMean≈6ms → `max(20, 7.2)=20`，与旧口径**逐值等价**；
+     * 只有 30Hz 这类基线才放宽到 37.5ms。真正抓「滚动比空闲更慢」的是相对判据
+     * `p95 <= relP95`，它保持锋利、不随基线放宽（注入 A 实测：滚动帧忙等 8ms → 它必红）。
+     */
+    const meanCap = Math.max(20, idleMean * 1.2)
     R.m2_idle = {
       started: baseStarted,
       done: baseDone,
@@ -544,22 +558,25 @@ export async function runSmokeVScroll(win: BrowserWindow): Promise<void> {
       mean: Math.round(mean * 10) / 10,
       max: Math.round(max * 10) / 10,
       idleP95: Math.round(idleP95 * 10) / 10,
+      idleMean: Math.round(idleMean * 10) / 10,
+      meanCap: Math.round(meanCap * 10) / 10,
       relP95: Math.round(relP95 * 10) / 10
     }
     // 阈值口径（写进报告与 §11.2）：
-    //   · 绝对：p95 ≤ 33ms（掉 2 帧以内）、平均 ≤ 20ms、最长 ≤ 80ms —— 按设计稿。
+    //   · 绝对：p95 ≤ 33ms（掉 2 帧以内）、平均 ≤ max(20ms, 空闲基线均值×1.2)、最长 ≤ 80ms。
     //     平均那条设计稿写 ≤16ms，但 60Hz 屏上 rAF 间隔本身就是 16.67ms，字面永远红；
-    //     本机实测 6.1ms，20ms 仍然远低于「注入验证」的 16.5ms（且相对判据会独立拦住它）。
+    //     挂到空闲基线上见 `meanCap` 的注释（60Hz+ 机器上仍是 20ms，与旧口径等价）。
     //   · 相对：p95 ≤ 空闲基线 × 2.5 —— 这条才是**能失败**的那条（见上面的基线说明）。
     check(
-      'M2 帧率 p95 ≤33ms / 平均 ≤20ms / 最长 ≤80ms（1 万条已加载）',
-      probeStarted && probeDone && sorted.length >= 200 && p95 <= 33 && mean <= 20 && max <= 80,
+      'M2 帧率 p95 ≤33ms / 平均 ≤max(20, 空闲基线均值×1.2) / 最长 ≤80ms（1 万条已加载）',
+      probeStarted && probeDone && sorted.length >= 200 && p95 <= 33 && mean <= meanCap && max <= 80,
       R.m2
     )
     check('M2 滚动帧 p95 ≤ 空闲基线 ×2.5（注入验证时这条必红）', baseDone && sorted.length >= 200 && p95 <= relP95, {
       p95: R.m2 && (R.m2 as { p95: number }).p95,
       relP95: Math.round(relP95 * 10) / 10,
-      idleP95: Math.round(idleP95 * 10) / 10
+      idleP95: Math.round(idleP95 * 10) / 10,
+      meanCap: Math.round(meanCap * 10) / 10
     })
 
     // ==================== 段 7：M6 视图切换 / 缩放 / 列数 ====================
@@ -1307,6 +1324,478 @@ export async function runSmokeVScroll(win: BrowserWindow): Promise<void> {
         pvName1 !== pvName2 &&
         !pvRenderedNames.includes(pvName2),
       { from: pvName1, to: pvName2, renderedInDom: pvRenderedNames.length, closed: pvClosed }
+    )
+
+    // ==================== 段 17：框选贴边自动滚动（QA-17A…H）====================
+    //
+    // 被测能力（§9.2 缺口 5，v0.1.8 已实现）：框选时指针压进 `.grid-wrap` 上下 48px 热区，
+    // 用 rAF 持续滚动，**每帧重算 band 与命中集**。这条链路有三类退化是既有 66 条断言抓不到的：
+    //   ① 功能压根没接上（不滚）——QA-17A/F/G
+    //   ② 滚了但**锚点算错 / 漏重算**（框顶边跟着内容漂、上面框住的素材掉出框）——QA-17B/B2/C
+    //   ③ 热区判定写反 / 出口没收干净（热区外乱滚、松手/失焦还在滚）——QA-17D/E/E2
+    // 每条都给出可测的量化判据（ΔscrollTop / ΔbandTop / 差集），不接受「看起来滚了」。
+    //
+    // 为什么 A–F 写在同一次拖拽里：真实用户就是一次拖拽；拆成六次独立拖拽会让「正在滚动」这个
+    // 前提每段重建一遍，反而更容易假红。D 要求「先真的在滚」，E 要求「松手时 rAF 真的还在跑」，
+    // 都是靠前一段把状态带过来的 —— 顺序不能乱。
+    //
+    // ⚠️ 采样用固定 `sleep` 是**故意的**：这里量的是「速率（px/时间窗）」，不是「等某个状态出现」，
+    // 没有可轮询的判据（§10.3 纪律 1 针对的是后者）。所以所有结论都建在**实测增量**上，
+    // 而不是「等了 200ms 所以就绪了」。
+    //
+    // ⚠️ 选择清理（本项目踩过）：每段结束都必须松手 + Esc 清选择，否则批量条挂出来会改
+    // `.grid-wrap` 的 padding-bottom，连带把 QA-10 / R6 / M4-到底 弄红。
+
+    type Shot = {
+      scrollTop: number
+      max: number
+      marquee: boolean
+      bandTop: number | null
+      bandH: number | null
+      viewTop: number | null
+      viewBottom: number | null
+      selIds: number[]
+      rendered: number
+      wrap: { top: number; bottom: number; left: number; right: number; h: number }
+    }
+    /**
+     * 一次**原子**读：滚动量 + 选框（内容坐标 & 视口坐标）+ 命中集 + 容器几何。
+     * 必须原子：分几次 IPC 读会在滚动中途拿到互相不一致的快照（Δ 全部失真）。
+     *
+     * `band` 的内容坐标直接取 `.marquee` 的 inline style —— 模板里就是
+     * `left/top/width/height = band.x1/y1/(x2-x1)/(y2-y1)`，与组件内部 `band` 同源、无换算；
+     * 视口坐标取 `getBoundingClientRect()`。两者的差就是「滚动偏移」这一项。
+     */
+    const shotCode = `(() => {
+      const w = document.querySelector('.grid-wrap')
+      if (!w) return null
+      const wr = w.getBoundingClientRect()
+      const mq = document.querySelector('.marquee')
+      const mqr = mq ? mq.getBoundingClientRect() : null
+      const t = mq ? parseFloat(mq.style.top) : null
+      const hh = mq ? parseFloat(mq.style.height) : null
+      return {
+        scrollTop: Math.round(w.scrollTop),
+        max: Math.round(w.scrollHeight - w.clientHeight),
+        marquee: !!mq,
+        bandTop: t == null || Number.isNaN(t) ? null : Math.round(t),
+        bandH: hh == null || Number.isNaN(hh) ? null : Math.round(hh),
+        viewTop: mqr ? Math.round(mqr.top - wr.top) : null,
+        viewBottom: mqr ? Math.round(mqr.bottom - wr.top) : null,
+        selIds: [...document.querySelectorAll('.masonry-card.selected')].map((c) => Number(c.dataset.id)),
+        rendered: document.querySelectorAll('.masonry-card').length,
+        wrap: {
+          top: Math.round(wr.top),
+          bottom: Math.round(wr.bottom),
+          left: Math.round(wr.left),
+          right: Math.round(wr.right),
+          h: Math.round(wr.height)
+        }
+      }
+    })()`
+    const shot = async (): Promise<Shot | null> => (await js(shotCode)) as Shot | null
+
+    /**
+     * 合成 mousedown。
+     * ⚠️ 必须派发在 `.grid-wrap` **本身**上（不是 `document.elementFromPoint` 拿到的那张卡）：
+     * `onGridPointerDown` 用 `e.target.closest('.card')` 区分「拖素材」与「框选」，
+     * 目标是容器 ⇒ `onCard = false` ⇒ 走框选。这也是 QA-2 的既有写法（同一条路径）。
+     */
+    const eDown = async (x: number, y: number): Promise<void> => {
+      await js(
+        `(() => { const w = document.querySelector('.grid-wrap'); w.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, buttons: 1, clientX: ${Math.round(x)}, clientY: ${Math.round(y)} })); return true })()`
+      )
+    }
+    /** 合成 mousemove（监听挂在 window 上，见 `onGridPointerDown` 里的 addEventListener） */
+    const eMove = async (x: number, y: number): Promise<void> => {
+      await js(
+        `window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: ${Math.round(x)}, clientY: ${Math.round(y)} }))`
+      )
+      await sleep(40)
+    }
+    /** 松手。**每次拖拽都必须调用**：漏一次就留下一个跑着的全局 rAF，会污染后面每一段 */
+    const eUp = async (x: number, y: number): Promise<void> => {
+      await js(
+        `window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, buttons: 0, clientX: ${Math.round(x)}, clientY: ${Math.round(y)} }))`
+      )
+      await sleep(140)
+    }
+    /** Esc 走组件自己的 `onKeyDown` → `assets.clearSelection()` */
+    const clearSel = async (): Promise<void> => {
+      await js(`(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true })()`)
+      await sleep(180)
+    }
+    /** 滚到「可滚动范围」的绝对位置并等窗口/布局 flush */
+    const setScrollTop = async (top: number): Promise<void> => {
+      await js(`(() => { document.querySelector('.grid-wrap').scrollTop = ${Math.round(top)}; return true })()`)
+      await sleep(300)
+    }
+
+    // 干净起点：瀑布视图 + 顶部 + 无选择
+    await clearSel()
+    await js(`(() => { document.querySelector('.grid-wrap').scrollTop = 0; return true })()`)
+    await sleep(300)
+    const pre = await shot()
+    const sv = await snap()
+    R.qa17_pre = { shot: pre, snap: sv, view: sv?.view }
+    const W = pre?.wrap ?? { top: 0, bottom: 0, left: 0, right: 0, h: 0 }
+    /** 横向取容器内两侧各留 40px（近乎整行宽 ⇒ 命中集足够大，差集才有意义） */
+    const bx1 = W.left + 40
+    const bx2 = W.right - 40
+    /** 起点在竖直方向 45% 处；落点压在下边缘热区内（距底 6px ⇒ 深度 42，接近满速） */
+    const startY = W.top + Math.round(W.h * 0.45)
+    const hotBottomY = W.bottom - 6
+
+    // —— QA-17A / B / C：一次向下拖拽，覆盖「触发 / 选框跟随 / 命中集更新」——
+    await eDown(bx1, startY)
+    await eMove(bx1 + 6, startY + 12) // 越过 DRAG_THRESHOLD(4) ⇒ 进入 band 模式
+    await eMove(bx2, hotBottomY) // 压进下边缘热区 ⇒ startBandAutoScroll 排帧
+    const A0 = await shot()
+    await sleep(220)
+    const A1 = await shot()
+    await sleep(220)
+    const A2 = await shot()
+    await sleep(220)
+    const A3 = await shot()
+    R.qa17_a = { s0: A0, s1: A1, s2: A2, s3: A3 }
+    /**
+     * A：向下滚动必须**单调增长**（三个区间都要涨），且 660ms 内总位移 ≥100px。
+     * 上限判据不是「滚到底了」——这条只看方向与单调性；贴底的表现由 G 负责。
+     */
+    check(
+      'QA-17A 指针进入下边缘热区后自动向下滚动：scrollTop 单调增长（3 个采样区间逐次变大、总位移 ≥100px）',
+      !!A0 &&
+        !!A1 &&
+        !!A2 &&
+        !!A3 &&
+        A0.marquee === true &&
+        A1.scrollTop > A0.scrollTop &&
+        A2.scrollTop > A1.scrollTop &&
+        A3.scrollTop > A2.scrollTop &&
+        A3.scrollTop - A0.scrollTop >= 100,
+      {
+        t0: A0?.scrollTop,
+        t1: A1?.scrollTop,
+        t2: A2?.scrollTop,
+        t3: A3?.scrollTop,
+        marquee: A0?.marquee,
+        rendered: A0?.rendered
+      }
+    )
+    /**
+     * B：框选矩形在滚动时的**正确语义** —— 起点锚死、框只往下长。
+     *
+     * ⚠️ 这条断言曾经写成相反的口径（断「band.top 与 scrollTop 等量位移、.marquee 在视口里不动」），
+     * 那是**把 bug 当规格**：起点每帧从视口坐标重算，会让它在内容里一路往下漂，
+     * 上面已经框住的素材被挤出框（用户实测反馈「滚到下面，上面的素材会丢失框选」）。
+     * 正确行为是：
+     *   ① 起点在按下那一刻锚成**内容坐标** ⇒ 滚动时 band.top 不动；
+     *   ② 终点跟着指针走 ⇒ 框高增长量 ≈ 滚动量；
+     *   ③ 选框在视口里随内容一起上移（ΔviewTop ≈ -ΔscrollTop），而不是钉在视口不动。
+     */
+    const dScroll = (A3?.scrollTop ?? 0) - (A0?.scrollTop ?? 0)
+    const dBand = (A3?.bandTop ?? 0) - (A0?.bandTop ?? 0)
+    const dView = (A3?.viewTop ?? 0) - (A0?.viewTop ?? 0)
+    const dBandH = (A3?.bandH ?? 0) - (A0?.bandH ?? 0)
+    check(
+      'QA-17B 滚动时框顶边锚死在内容里（ΔbandTop ≈ 0）、框只往下长（ΔbandH ≈ ΔscrollTop）、选框随内容上移出视口（ΔviewTop ≈ -ΔscrollTop）',
+      !!A0 &&
+        !!A3 &&
+        A0.bandTop != null &&
+        A3.bandTop != null &&
+        // 「滚了」这个前提必须显式成立：否则 Δ 全 0 会让各条判据空转成真（假绿通道）
+        dScroll > 100 &&
+        Math.abs(dBand) <= 4 &&
+        Math.abs(dView + dScroll) <= 6 &&
+        Math.abs(dBandH - dScroll) <= 6,
+      {
+        dScroll,
+        dBandTop: dBand,
+        dViewTop: dView,
+        dBandH,
+        bandH0: A0?.bandH,
+        bandH3: A3?.bandH,
+        viewTop0: A0?.viewTop,
+        viewTop3: A3?.viewTop
+      }
+    )
+    /**
+     * B2：用户实测反馈的直接回归 —— 「滚到下面，上面的素材会丢失框选」。
+     *
+     * 断在**选中集的单调性**上：滚动前框内的 id 必须全部仍在滚动后的集合里，且最上面那条的 id 不变。
+     * 这比断几何更贴近用户能感知到的故障，也能抓住「band 确实每帧重算了、但锚点算错」这一类
+     * （几何判据可能因为两边同时错而互相抵消，集合判据不会）。
+     */
+    const s0Ids = A0?.selIds ?? []
+    const s3Ids = A3?.selIds ?? []
+    const lostIds = s0Ids.filter((id) => !s3Ids.includes(id))
+    check(
+      'QA-17B2 向下滚动时已框住的素材一个都不丢（滚动前集合 ⊆ 滚动后集合，最上面那条 id 不变）',
+      s0Ids.length > 0 && lostIds.length === 0 && s3Ids[0] === s0Ids[0],
+      {
+        before: s0Ids.length,
+        after: s3Ids.length,
+        lost: lostIds,
+        firstBefore: s0Ids[0],
+        firstAfter: s3Ids[0]
+      }
+    )
+    /**
+     * C：命中集必须随滚动更新 —— 「滚进来之后才进入框内」的卡片 id 与滚动前的集合做差集，非空即证。
+     * 判据建在**渲染出来的 `.selected` 卡片 id 集**上（`bandHits` 没有对外出口，
+     * 但它渲染成 `.selected` 类，且 id 是数据层 id ⇒ 可以跨屏比集合）。
+     * 同时要求末次采样仍有足够多的命中：只滚不重算时，band 会随滚动飘出视口，
+     * 命中数会掉到 0 —— 那也算「差集为空 + 数量崩塌」双红。
+     */
+    const selBefore = new Set(A0?.selIds ?? [])
+    const newIds = (A3?.selIds ?? []).filter((id) => !selBefore.has(id))
+    check(
+      'QA-17C 命中集随滚动更新：出现「滚进来之后才进入框内」的新卡片（与滚动前集合作差集，非空）',
+      !!A0 && !!A3 && (A0.selIds.length ?? 0) >= 4 && newIds.length >= 1 && A3.selIds.length >= 8,
+      {
+        before: A0?.selIds.length,
+        after: A3?.selIds.length,
+        newIds: newIds.length,
+        sampleNew: newIds.slice(0, 6)
+      }
+    )
+
+    // —— QA-17D：反向断言（指针在容器中部 ⇒ 不该滚）——
+    // 判据：离开热区后两次采样 scrollTop **完全相等**（不是「涨得慢」）。这条专抓热区判定写反 / 恒真。
+    await eMove(bx2, W.top + Math.round(W.h * 0.5))
+    await sleep(220)
+    const D0 = await shot()
+    await sleep(360)
+    const D1 = await shot()
+    R.qa17_d = { s0: D0, s1: D1 }
+    check(
+      'QA-17D 指针在容器中部（不在热区）时 scrollTop 冻结、选框仍在（两次采样完全相等）',
+      !!D0 && !!D1 && D0.marquee === true && D1.marquee === true && D0.scrollTop === D1.scrollTop,
+      { t0: D0?.scrollTop, t1: D1?.scrollTop, marquee: D0?.marquee }
+    )
+
+    // —— QA-17E：停止出口（松手 ⇒ rAF 真停 + 选框消失）——
+    // 必须**先让 rAF 真的在跑**再松手（D 已经把滚动停掉了，直接松手会变成空转断言）。
+    await eMove(bx2, hotBottomY)
+    await sleep(260)
+    const E0 = await shot()
+    await sleep(260)
+    const E1 = await shot()
+    await eUp(bx2, hotBottomY)
+    const E2 = await shot()
+    await sleep(360)
+    const E3 = await shot()
+    R.qa17_e = { resumed0: E0, resumed1: E1, afterUp: E2, still: E3 }
+    /**
+     * 判据：① 松手前确实在滚（E1 > E0）；② 松手后 `.marquee` 消失；③ 再等 360ms 仍冻结。
+     * ③ 是**区分「rAF 真停」与「还在滚只是被底边夹住」**的那一条 —— 只断「冻结」的话，
+     * 恰好滚到边界上就会假绿（这里选在顶部附近拖，距底很远，夹取不可能发生）。
+     */
+    check(
+      'QA-17E 松手后自动滚动停止（再等 360ms 仍冻结，非被底边夹住）且选框消失',
+      !!E0 &&
+        !!E1 &&
+        !!E2 &&
+        !!E3 &&
+        E1.scrollTop > E0.scrollTop &&
+        E2.marquee === false &&
+        E2.scrollTop === E3.scrollTop,
+      { resumed: [E0?.scrollTop, E1?.scrollTop], afterUp: E2?.scrollTop, later: E3?.scrollTop, marquee: E2?.marquee }
+    )
+    await clearSel() // E 松手会提交选择 ⇒ 必须清掉（批量条会改 padding-bottom）
+
+    // —— QA-17E2：另一个停止出口 —— 拖拽中窗口失焦（alt+tab / 点别的窗口）——
+    //
+    // 为什么这条必须单列（QA 实测结论，别再合并回 E）：E 只证明「松手后不再滚」，而
+    // `autoScrollFrame` 自己的状态护栏（`!st || !dragging`）在松手后**同样**会把循环停掉 ——
+    // 于是「`stopDragTrack()` 里那句 `stopBandAutoScroll()` 被删掉」时 E 依然全绿（已实测）。
+    // 失焦这条出口没有那层兜底：失焦时 `dragging` / `dragStart` 都还在，护栏不成立，
+    // 只有真的 `cancelAnimationFrame` 才能停下 ⇒ 这一条才**真的**能证伪「出口漏接」。
+    await eDown(bx1, startY)
+    await eMove(bx1 + 6, startY + 12)
+    await eMove(bx2, hotBottomY)
+    await sleep(240)
+    const FB0 = await shot()
+    await sleep(240)
+    const FB1 = await shot()
+    await js(`window.dispatchEvent(new Event('blur'))`)
+    await sleep(240)
+    const FB2 = await shot()
+    await sleep(360)
+    const FB3 = await shot()
+    await eUp(bx2, hotBottomY)
+    R.qa17_e2 = { resume0: FB0, resume1: FB1, afterBlur: FB2, still: FB3 }
+    check(
+      'QA-17E2 拖拽中窗口失焦也必须停止自动滚动：失焦后 scrollTop 冻结、选框仍在（只有真 cancel 才停得住）',
+      !!FB0 &&
+        !!FB1 &&
+        !!FB2 &&
+        !!FB3 &&
+        FB1.scrollTop > FB0.scrollTop &&
+        FB2.scrollTop === FB3.scrollTop &&
+        FB2.marquee === true,
+      { resumed: [FB0?.scrollTop, FB1?.scrollTop], afterBlur: FB2?.scrollTop, later: FB3?.scrollTop, marquee: FB2?.marquee }
+    )
+    await clearSel()
+
+    // —— QA-17F：上边缘反向滚动 ——
+    // 不先滚到中部的话「递减」没有空间（scrollTop = 0 无法再减），断言会空转。
+    const midTarget = Math.round(((await shot())?.max ?? 0) * 0.4)
+    await setScrollTop(midTarget)
+    const fPre = await shot()
+    await eDown(bx1, W.top + Math.round(W.h * 0.75))
+    await eMove(bx1 + 6, W.top + Math.round(W.h * 0.75) - 12)
+    await eMove(bx2, W.top + 6) // 压进上边缘热区（深度 42）
+    const F0 = await shot()
+    await sleep(240)
+    const F1 = await shot()
+    await sleep(240)
+    const F2 = await shot()
+    await eUp(bx2, W.top + 6)
+    R.qa17_f = { pre: fPre, s0: F0, s1: F1, s2: F2 }
+    check(
+      'QA-17F 上边缘热区反向滚动：scrollTop 单调递减（总位移 ≥80px，且起点 >0 使断言不空转）',
+      !!fPre &&
+        !!F0 &&
+        !!F1 &&
+        !!F2 &&
+        (fPre.scrollTop ?? 0) > 1000 &&
+        F0.scrollTop < fPre.scrollTop &&
+        F1.scrollTop < F0.scrollTop &&
+        F2.scrollTop < F1.scrollTop &&
+        F0.scrollTop - F2.scrollTop >= 80,
+      {
+        pre: fPre?.scrollTop,
+        t0: F0?.scrollTop,
+        t1: F1?.scrollTop,
+        t2: F2?.scrollTop,
+        drop: (F0?.scrollTop ?? 0) - (F2?.scrollTop ?? 0)
+      }
+    )
+    await clearSel()
+
+    // —— QA-17G：贴住下边缘能跨页续滚（重点怀疑项，工程师只做了推理、未实测）——
+    //
+    // 背景：`maybeLoadMore()` 由 `onScroll` 与 `watch(layout)` 两处触发。贴住底边时 scrollTop
+    // 被夹住、不再变化 ⇒ 不再派发 scroll 事件；若「布局变化」那条路也不成立，就会卡死在底部。
+    //
+    // 判据（无法伪造的量）：`scrollTop` 超过**一页内容自己的可滚上限**（`scrollHeight - clientHeight`
+    // 在 n = 200 时测得）—— 只有真的追加了下一页才可能越过它；再加「已加载条数 200 → 400」与
+    // 「越过边界之后仍在继续增长」（区分「滚到底停住」与「追加后接着滚」）。
+    //
+    // ⚠️ 为什么不从 scrollTop = 0 一路滚下来：本机 rAF 间隔实测 31.3ms（M2 的空闲基线就是 31.3ms，
+    // 见报告里的环境定性），20px/帧 ⇒ 约 640px/s，一页内容 10038px 要滚 15 秒，纯浪费。
+    // 所以先**程序性**滚到「距续页阈值（800px）还剩约 2200px」的位置（此时 n 仍是 200），
+    // 再交给自动滚动去跨那道边界 —— 走到的正是「到底 → 追加 → 继续」这条路径。
+    await clearSel()
+    // 重置成「恰好一页」：改关键词会重查（n 回到 200）；先打一个必然 0 命中的词再清空，确保 watcher 真的跑
+    await typeSearch('zzzz-qa17-reset')
+    await waitUntil('!!window.__vsDebug && window.__vsDebug().n === 0', 15000)
+    await typeSearch('')
+    const freshPage = await waitUntil(
+      '!!window.__vsDebug && window.__vsDebug().n === 200 && window.__vsDebug().dataTotal === 10000',
+      15000
+    )
+    await sleep(320)
+    let gPre = await snap()
+    /** 距续页阈值的余量 = total - vpBottom（组件里 maybeLoadMore 的同一口径） */
+    const gRemain = (gPre?.total ?? 0) - (gPre?.vpBottom ?? 0)
+    if (gPre?.n === 200 && gRemain > 2600) {
+      // 一次校正：目标位置 = 当前位置 + (当前余量 - 2200)
+      const gTop = Math.round(gPre.scrollTop + gRemain - 2200)
+      await setScrollTop(gTop)
+      gPre = await snap()
+    }
+    const gShot = await shot()
+    const pageMax = gShot?.max ?? -1
+    R.qa17_g_pre = { freshPage, remainBefore: gRemain, snap: gPre, pageMax }
+    await eDown(W.left + 60, W.top + Math.round(W.h * 0.25))
+    await eMove(W.left + 66, W.top + Math.round(W.h * 0.25) + 12)
+    await eMove(W.right - 60, W.bottom + 60) // 容器外下方 ⇒ 深度 108 ⇒ 满速 20px/帧
+    const gCrossed = await waitUntil(
+      `(() => { const w = document.querySelector('.grid-wrap'); return w.scrollTop > ${pageMax + 120} })()`,
+      30000
+    )
+    const GA = await shot()
+    await sleep(420)
+    const GB = await shot()
+    await eUp(W.right - 60, W.bottom + 60)
+    const gAfter = await snap()
+    R.qa17_g = { crossed: gCrossed, pageMax, a: GA, b: GB, after: gAfter }
+    check(
+      'QA-17G 贴住下边缘能跨页续滚：scrollTop 越过「一页内容」的上限、已加载 200 → 400、且越过边界后仍在增长',
+      freshPage &&
+        gPre?.n === 200 &&
+        gCrossed &&
+        (GA?.scrollTop ?? -1) > pageMax &&
+        (GB?.scrollTop ?? 0) > (GA?.scrollTop ?? 0) &&
+        (gAfter?.n ?? 0) === 400,
+      {
+        pageMax,
+        crossed: gCrossed,
+        atCross: GA?.scrollTop,
+        later: GB?.scrollTop,
+        nBefore: gPre?.n,
+        nAfter: gAfter?.n
+      }
+    )
+    await clearSel()
+
+    // —— QA-17H：既有 QA-2 不回归（跨屏框选仍能选中「未渲染但已加载」的卡片）——
+    // 只复算关系（选中数 > 渲染数），不复用 QA-2 的编号与阈值口径：DOM 基数 ≠ 数据基数（§10.3 纪律 4）。
+    // 注意 QA-2 那套事件是**同一个同步块**里派发的，所以指针即使落在热区也不会真的滚起来（rAF 来不及跑），
+    // 结论与改造前逐字一致。
+    await scrollToRatio(0)
+    await clearSel()
+    await js(`(() => {
+      const w = document.querySelector('.grid-wrap')
+      const wr = w.getBoundingClientRect()
+      const down = (x, y) => w.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, buttons: 1, clientX: x, clientY: y }))
+      const mv = (x, y) => window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: x, clientY: y }))
+      const up = (x, y) => window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, buttons: 1, clientX: x, clientY: y }))
+      const x1 = Math.round(wr.left + 30)
+      const x2 = Math.round(wr.left + Math.max(60, wr.width - 30))
+      const y1 = Math.round(wr.top + 80)
+      const y2 = Math.round(wr.top + wr.height * 3)
+      down(x1, y1)
+      mv(x1 + 3, y1 + 3)
+      mv(Math.round((x1 + x2) / 2), Math.round((y1 + y2) / 2))
+      mv(x2, y2)
+      up(x2, y2)
+      return true
+    })()`)
+    const hSelected = await waitUntil("!!document.querySelector('.bb-count b')", 8000)
+    await sleep(320)
+    const hSel = await selCount()
+    const hDom = (await js(`(() => ({
+      rendered: document.querySelectorAll('.masonry-card').length,
+      selectedDom: document.querySelectorAll('.masonry-card.selected').length,
+      marqueeGone: !document.querySelector('.marquee')
+    }))()`)) as { rendered: number; selectedDom: number; marqueeGone: boolean } | null
+    R.qa17_h = { selected: hSel, dom: hDom }
+    check(
+      'QA-17H 既有 QA-2 不回归：跨屏框选仍满足「选中数 > 渲染数」（加自动滚动后断点不变）',
+      hSelected && !!hDom && hSel > hDom.rendered && hDom.selectedDom < hSel && hDom.rendered <= M1_SOFT_MAX,
+      { selected: hSel, rendered: hDom?.rendered, selectedDom: hDom?.selectedDom }
+    )
+
+    // 收尾（本项目踩过的坑：留下的选中会把底部批量条挂出来，连带污染 QA-10 / R6 / M4-到底）
+    await clearSel()
+    /**
+     * 批量条是 `<Transition name="raise">` 包着的（`BatchBar.vue`），选中清空后节点要等离场动画
+     * 走完才移除 —— 所以这里必须**有界轮询**而不是「Esc 之后立刻查」（第一版就是固定 180ms 假红）。
+     */
+    const barGone = await waitUntil("!document.querySelector('.bb-count b')", 4000)
+    const qa17End = (await js(`(() => ({
+      batchbar: !!document.querySelector('.bb-count b'),
+      marquee: !!document.querySelector('.marquee'),
+      scrollTop: Math.round(document.querySelector('.grid-wrap').scrollTop)
+    }))()`)) as { batchbar: boolean; marquee: boolean; scrollTop: number } | null
+    R.qa17_end = { ...qa17End, barGone }
+    check(
+      'QA-17 收尾：选择已清空（批量条离场）、选框已消失（不给后续段留污染）',
+      barGone && !!qa17End && qa17End.batchbar === false && qa17End.marquee === false,
+      R.qa17_end
     )
 
     // 收尾：清掉选中，避免影响退出链

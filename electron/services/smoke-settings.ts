@@ -21,10 +21,14 @@
 //   S11 快捷键    —— 只读清单：有内容、不留空行、且**里面不该有任何可点控件**（防「假设置」）
 //   S12 切换库     —— 两个临时库（X: 400×200 的图；Y: txt 占位图 1:1）来回切，
 //                    断言图片卡片的宽高比不被上一个库的实测值带偏（用户报过「切库后都变成 1:1」）
+//   UF 检查更新    —— 关于页的 GitHub 入口 + 检查更新（QA 增补，编号 UF-1…UF-8）：
+//                    版本比较逐段按数字比、302 Location 解析、白名单（含前缀骗术 / 段边界）、
+//                    checkLatest 三态与「异常收敛成值」、IPC 白名单拒绝、版本行 DOM 结构、
+//                    转圈动画、三态文案真实渲染。**零真实网络、零真实浏览器**（见段内说明）。
 //
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
-import { app, BrowserWindow, dialog } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync, type Dirent } from 'fs'
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
@@ -36,6 +40,15 @@ import { cacheStats, clearCache } from './cache'
 import { deriveFor } from './preview'
 import { libraryUsage } from './health'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
+import {
+  checkLatest,
+  compareVersion,
+  isAllowedExternalUrl,
+  parseTagFromLocation,
+  RELEASES_URL,
+  REPO_URL,
+  type UpdateCheckResult
+} from './update'
 
 interface Check { name: string; pass: boolean; detail?: string }
 
@@ -1279,6 +1292,359 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         try {
           rmSync(d, { recursive: true, force: true })
         } catch { /* 句柄没释放就留着，系统会回收 */ }
+      }
+    }
+
+    // ==================== UF 检查更新 / GitHub 入口（QA 增补） ====================
+    // ⚠️ 本段最硬的两条边界：**绝不碰真实网络、绝不真的拉起浏览器**。做法：
+    //   · 纯函数（版本比较 / Location 解析 / 白名单）在主进程**直接 import 后调用**，不经过 IPC；
+    //   · `checkLatest` 一律注入 `fetchLocation`（工程师专门留的注入口）→ 一个请求都不发；
+    //   · IPC 只走**会被拒绝**的路径：`ERR_URL_NOT_ALLOWED` 在 `shell.openExternal` 之前就抛了；
+    //   · 三态文案必须把 UI 真跑起来才看得见，而真实 `update:check` 会联网（本机 github.com 实测
+    //     5036ms 超时 / 606ms 成功 —— 时通时不通，拿它做断言等于掷骰子）。所以这里把 IPC handler
+    //     换成**测试替身**：渲染层 → preload → IPC → Vue 状态机 → DOM 这条真链路一条不少，
+    //     只把「网络」那一层替掉（与注入 `fetchLocation` 同一思路，只是往下挪一层）。
+    //     替身生效前先用探针自证（否则万一是真 handler 在跑，点 GitHub 图标就真弹浏览器了），
+    //     跑完立刻在 finally 里还原成等价实现。
+    {
+      // ---------- UF-1 版本比较：必须逐段按数字比 ----------
+      // 本单的命门：字符串比较里 `'0.1.10' < '0.1.9'`（'1' < '9'），而 0.1.10 恰恰是最常见的
+      // 下一个版本号 —— 判反了就是「有新版」永远提示不出来，且「已最新」永远假绿。
+      check('UF-1 版本比较：0.1.10 > 0.1.9（字符串比较会判反，这条必须有）',
+        compareVersion('0.1.10', '0.1.9') === 1, String(compareVersion('0.1.10', '0.1.9')))
+      const verCases: Array<[string, string, number]> = [
+        ['0.2.0', '0.1.99', 1],
+        ['1.0.0', '0.9.9', 1],
+        ['0.1.8', '0.1.8', 0],
+        ['v0.1.9', '0.1.8', 1],
+        ['1.0.0', '1', 0], // 缺段补 0
+        ['0.1.9', '0.1.10', -1] // 反向比较
+      ]
+      for (const [a, b, want] of verCases) {
+        const got = compareVersion(a, b)
+        check(`UF-1 版本比较：${a} vs ${b} → ${want}`, got === want, String(got))
+      }
+
+      // ---------- UF-2 从 302 的 Location 里解析 tag ----------
+      const locCases: Array<[string, string | null]> = [
+        ['https://github.com/o/r/releases/tag/v0.1.9', '0.1.9'],
+        ['https://github.com/o/r/releases/tag/v0.1.9/', '0.1.9'], // 尾斜杠
+        ['https://github.com/o/r/releases/tag/v0.1.9?foo=bar#x', '0.1.9'], // query / hash
+        ['https://github.com/o/r/releases/tag/0.1.9', '0.1.9'], // 无 v 前缀
+        ['https://evil.com/o/r/releases/tag/v0.1.9', null], // 非 GitHub 域名
+        ['https://github.com/o/r/releases', null], // 没 /tag/ 段
+        ['', null], // 空串
+        ['file:///C:/releases/tag/v0.1.9', null], // 非 http(s)
+        ['https://github.com/o/r/releases/tag/latest', null] // 段不是版本号
+      ]
+      for (const [input, want] of locCases) {
+        const got = parseTagFromLocation(input)
+        check(`UF-2 Location 解析：${input || '(空串)'} → ${want === null ? 'null' : want}`,
+          got === want, String(got))
+      }
+
+      // ---------- UF-3 白名单：安全关键，逐条断 ----------
+      // 只放行本仓库的 GitHub 页面。下面这些「像但不是」的一个都不能漏。
+      const denyUrls: Array<[string, string]> = [
+        ['http://github.com/Zizzp0318/Stash', '非 https'],
+        ['https://github.com/evil/Stash', '别人的仓库'],
+        ['https://github.com/Zizzp0318/StashX', '段边界（StashX 不是 Stash）'],
+        ['https://github.com/Zizzp0318/Stash/../evil', '../ 规范化后越界'],
+        ['https://github.com@evil.com/Zizzp0318/Stash', '前缀骗术（真的 host 是 evil.com）'],
+        ['file:///C:/Windows/System32/cmd.exe', '本地文件协议'],
+        ['', '空串']
+      ]
+      for (const [u, why] of denyUrls) {
+        check(`UF-3 白名单必须拒绝：${u || '(空串)'}（${why}）`, isAllowedExternalUrl(u) === false)
+      }
+      const allowUrls: Array<[string, string]> = [
+        [REPO_URL, '仓库主页'],
+        [RELEASES_URL, 'Releases 页（GitHub 图标 / 去下载 用这个）'],
+        [`${REPO_URL}/releases/tag/v0.1.9`, '某个 tag 页'],
+        [`${REPO_URL}/`, '带尾斜杠']
+      ]
+      for (const [u, why] of allowUrls) {
+        check(`UF-3 白名单必须放行：${u}（${why}）`, isAllowedExternalUrl(u) === true)
+      }
+
+      // ---------- UF-4 checkLatest 三态（全部注入，零网络） ----------
+      const okRes: UpdateCheckResult = await checkLatest({
+        fetchLocation: async () => `${REPO_URL}/releases/tag/v0.1.9`
+      })
+      check('UF-4 注入合法 Location → { latest:"0.1.9", url:RELEASES_URL }，且没有 error 键',
+        !('error' in okRes) && okRes.latest === '0.1.9' && okRes.url === RELEASES_URL,
+        JSON.stringify(okRes))
+      // 顺带：非法 timeoutMs 不该把一次正常检查变成失败态（归一化在 checkLatest 里）
+      const weirdTimeout: UpdateCheckResult = await checkLatest({
+        timeoutMs: -1,
+        fetchLocation: async () => `${REPO_URL}/releases/tag/v0.2.0`
+      })
+      check('UF-4 非法 timeoutMs 不影响结论（归一化到默认值，不 reject）',
+        !('error' in weirdTimeout) && weirdTimeout.latest === '0.2.0', JSON.stringify(weirdTimeout))
+
+      const noLoc: UpdateCheckResult = await checkLatest({ fetchLocation: async () => null })
+      check('UF-4 注入 null → { error:"ERR_NO_LOCATION" }',
+        'error' in noLoc && noLoc.error === 'ERR_NO_LOCATION', JSON.stringify(noLoc))
+
+      const badLoc: UpdateCheckResult = await checkLatest({
+        fetchLocation: async () => `${REPO_URL}/releases/tag/latest`
+      })
+      check('UF-4 注入非版本 tag（latest）→ { error:"ERR_BAD_LOCATION" }',
+        'error' in badLoc && badLoc.error === 'ERR_BAD_LOCATION', JSON.stringify(badLoc))
+
+      // 抛错（同步 / 异步各一）：必须收敛成 { error }，**绝不 throw** —— 否则 IPC 层 reject，
+      // 渲染层的 checkUpdate() 会卡在 checking 态（没有 catch），按钮永远 disabled。
+      const syncThrower = (): Promise<string | null> => {
+        throw new Error('BOOM-SYNC')
+      }
+      let syncRes: UpdateCheckResult | null = null
+      let syncThrew = ''
+      try {
+        syncRes = await checkLatest({ fetchLocation: syncThrower })
+      } catch (e) {
+        syncThrew = String((e as Error)?.message ?? e)
+      }
+      check('UF-4 fetchLocation 同步抛错 → 收敛成 { error }，绝不 throw',
+        syncThrew === '' && syncRes !== null && 'error' in syncRes && syncRes.error === 'BOOM-SYNC',
+        `threw=${syncThrew || '(none)'} res=${JSON.stringify(syncRes)}`)
+
+      let asyncRes: UpdateCheckResult | null = null
+      let asyncThrew = ''
+      try {
+        asyncRes = await checkLatest({ fetchLocation: () => Promise.reject(new Error('BOOM-ASYNC')) })
+      } catch (e) {
+        asyncThrew = String((e as Error)?.message ?? e)
+      }
+      check('UF-4 fetchLocation 异步 reject → 收敛成 { error }，绝不 throw',
+        asyncThrew === '' && asyncRes !== null && 'error' in asyncRes && asyncRes.error === 'BOOM-ASYNC',
+        `threw=${asyncThrew || '(none)'} res=${JSON.stringify(asyncRes)}`)
+
+      // ---------- UF-5 白名单的 IPC 拒绝路径（会被拒、不会拉起浏览器） ----------
+      check('UF-5 preload 暴露了 shell.openExternal 与 update.check',
+        (await js<boolean>(
+          "typeof window.stash?.shell?.openExternal === 'function' && typeof window.stash?.update?.check === 'function'"
+        )) === true)
+
+      const ipcDeny = await js<{ ok: boolean; error?: string }>(
+        "window.stash.shell.openExternal('https://evil.com/Zizzp0318/Stash')"
+      )
+      check('UF-5 越界域名走真实 IPC → { ok:false, error 含 ERR_URL_NOT_ALLOWED }',
+        ipcDeny?.ok === false && /ERR_URL_NOT_ALLOWED/.test(String(ipcDeny?.error ?? '')),
+        JSON.stringify(ipcDeny))
+      const ipcDenyFile = await js<{ ok: boolean; error?: string }>(
+        "window.stash.shell.openExternal('file:///C:/Windows/System32/cmd.exe')"
+      )
+      check('UF-5 file:// 协议同样被 IPC 拒绝（否则等于把「发文件给系统执行」开放给渲染层）',
+        ipcDenyFile?.ok === false && /ERR_URL_NOT_ALLOWED/.test(String(ipcDenyFile?.error ?? '')),
+        JSON.stringify(ipcDenyFile))
+
+      // ---------- UF-6 关于页版本行的 DOM 结构 ----------
+      const panelUp =
+        (await js<boolean>("!!document.querySelector('[data-settings-panel]')")) === true || (await openPanel())
+      await clickEl('[data-sp-group="about"]')
+      const aboutOk = await waitFor("document.querySelector('.sp-h')?.textContent.trim() === '关于'")
+      check('UF-6 前置：设置面板能切到「关于」', panelUp && aboutOk)
+
+      type VerLine = {
+        hasGithub: boolean
+        hasCheck: boolean
+        bothInLine: boolean
+        versionText: string
+        githubLabel: string
+        checkLabel: string
+        checkDisabled: boolean
+        idleNoResult: boolean
+      }
+      const verLine = await js<VerLine>(`(() => {
+        const ver = document.querySelector('[data-sp-version]')
+        const gh = document.querySelector('[data-sp-github]')
+        const ck = document.querySelector('[data-sp-check-update]')
+        const line = ver ? ver.closest('.sp-ver-line') : null
+        return {
+          hasGithub: !!gh,
+          hasCheck: !!ck,
+          bothInLine: !!line && !!gh && !!ck && line.contains(gh) && line.contains(ck) && line.contains(ver),
+          versionText: (ver?.textContent ?? '').trim(),
+          githubLabel: gh?.getAttribute('aria-label') ?? '',
+          checkLabel: ck?.getAttribute('aria-label') ?? '',
+          checkDisabled: ck?.disabled === true,
+          idleNoResult: !document.querySelector('[data-sp-update-state]')
+        }
+      })()`)
+      check('UF-6 版本行里有 GitHub 图标按钮与「检查更新」按钮',
+        verLine?.hasGithub === true && verLine?.hasCheck === true, JSON.stringify(verLine))
+      check('UF-6 两个按钮都在版本行内（和版本号同一行，不是散在别处）', verLine?.bothInLine === true)
+      // 版本号仍是**纯版本号文本**：图标若被塞进 [data-sp-version] 里，这条会红
+      check('UF-6 data-sp-version 仍是纯版本号文本（没被图标污染），且与主进程一致',
+        /^\d+\.\d+\.\d+$/.test(verLine?.versionText ?? '') && verLine?.versionText === app.getVersion(),
+        `dom=${verLine?.versionText} app=${app.getVersion()}`)
+      check('UF-6 两个按钮都有可读的无障碍名称（不是「只有图标没有名字」）',
+        (verLine?.githubLabel ?? '').length > 0 && (verLine?.checkLabel ?? '').length > 0,
+        `github=${verLine?.githubLabel} check=${verLine?.checkLabel}`)
+      check('UF-6 初始 idle：检查按钮可点、且页面上不存在任何结果文案',
+        verLine?.checkDisabled === false && verLine?.idleNoResult === true)
+
+      // ---------- UF-7 转圈动画真的能生效（纯 DOM 操作：不点按钮、不联网） ----------
+      // 项目里原本没有 @keyframes，`sp-spin` 是这次新加的 —— 写成 `animation: spin ...`（名字写错）
+      // 时浏览器会**静默忽略**（控制台都不报），只有读 computed style 才看得见。
+      const animName = async (withClass: boolean): Promise<string> =>
+        ((await js<string>(`(() => {
+          const b = document.querySelector('[data-sp-check-update]')
+          const svg = b ? b.querySelector('svg') : null
+          if (!b || !svg) return 'no-svg'
+          b.classList.toggle('checking', ${withClass})
+          return getComputedStyle(svg).animationName
+        })()`)) ?? '(eval 失败)')
+      const animOn = await animName(true)
+      const animOff = await animName(false)
+      check('UF-7 加 .checking 后图标 animationName === sp-spin（新 keyframes 真的被引用到了）',
+        animOn === 'sp-spin', animOn)
+      check('UF-7 去掉 .checking 后不再旋转（动画不是无条件常开的）', animOff !== 'sp-spin', animOff)
+
+      // ---------- UF-8 三态文案 / 检测中状态：真实 IPC → Vue → DOM，只把网络响应换成替身 ----------
+      // 等价于 main.ts 里 `wrap()` 的形态：成功 {ok:true,data} / 失败 {ok:false,error}
+      const wrapLike = (fn: () => unknown): Promise<unknown> =>
+        Promise.resolve()
+          .then(fn)
+          .then((data) => ({ ok: true as const, data }))
+          .catch((e) => ({ ok: false as const, error: String((e as Error)?.message ?? e) }))
+      // 还原用：与 main.ts 的两个 handler 等价（本套件后续不再调用它们，纯粹是不给下一个跑的人留坑）
+      const realUpdateCheck = (): Promise<unknown> =>
+        wrapLike(async () => {
+          const current = app.getVersion()
+          const r = await checkLatest()
+          if ('error' in r) throw new Error(r.error || 'ERR_UPDATE_CHECK')
+          return { latest: r.latest, url: r.url, current, hasUpdate: compareVersion(r.latest, current) > 0 }
+        })
+      const realOpenExternal = (_e: unknown, url: unknown): Promise<unknown> =>
+        wrapLike(async () => {
+          const target = String(url ?? '')
+          if (!isAllowedExternalUrl(target)) throw new Error('ERR_URL_NOT_ALLOWED')
+          await shell.openExternal(target)
+          return { opened: true }
+        })
+      const stubUpdateCheck = (impl: () => unknown): void => {
+        ipcMain.removeHandler('update:check')
+        ipcMain.handle('update:check', impl)
+      }
+      const stateNow = async (): Promise<{ state: string; text: string; download: boolean }> =>
+        ((await js<{ state: string; text: string; download: boolean }>(`(() => {
+          const el = document.querySelector('[data-sp-update-state]')
+          return {
+            state: el ? el.getAttribute('data-sp-update-state') : '',
+            text: (el?.textContent ?? '').replace(/\\s+/g, '').trim(),
+            download: !!el?.querySelector('[data-sp-update-download]')
+          }
+        })()`)) ?? { state: '', text: '', download: false })
+      /** 等主进程里的某个变量成立（DOM 侧用 waitFor，这里等的是替身被真的调到） */
+      const waitMain = async (fn: () => boolean, ms = 5000): Promise<boolean> => {
+        const t0 = Date.now()
+        while (Date.now() - t0 < ms) {
+          if (fn()) return true
+          await new Promise((r) => setTimeout(r, 60))
+        }
+        return fn()
+      }
+
+      try {
+        // —— ① 检测中：把响应挂住，看按钮是不是真的在转圈 + disabled 防连点 ——
+        let release: ((v: unknown) => void) | null = null
+        stubUpdateCheck(() => new Promise((resolve) => { release = resolve }))
+        const clicked = await clickEl('[data-sp-check-update]')
+        const handedOff = await waitMain(() => release !== null)
+        const spinning = await waitFor(
+          "document.querySelector('[data-sp-check-update]')?.classList.contains('checking') === true"
+        )
+        const during = await js<{ cls: string; disabled: boolean; anim: string; busy: string }>(`(() => {
+          const b = document.querySelector('[data-sp-check-update]')
+          const svg = b ? b.querySelector('svg') : null
+          return {
+            cls: b ? (b.className || '') : '',
+            disabled: b?.disabled === true,
+            anim: svg ? getComputedStyle(svg).animationName : 'no-svg',
+            busy: b?.getAttribute('aria-busy') ?? ''
+          }
+        })()`)
+        check('UF-8 检测中：按钮转圈（class checking + svg animationName=sp-spin）且 disabled 防连点',
+          clicked && handedOff && spinning && during?.disabled === true &&
+            during?.anim === 'sp-spin' && during?.busy === 'true' && /(^|\s)checking(\s|$)/.test(during?.cls ?? ''),
+          JSON.stringify(during))
+
+        // —— ② 有新版：放行替身，看文案 ——
+        const fn1 = release as ((v: unknown) => void) | null
+        if (fn1) fn1({ ok: true, data: { latest: '0.1.99', url: RELEASES_URL, current: app.getVersion(), hasUpdate: true } })
+        release = null
+        const newerOk = await waitFor(
+          "document.querySelector('[data-sp-update-state]')?.getAttribute('data-sp-update-state') === 'newer'"
+        )
+        const newer = await stateNow()
+        check('UF-8 有新版：渲染「发现新版本 v0.1.99 · 去下载」并带出 data-sp-update-download',
+          newerOk && newer.text === '发现新版本v0.1.99·去下载' && newer.download === true,
+          JSON.stringify(newer))
+        check('UF-8 检查结束后转圈收掉、按钮恢复可点（否则用户只能重启）',
+          (await js<boolean>(`(() => {
+            const b = document.querySelector('[data-sp-check-update]')
+            const svg = b ? b.querySelector('svg') : null
+            return !!b && b.disabled === false && !b.classList.contains('checking') &&
+              !!svg && getComputedStyle(svg).animationName !== 'sp-spin'
+          })()`)) === true)
+
+        // —— ③ 已最新：文案换掉，且上一条的「去下载」必须消失（v-if / v-else-if 真的互斥）——
+        stubUpdateCheck(async () => ({
+          ok: true, data: { latest: app.getVersion(), url: RELEASES_URL, current: app.getVersion(), hasUpdate: false }
+        }))
+        await clickEl('[data-sp-check-update]')
+        const latestOk = await waitFor(
+          "document.querySelector('[data-sp-update-state]')?.getAttribute('data-sp-update-state') === 'latest'"
+        )
+        const latest = await stateNow()
+        check('UF-8 已最新：渲染「已是最新版本」，且上一条「去下载」不再存在（三态互斥）',
+          latestOk && latest.text === '已是最新版本' && latest.download === false, JSON.stringify(latest))
+
+        // —— ④ 检查失败：错误也是值，不弹窗、不崩 ——
+        stubUpdateCheck(async () => ({ ok: false, error: 'ERR_NO_LOCATION' }))
+        await clickEl('[data-sp-check-update]')
+        const failedOk = await waitFor(
+          "document.querySelector('[data-sp-update-state]')?.getAttribute('data-sp-update-state') === 'failed'"
+        )
+        const failed = await stateNow()
+        check('UF-8 检查失败：渲染「检查失败，请稍后再试」（失败态也就是一行小字）',
+          failedOk && failed.text === '检查失败，请稍后再试' && failed.download === false,
+          JSON.stringify(failed))
+
+        // —— ⑤ 附加：GitHub 图标交给主进程的 URL 能过白名单 ——
+        // ⚠️ 这里点了图标，但 handler 已换成替身：先用探针自证替身生效（真 handler 会拒探针 URL），
+        //    确认之后 `shell.openExternal` 根本不会被调用 → **不会弹浏览器**。
+        //    价值：UI 里那份 `GITHUB_RELEASES_URL` 是**另抄的一份常量**（没复用 update.ts 的），
+        //    一旦哪天改歪，用户点图标只会看到「打开浏览器失败」。
+        let capturedUrl: string | null = null
+        ipcMain.removeHandler('shell:open-external')
+        ipcMain.handle('shell:open-external', (_e, url: unknown) => {
+          capturedUrl = String(url ?? '')
+          return Promise.resolve({ ok: true, data: { opened: true } })
+        })
+        const probe = await js<{ ok: boolean }>("window.stash.shell.openExternal('https://evil.com/probe')")
+        check('UF-8 附加前置：openExternal 替身已生效（探针 URL 走通了 = 下一条不会真拉起浏览器）',
+          probe?.ok === true, JSON.stringify(probe))
+        // ⚠️ 探针没通过就**绝不点**：真 handler 在跑的情况下点图标会真的弹浏览器
+        let uiUrl: string | null = null
+        if (probe?.ok === true) {
+          await clickEl('[data-sp-github]')
+          await waitMain(() => capturedUrl !== null)
+          uiUrl = capturedUrl as string | null
+        }
+        check('UF-8 附加：GitHub 图标送给主进程的是 Releases 页，且能过白名单（UI 那份常量没跑偏）',
+          uiUrl !== null && isAllowedExternalUrl(uiUrl) && /\/releases$/.test(uiUrl),
+          `UI 送来的 URL=${uiUrl}`)
+      } finally {
+        // 还原两个 handler（等价实现），并把替身期间可能残留的状态清掉
+        ipcMain.removeHandler('update:check')
+        ipcMain.handle('update:check', realUpdateCheck)
+        ipcMain.removeHandler('shell:open-external')
+        ipcMain.handle('shell:open-external', realOpenExternal)
+        // UF-7 手工加的类不能留下：留着会让下一次进关于页看到「一直在转圈」
+        await js("document.querySelector('[data-sp-check-update]')?.classList.remove('checking'); true")
+        await capture('shot-settings-about-update.png')
       }
     }
 

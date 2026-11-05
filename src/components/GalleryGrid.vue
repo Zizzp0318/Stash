@@ -229,6 +229,42 @@ async function importFiles(): Promise<void> {
   await window.stash.import.files({ paths, folderId: assets.query.folderId })
 }
 
+/**
+ * 「导入」按钮的下拉菜单开合。
+ *
+ * 为什么做成下拉而不是两个并排按钮：导入是标题行里唯一的主操作（强调色实底），
+ * 再塞一个同样重的按钮会把视觉重心掰成两半；下拉里只放「导入文件 / 导入文件夹」两项，
+ * 既看得见全部能力，又不多占一个按钮位。
+ */
+const importMenuOpen = ref(false)
+
+function toggleImportMenu(): void {
+  importMenuOpen.value = !importMenuOpen.value
+}
+
+function closeImportMenu(): void {
+  importMenuOpen.value = false
+}
+
+/** 菜单项「导入文件」：先收起菜单再弹对话框，避免对话框盖着而菜单状态残留 */
+async function pickImportFiles(): Promise<void> {
+  importMenuOpen.value = false
+  await importFiles()
+}
+
+/**
+ * 菜单项「导入文件夹」：整个文件夹（含各级子目录）导进**当前文件夹**，
+ * 库内按磁盘上的目录层级建对应子文件夹。
+ *
+ * 不传 `mode`：与选文件那条路径同一份「导入方式」设置（见 `importFiles` 的注释）。
+ */
+async function pickImportFolder(): Promise<void> {
+  importMenuOpen.value = false
+  const dir = await window.stash.dialog.pickFolder()
+  if (!dir) return
+  await window.stash.import.folder({ rootPath: dir, folderId: assets.query.folderId })
+}
+
 // —— 卡片 ——
 const TYPE_ICON: Record<string, string> = { image: '🖼', video: '🎬', audio: '🎵', text: '📄' }
 
@@ -363,6 +399,8 @@ onMounted(() => {
   installVsDebug()
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
+  // 窗口失焦（alt+tab / 点别的窗口）后收不到 mouseup，框选的自动滚动会一直转下去 —— 必须停
+  window.addEventListener('blur', stopBandAutoScroll)
   // 拖文件进窗口：全局拦掉，否则 Chromium 会直接「导航到那个文件」，整个应用被替换成一张图
   window.addEventListener('dragenter', onDragEnter)
   window.addEventListener('dragover', onDragOver)
@@ -378,6 +416,7 @@ onBeforeUnmount(() => {
   document.body.classList.remove('drag-moving')
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousedown', onWindowMouseDown)
+  window.removeEventListener('blur', stopBandAutoScroll)
   window.removeEventListener('dragenter', onDragEnter)
   window.removeEventListener('dragover', onDragOver)
   window.removeEventListener('dragleave', onDragLeave)
@@ -941,8 +980,24 @@ const bandHitSet = computed(() => new Set(bandHits.value))
 const DRAG_THRESHOLD = 4
 /** 拖拽模式：band = 框选，move = 把素材拖进侧栏文件夹 */
 type DragMode = 'band' | 'move'
-let dragStart: { x: number; y: number; additive: boolean; onCard: boolean; cardId: number | null } | null =
-  null
+/**
+ * `x` / `y` 是**视口**坐标（只用于判拖拽阈值、给拖素材用）；
+ * `ax` / `ay` 是**按下那一瞬间锚死的内容坐标**，框选矩形的起点只认它们。
+ *
+ * 起点必须锚在内容坐标系里，不能每帧拿视口坐标重算：滚动改变的是 `rect.top`，
+ * 同一组视口坐标在滚动之后对应的已经是另一片内容 —— 起点会跟着内容一路漂，
+ * 框的顶边追着内容往上跑，**上面已经框住的素材就掉出框**（用户实测反馈）。
+ * 锚死之后滚动时框只会往下「长」，已框住的一个都不丢。
+ */
+let dragStart: {
+  x: number
+  y: number
+  ax: number | null
+  ay: number | null
+  additive: boolean
+  onCard: boolean
+  cardId: number | null
+} | null = null
 let dragMode: DragMode | null = null
 let dragging = false
 /** 框选/拖拽结束后短暂屏蔽随后的 click —— 否则浏览器补发的 click 会把选区改成单选 */
@@ -955,14 +1010,138 @@ function toLocal(x: number, y: number): { x: number; y: number } | null {
   return { x: x - r.left, y: y - r.top }
 }
 
+/**
+ * 框选矩形：起点用锚死的内容坐标，终点用当前指针的视口坐标现算。
+ *
+ * 两次 `min/max` 是有意的 —— 用户把指针拖回起点上方（或左侧）时框要能正常反转。
+ */
+function bandRect(ax: number, ay: number, px: number, py: number) {
+  const b = toLocal(px, py)
+  if (!b) return null
+  return {
+    x1: Math.min(ax, b.x),
+    y1: Math.min(ay, b.y),
+    x2: Math.max(ax, b.x),
+    y2: Math.max(ay, b.y)
+  }
+}
+
+// ==================== 框选：贴边自动滚动 ====================
+/**
+ * 自动滚动热区（px）：指针进入 `.grid-wrap` 上下边缘这么宽的一条带子就开始滚。
+ *
+ * 48 是「贴到边就触发、又不会把可视区吃掉太多」的折中值；**容器外面的部分也算热区** ——
+ * 用户一使劲就把鼠标拖出容器是常态，只认容器内部那一条会显得很迟钝（要精确地停在边上）。
+ */
+const BAND_AUTOSCROLL_ZONE = 48
+/** 每帧最小 / 最大滚动量（px）：起步太小会「纹丝不动」，太大就成了「一碰边就飞出去」 */
+const BAND_AUTOSCROLL_MIN = 4
+const BAND_AUTOSCROLL_MAX = 20
+
+/** 当前自动滚动的 rAF 句柄（0 = 没在滚）。全局唯一，所有出口都必须经 `stopBandAutoScroll()` 清掉 */
+let autoScrollRaf = 0
+/** 最近一次的指针视口坐标（rAF 里靠它算热区与速度；mousemove 只负责刷新它） */
+let pointerX = 0
+let pointerY = 0
+
+/**
+ * 指针压进上 / 下热区有多深（px）。正 = 向下滚，负 = 向上滚，0 = 不在热区。
+ *
+ * 横向出了容器直接返回 0：把鼠标拖到左侧栏 / 右侧详情栏上时画面还在跑，会让人以为滚错了地方。
+ */
+function autoScrollDepth(): number {
+  const el = gridWrap.value
+  if (!el) return 0
+  const r = el.getBoundingClientRect()
+  if (r.height <= 0) return 0
+  if (pointerX < r.left || pointerX > r.right) return 0
+  // 先判下边：容器比两倍热区还矮时上下会重叠，向下优先更符合直觉
+  const down = pointerY - (r.bottom - BAND_AUTOSCROLL_ZONE)
+  if (down > 0) return down
+  const up = r.top + BAND_AUTOSCROLL_ZONE - pointerY
+  if (up > 0) return -up
+  return 0
+}
+
+/** 深度 → 本帧滚动量：随「压进热区多深」线性加速，封顶 `BAND_AUTOSCROLL_MAX` */
+function autoScrollStep(depth: number): number {
+  const t = Math.min(1, Math.abs(depth) / BAND_AUTOSCROLL_ZONE)
+  const px = BAND_AUTOSCROLL_MIN + (BAND_AUTOSCROLL_MAX - BAND_AUTOSCROLL_MIN) * t
+  return depth < 0 ? -px : px
+}
+
+/**
+ * 停掉自动滚动。**所有出口都走这里**：松手、指针离开热区、窗口失焦、切到拖素材、组件卸载。
+ * 漏掉一处就是泄漏一个全局 rAF 循环，会一直滚到用户重开窗口。
+ */
+function stopBandAutoScroll(): void {
+  if (autoScrollRaf) cancelAnimationFrame(autoScrollRaf)
+  autoScrollRaf = 0
+}
+
+/** 排一帧自动滚动；不在热区就压根不排 —— 普通框选（指针在中间）零额外开销 */
+function startBandAutoScroll(): void {
+  if (autoScrollRaf) return
+  if (typeof requestAnimationFrame !== 'function') return
+  if (autoScrollDepth() === 0) return
+  autoScrollRaf = requestAnimationFrame(autoScrollFrame)
+}
+
+/**
+ * 自动滚动一帧。
+ *
+ * 为什么用 rAF 而不是 `setInterval`：滚动会派发 scroll 事件，`onScroll` 里的窗口重算与「续页」
+ * 都要跟着跑。定时器和 scroll 事件是两个不同频率的时钟，叠在一起就会出现「滚一帧、停两帧」
+ * 的节奏，选框看起来是抖的。rAF 与浏览器刷新同频，天然对齐。
+ *
+ * 为什么**每帧都要重算 band**：`band` / `bandHits` 用的是 `.masonry` 的**内容坐标**，
+ * 而滚动改变的是内容相对视口的偏移 —— 同一组视口坐标（起点 `dragStart`、当前指针 `pointer*`）
+ * 在滚动之后对应的已经是**另一片内容**。`toLocal()` 每次现读 `getBoundingClientRect()`，
+ * 重算一次就自动跟上了；不重算的话选框会停在滚动前的旧位置（越滚错得越远），
+ * 新滚进来的卡片也不会高亮，松手时那一批还会漏选。
+ *
+ * 已到顶 / 到底时 `scrollTop` 会被夹住、画面不动，但仍要按原节奏续帧：
+ * 下边贴住时 `maybeLoadMore()` 会追加下一页，追加完就该继续滚 —— 停掉 rAF 的话
+ * 用户得再抖一下鼠标才能恢复。
+ */
+function autoScrollFrame(): void {
+  autoScrollRaf = 0
+  const st = dragStart
+  const el = gridWrap.value
+  // 所有「不该再滚」的状态在这里统一收口一次：松手、切到拖素材、组件已卸载
+  if (!st || !dragging || dragMode !== 'band' || !el) return stopBandAutoScroll()
+  const depth = autoScrollDepth()
+  if (depth === 0) return stopBandAutoScroll()
+
+  el.scrollTop += autoScrollStep(depth)
+
+  // 滚动后立刻重算选框与命中集（`getBoundingClientRect` 会强制布局，读到的已是新偏移）。
+  // 起点取**锚死的内容坐标** `st.ax/st.ay`，不是 `toLocal(st.x, st.y)` —— 后者每次都把起点
+  // 重新钉到视口里同一个像素上，滚动时等于让它在内容里往下漂，上面框住的素材会一个个掉出去。
+  const anchor = st.ax != null && st.ay != null ? { x: st.ax, y: st.ay } : toLocal(st.x, st.y)
+  const rect = anchor ? bandRect(anchor.x, anchor.y, pointerX, pointerY) : null
+  if (rect) {
+    band.value = rect
+    bandHits.value = hitsInRect(rect)
+  }
+  autoScrollRaf = requestAnimationFrame(autoScrollFrame)
+}
+
 function onGridPointerDown(e: MouseEvent): void {
   if (e.button !== 0) return
   // 右键菜单 / 弹窗内部的按下不算框选起点
   if ((e.target as HTMLElement).closest('.ctx-menu, .modal-mask')) return
   const cardEl = (e.target as HTMLElement).closest<HTMLElement>('.card, .list-row')
+  // 指针坐标归一：自动滚动读的是 pointerX/pointerY，不能让上一次拖拽的残留值参与这一轮
+  pointerX = e.clientX
+  pointerY = e.clientY
+  // 按下瞬间把起点锚死成内容坐标（此刻还没滚动，算出来的就是它在内容里的真实位置）
+  const anchor = toLocal(e.clientX, e.clientY)
   dragStart = {
     x: e.clientX,
     y: e.clientY,
+    ax: anchor?.x ?? null,
+    ay: anchor?.y ?? null,
     additive: e.ctrlKey || e.metaKey,
     onCard: !!cardEl,
     cardId: cardEl?.dataset.id ? Number(cardEl.dataset.id) : null
@@ -974,13 +1153,21 @@ function onGridPointerDown(e: MouseEvent): void {
 function stopDragTrack(): void {
   window.removeEventListener('mousemove', onGridPointerMove)
   window.removeEventListener('mouseup', onGridPointerUp)
+  // 拖拽链路的唯一收尾口：松手、切视图放弃框选、组件卸载都会走到这里，
+  // 自动滚动必须一起停，否则会留下一个没人管的全局 rAF 循环。
+  stopBandAutoScroll()
 }
 
 function onGridPointerMove(e: MouseEvent): void {
   const st = dragStart
   if (!st) return
   // 鼠标移出窗口后松手收不到 mouseup：用 buttons 兜底，否则拖拽状态会卡住
+  // （自动滚动由 rAF 驱动、不会派发 mousemove，所以这条兜底不会被它误判成「松手」）
   if (dragging && e.buttons === 0) return onGridPointerUp()
+
+  // 指针坐标只在这里刷新：rAF 循环读它算热区/速度，两者不会互相打架
+  pointerX = e.clientX
+  pointerY = e.clientY
 
   if (!dragging) {
     if (Math.abs(e.clientX - st.x) < DRAG_THRESHOLD && Math.abs(e.clientY - st.y) < DRAG_THRESHOLD) return
@@ -1002,17 +1189,22 @@ function onGridPointerMove(e: MouseEvent): void {
   }
 
   if (dragMode === 'move') {
+    // 拖素材进文件夹不需要自动滚动（ghost 跟着指针走），顺手把可能还在跑的框选滚动停掉
+    stopBandAutoScroll()
     ghostPos.value = { x: e.clientX, y: e.clientY }
     assets.setDragOver(folderIdAt(e.clientX, e.clientY))
     return
   }
 
-  const a = toLocal(st.x, st.y)
-  const b = toLocal(e.clientX, e.clientY)
-  if (!a || !b) return
-  const rect = { x1: Math.min(a.x, b.x), y1: Math.min(a.y, b.y), x2: Math.max(a.x, b.x), y2: Math.max(a.y, b.y) }
+  // 起点同样用锚死的内容坐标，理由见 `dragStart.ax/ay` 的注释
+  const anchor = st.ax != null && st.ay != null ? { x: st.ax, y: st.ay } : toLocal(st.x, st.y)
+  if (!anchor) return
+  const rect = bandRect(anchor.x, anchor.y, e.clientX, e.clientY)
+  if (!rect) return
   band.value = rect
   bandHits.value = hitsInRect(rect)
+  // 拖到上下边缘热区就开滚；指针一离开热区，下一帧 autoScrollFrame 会自己停掉
+  startBandAutoScroll()
 }
 
 /**
@@ -1064,6 +1256,20 @@ function onGridPointerUp(): void {
   // 没有位移就是一次点击：起点在卡片上交给卡片处理，起点在空白处则取消选择
   if (!st.onCard && !st.additive) assets.clearSelection()
 }
+
+/**
+ * 布局变了 → 框选中的命中集补算一次。
+ *
+ * `band` 存的是内容坐标，布局一变（图片实测比例回写、续页追加、列数变化），
+ * 同一个矩形覆盖到的卡片就可能不是原来那批了。自动滚动时每帧都会重算（见 `autoScrollFrame`），
+ * 但「鼠标停着不动、只是布局自己变了」没有别的触发点，所以在这里补上。
+ * 只认 band 模式：拖素材（move）与不在拖拽时都不该碰 `bandHits`。
+ */
+watch(layout, () => {
+  const rect = band.value
+  if (!dragging || dragMode !== 'band' || !rect) return
+  bandHits.value = hitsInRect(rect)
+})
 
 // ==================== 拖动素材到文件夹 ====================
 /** ghost 跟随鼠标的位置（视口坐标） */
@@ -1492,6 +1698,7 @@ function onKeyDown(e: KeyboardEvent): void {
   if (e.key !== 'Escape') return
   if (renameOpen.value) return closeRename()
   if (chipMenu.value) return void (chipMenu.value = null)
+  if (importMenuOpen.value) return closeImportMenu()
   if (menu.value) return closeMenu()
   if (moveOpen.value) return void (moveOpen.value = false)
   if (deleteOpen.value) return void (deleteOpen.value = false)
@@ -1549,6 +1756,9 @@ function onWindowMouseDown(e: MouseEvent): void {
   // 若在 mousedown 就关掉，紧接着的 click 又会把它打开，看着像点了没反应。
   if (chipMenu.value && !t.closest('.chip-menu') && !t.closest('.chip-menu-trigger')) chipMenu.value = null
   if (menu.value && !t.closest('.ctx-menu')) closeMenu()
+  // 导入下拉：触发按钮自己带 toggle 逻辑，所以排除整个 `.import-wrap`
+  // （含按钮与弹层）—— 否则 mousedown 先关、紧接着的 click 又开，看着像点了没反应。
+  if (importMenuOpen.value && !t.closest('.import-wrap')) closeImportMenu()
 }
 
 // ==================== 调试出口（冒烟读，生产无害）====================
@@ -1623,10 +1833,34 @@ function uninstallVsDebug(): void {
           <template v-else>{{ fmtCount(assets.total) }} 个文件</template>
         </span>
         <div class="toolbar-actions">
-          <button class="import-btn" title="导入文件到当前文件夹" @click="importFiles">
-            <svg viewBox="0 0 12 12" fill="none"><path d="M6 1.8v6M3.4 5.4L6 8l2.6-2.6M2 10.4h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
-            导入
-          </button>
+          <!--
+            「导入」= 下拉触发器。点开有「导入文件 / 导入文件夹」两项。
+            `.import-wrap` 自己带 `-webkit-app-region: no-drag`（外壳是无边框窗口，
+            祖先一旦是拖拽区，弹层里的点击会被当成拖窗口而点不动）。
+          -->
+          <div class="import-wrap" :class="{ open: importMenuOpen }">
+            <button
+              class="import-btn"
+              title="导入文件或文件夹到当前文件夹"
+              :aria-expanded="importMenuOpen"
+              aria-haspopup="menu"
+              @click="toggleImportMenu"
+            >
+              <svg viewBox="0 0 12 12" fill="none"><path d="M6 1.8v6M3.4 5.4L6 8l2.6-2.6M2 10.4h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" /></svg>
+              导入
+              <svg class="caret" viewBox="0 0 12 12" fill="none"><path d="M3.4 4.9L6 7.5l2.6-2.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            </button>
+            <div v-if="importMenuOpen" class="import-menu" role="menu">
+              <button class="import-menu-item" role="menuitem" title="选择文件导入到当前文件夹" @click="pickImportFiles">
+                <svg viewBox="0 0 12 12" fill="none"><path d="M7.4 1.8H3.8a1 1 0 0 0-1 1v6.4a1 1 0 0 0 1 1h4.4a1 1 0 0 0 1-1V3.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" /><path d="M7.3 1.9v1.8h1.9" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" /></svg>
+                导入文件
+              </button>
+              <button class="import-menu-item" role="menuitem" title="选择文件夹导入到当前文件夹（保留子目录结构）" @click="pickImportFolder">
+                <svg viewBox="0 0 12 12" fill="none"><path d="M1.6 4.2V3.1a1 1 0 0 1 1-1h2l1 1.1h3.8a1 1 0 0 1 1 1v.1" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" /><path d="M1.6 4.5h8.8a.6.6 0 0 1 .6.7l-.7 3.9a1 1 0 0 1-1 .8H2.7a1 1 0 0 1-1-.8l-.7-3.9a.6.6 0 0 1 .6-.7z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" /></svg>
+                导入文件夹
+              </button>
+            </div>
+          </div>
           <div class="viewtoggle">
             <button :class="{ on: view === 'masonry' }" title="瀑布视图" @click="view = 'masonry'">
               <svg viewBox="0 0 14 14" fill="currentColor"><rect x="1.6" y="1.6" width="4.6" height="6.6" rx="1.2" /><rect x="7.8" y="1.6" width="4.6" height="4.2" rx="1.2" /><rect x="1.6" y="9.8" width="4.6" height="2.6" rx="1.2" /><rect x="7.8" y="7.4" width="4.6" height="5" rx="1.2" /></svg>

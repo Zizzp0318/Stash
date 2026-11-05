@@ -52,8 +52,13 @@ export interface StashFolderApi {
 
 export interface StashImportApi {
   files: (args: { paths: string[]; folderId?: number | null; mode?: 'copy' | 'move' }) => Promise<{ ok: boolean; data?: { importId: number }; error?: string }>
+  /**
+   * 导入整个文件夹（**保留目录层级**：磁盘上的子目录会在库里变成对应的子文件夹）。
+   * 不支持的扩展名不会导入，但会计入结果的 `skipped`。
+   */
+  folder: (args: { rootPath: string; folderId: number | null; mode?: 'copy' | 'move' }) => Promise<{ ok: boolean; data?: { importId: number }; error?: string }>
   onProgress: (cb: (d: { importId: number; done: number; total: number }) => void) => Unsub
-  onDone: (cb: (d: { importId: number; added: number; skipped: number; renamed: number; failed: Array<{ path: string; error: string; batch?: boolean; count?: number }> }) => void) => Unsub
+  onDone: (cb: (d: { importId: number; added: number; skipped: number; renamed: number; failed: Array<{ path: string; error: string; batch?: boolean; count?: number }>; dirsCreated?: number }) => void) => Unsub
 }
 
 export interface StashThumbApi {
@@ -246,6 +251,28 @@ export interface StashShellApi {
   /** 用系统默认程序打开素材。`opened` 为假时 `error` 说明原因 */
   open: (id: number) => Promise<{ ok: boolean; data?: { opened: boolean; error?: string }; error?: string }>
   reveal: (id: number) => Promise<{ ok: boolean; data?: { revealed: boolean }; error?: string }>
+  /**
+   * 用系统默认浏览器打开外部链接。
+   * 主进程有 URL 白名单（只放行本仓库的 GitHub 页面），越界时 `error` 为 `ERR_URL_NOT_ALLOWED`。
+   */
+  openExternal: (url: string) => Promise<{ ok: boolean; data?: { opened: boolean }; error?: string }>
+}
+
+/** 检查更新结果（只查版本号，不下载不安装） */
+export interface StashUpdateCheck {
+  /** 最新版本号，已去掉 `v` 前缀（`0.1.9`） */
+  latest: string
+  /** 发布下载页（点「去下载」打开它） */
+  url: string
+  /** 当前运行版本（= `app.getVersion()`） */
+  current: string
+  /** 由主进程逐段数字比较得出，渲染层不要自己再比一遍 */
+  hasUpdate: boolean
+}
+
+export interface StashUpdateApi {
+  /** 检查更新。失败（断网 / 超时 / 解析失败）走 `{ ok:false, error }`，不弹异常 */
+  check: () => Promise<{ ok: boolean; data?: StashUpdateCheck; error?: string }>
 }
 
 /** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
@@ -503,6 +530,8 @@ export interface StashApi {
   asset: StashAssetApi
   preview: StashPreviewApi
   shell: StashShellApi
+  /** 检查更新（关于页的旋转小按钮） */
+  update: StashUpdateApi
   clipboard: StashClipboardApi
   /** 拖拽进来的 File → 磁盘绝对路径（Electron 32+ 必须用 webUtils） */
   pathForFile: (file: File) => string

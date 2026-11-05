@@ -48,6 +48,12 @@ contextBridge.exposeInMainWorld('stash', {
   import: {
     files: (args: { paths: string[]; folderId?: number | null; mode?: 'copy' | 'move' }) =>
       ipcRenderer.invoke('import:files', args),
+    /**
+     * 导入整个文件夹（保留目录层级）。
+     * 不传 `mode` 时同样跟着「导入方式」设置走 —— 两条导入入口不能各读一处配置。
+     */
+    folder: (args: { rootPath: string; folderId: number | null; mode?: 'copy' | 'move' }) =>
+      ipcRenderer.invoke('import:folder', args),
     onProgress: (cb: (d: unknown) => void) => subscribe('import:progress', cb),
     onDone: (cb: (d: unknown) => void) => subscribe('import:done', cb)
   },
@@ -102,7 +108,18 @@ contextBridge.exposeInMainWorld('stash', {
   /** 交给系统处理（Chromium 真解不了的格式的兜底出口 / 在文件夹中显示） */
   shell: {
     open: (id: number) => ipcRenderer.invoke('shell:open', { id }),
-    reveal: (id: number) => ipcRenderer.invoke('shell:reveal', { id })
+    reveal: (id: number) => ipcRenderer.invoke('shell:reveal', { id }),
+    /**
+     * 用系统默认浏览器打开外部链接（关于页的 GitHub 图标 / 「去下载」）。
+     * ⚠️ 主进程会做 URL 白名单，非本仓库的 GitHub 地址一律回 `ERR_URL_NOT_ALLOWED` ——
+     * 这里不做校验是刻意的：校验只能有一个地方，写在渲染层等于没写。
+     */
+    openExternal: (url: string) => ipcRenderer.invoke('shell:open-external', url)
+  },
+  /** 检查更新：只查最新版本号，不下载、不安装、不自动更新 */
+  update: {
+    /** 失败不是异常，而是 `{ ok:false, error }`（断网 / 超时都是常态） */
+    check: () => ipcRenderer.invoke('update:check')
   },
   /** 系统剪贴板里的「文件列表」（uri-list ↔ CF_HDROP，资源管理器可直接互粘） */
   clipboard: {

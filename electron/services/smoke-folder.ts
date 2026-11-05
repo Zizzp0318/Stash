@@ -3,17 +3,17 @@
 // 末尾 M 段是「重命名一个**正在被我们自己预览**的文件夹」（用户报的「一级文件夹改不了名」的原形）：
 // 必须先把 preview 的读流放掉，否则 Windows 上 rename(目录) 恒 EPERM。
 import { app, BrowserWindow } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs'
 import { spawn } from 'child_process'
 import { randomFillSync } from 'crypto'
 import { tmpdir } from 'os'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import sharp from 'sharp'
 import {
   closeCurrent, createLibrary, deleteFolder, forgetLibrary, mkdirChild, openLibrary, renameFolder, requireCurrent
 } from './library'
 import { createTag, setTags } from './assets'
-import { importFiles } from './importer'
+import { importFiles, importFolder } from './importer'
 import { ensureBatch, ensureThumb, pumpState } from './thumbs'
 import { renameWithRetry } from './fsutil'
 import {
@@ -76,6 +76,13 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
   const folderRows = (): Array<{ id: number; parent_id: number | null; path: string; name: string }> =>
     D().prepare('SELECT id, parent_id, path, name FROM folders ORDER BY path').all() as never
   const folderPaths = (): string[] => folderRows().map((f) => f.path).sort()
+  /**
+   * 库内**任何**一段以 `.` 开头的文件夹（如 `收藏/C/.hidden`）。
+   * 这不是「某个具体路径」探针，而是**不依赖前缀**的兜底：只要套层把 `.` 开头的目录名带进库，
+   * 无论外层叫什么都能抓到 —— 规格再改口径也不会退化成空转。
+   */
+  const dotSegmentFolders = (): string[] =>
+    folderPaths().filter((p) => p.split('/').some((seg) => seg.startsWith('.')))
   const assetRels = (): string[] =>
     (D().prepare('SELECT rel_path FROM assets ORDER BY rel_path').all() as Array<{ rel_path: string }>).map((a) => a.rel_path)
   const byPath = (p: string): { id: number; parent_id: number | null; path: string; name: string } | undefined =>
@@ -1638,7 +1645,210 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       step(`O ${JSON.stringify(R.o_residuals)}`)
     }
 
+    // ==================== P. 导入文件夹（QA 第六轮：IF-1 ~ IF-8）====================
+    //
+    // 用户需求原话：「点击导入，下拉列表会显示导入文件和导入文件夹。导入文件夹就是整个文件夹
+    // 导入到我选择的当前文件夹里，不支持的格式就不导入了。」产品决策：**保留目录层级**。
+    //
+    // 所以下面断的全是**用户看得见的东西** —— 库里有没有这个文件夹、文件在不在那个路径、
+    // 提示条上的跳过数对不对 —— 而不是某个内部变量（照实现写断言只能防退化、防不了设计错误）。
+    // 每棵树各管一件事，一个 bug 只红对应的那几条，注入验证才看得清因果。
+    {
+      step('P')
 
+      /**
+       * 造一份**内容唯一**的随机字节文件（size 也各不相同）→ `content_hash` 必然不同，
+       * 不会被 `importing.dedupe` 挡掉。扩展名由调用方给，用来覆盖「不支持格式」。
+       */
+      const writeBlob = (p: string, size: number): void => {
+        mkdirSync(dirname(p), { recursive: true })
+        const buf = Buffer.alloc(size)
+        randomFillSync(buf)
+        writeFileSync(p, buf)
+      }
+
+      /**
+       * 带**闸门**的文件夹导入。
+       *
+       * 超时返回 `{ timeout: true, added: -1, skipped: -1, ... }` 而不是永不 resolve —— 永不 resolve
+       * 会把整轮冒烟挂死（只能靠外部超时杀，连结果 JSON 都拿不到）。调用方必须把 added/skipped
+       * 并进断言：超时值 `-1` 一定不等于期望值 → 必红，不会伪装成通过（G11）。
+       */
+      const importFolderTo = (
+        rootPath: string,
+        folderId: number | null
+      ): Promise<{
+        timeout?: boolean
+        added: number
+        skipped: number
+        renamed: number
+        failed: Array<{ path: string; error: string }>
+        dirsCreated: number
+      }> =>
+        new Promise((resolve) => {
+          const t = setTimeout(
+            () => resolve({ timeout: true, added: -1, skipped: -1, renamed: -1, failed: [], dirsCreated: -1 }),
+            30000
+          )
+          importFolder({
+            rootPath,
+            folderId,
+            mode: 'copy',
+            onDone: (r) => {
+              clearTimeout(t)
+              resolve({ ...r })
+            }
+          })
+        })
+
+      const pRoot = join(dir, 'import-folder')
+
+      /**
+       * 带**闸门**的批量文件导入（IF-8 用它往「收藏/预建」里预置一个已有素材）。
+       * 与 `importFolderTo` 同一条纪律：超时给 `added: -1`，调用方必须把它并进断言 → 必红，不伪装通过。
+       */
+      const importFilesTo = (
+        paths: string[],
+        folderId: number | null
+      ): Promise<{ timeout?: boolean; added: number }> =>
+        new Promise((resolve) => {
+          const t = setTimeout(() => resolve({ timeout: true, added: -1 }), 30000)
+          importFiles({
+            paths,
+            folderId,
+            mode: 'copy',
+            onDone: (r) => {
+              clearTimeout(t)
+              resolve({ added: r.added })
+            }
+          })
+        })
+
+      // —— IF-1 / IF-2：层级 + 物理落位。树形与用户场景完全一致（顶层文件 + 两级子目录）——
+      const treeA = join(pRoot, 'A')
+      writeBlob(join(treeA, 'a.png'), 101)
+      writeBlob(join(treeA, 'note.txt'), 137)
+      writeBlob(join(treeA, 'sub', 'b.png'), 173)
+      writeBlob(join(treeA, 'sub', 'deep', 'c.png'), 211)
+
+      // 目标文件夹 = 「收藏」（用户点的是侧栏里某个具体文件夹，不是「导入到库根」）
+      const fav = mkdirChild('', '收藏')
+      const foldersBeforeA = folderPaths()
+      const rA = await importFolderTo(treeA, fav.id)
+      const foldersAfterA = folderPaths()
+      // 只取这棵树带来的素材：`收藏/A/` 前缀是本轮的**新增外层**（选中文件夹自己的名字）
+      const relsAfterA = assetRels().filter((r) => r.startsWith('收藏/A/'))
+      R.p_treeA = {
+        ...rA,
+        // 源树根目录留着：IF-2 要拿库里的文件与**原文件**逐字节比对（不是拿库里的两份互相比）
+        srcRoot: treeA,
+        newFolders: foldersAfterA.filter((p) => !foldersBeforeA.includes(p)),
+        relPaths: relsAfterA
+      }
+
+      // —— IF-3 / IF-5：不支持格式计入 skipped + 空目录不建库文件夹 ——
+      const treeB = join(pRoot, 'B')
+      writeBlob(join(treeB, 'keep.png'), 251)
+      writeBlob(join(treeB, 'x.xyz'), 283)
+      writeBlob(join(treeB, 'readme.pdf'), 317)
+      mkdirSync(join(treeB, 'empty'), { recursive: true }) // 空目录：一个文件都没有
+      const rB = await importFolderTo(treeB, fav.id)
+      R.p_treeB = { ...rB, relPaths: assetRels().filter((r) => r.startsWith('收藏/B/keep')) }
+
+      // —— IF-4：`.` 开头的文件与目录全跳过（库里既无文件、也无隐藏文件夹）——
+      const treeC = join(pRoot, 'C')
+      writeBlob(join(treeC, 'ok.png'), 353)
+      writeBlob(join(treeC, '.hidden', 'd.png'), 389)
+      writeBlob(join(treeC, '.DS_Store'), 41)
+      const rC = await importFolderTo(treeC, fav.id)
+      R.p_treeC = { ...rC, okImported: assetRels().includes('收藏/C/ok.png') }
+
+      // —— IF-6（方向二）：folderId = null 时落点是「未分类」，不是库根、也不是上次选的文件夹 ——
+      // 刻意再套一层子目录：这样本条同时能抓住「落点错」与「层级没还原」两种回归
+      //（把 `resolveDir` 改成永远返回 base 时，期望路径会从 `未分类/deep/...` 变成 `未分类/...` → 红）。
+      const treeD = join(pRoot, 'D')
+      writeBlob(join(treeD, 'deep', 'if6-target.png'), 421)
+      const rD = await importFolderTo(treeD, null)
+      R.p_treeD = { ...rD, relPaths: assetRels().filter((r) => r.endsWith('/if6-target.png')) }
+
+      // —— IF-7：同一棵树导两次（dedupe 默认开）→ 第二次 added=0、skipped 全覆盖，且**不新建任何目录**
+      //
+      // 第二次刻意导进一个**全新的空文件夹**（「收藏/去重目标」）：如果 `resolveDir` 在去重判定之前
+      // 被调用，`去重目标/E` 与 `去重目标/E/sub2` 就会在库里被建出来 —— 只有空壳、永远没有素材的文件夹。
+      //
+      // ⚠️ 探针路径**必须带上这一轮新加的外层 `E`**（选中文件夹自己的名字）。留在旧的
+      // `收藏/去重目标/sub2` 上 = 断一个永远不会出现的路径 → 注入验证时也照样绿（假绿）。
+      const treeE = join(pRoot, 'E')
+      writeBlob(join(treeE, 'e1.png'), 457)
+      writeBlob(join(treeE, 'sub2', 'e2.png'), 491)
+      const rE1 = await importFolderTo(treeE, fav.id)
+      const dedupeTarget = mkdirChild('收藏', '去重目标')
+      const foldersBeforeE2 = folderPaths()
+      const rE2 = await importFolderTo(treeE, dedupeTarget.id)
+      const foldersAfterE2 = folderPaths()
+      R.p_treeE = {
+        first: { ...rE1 },
+        second: { ...rE2 },
+        foldersDelta: foldersAfterE2.length - foldersBeforeE2.length,
+        strayFolder: foldersAfterE2.includes('收藏/去重目标/E/sub2'),
+        strayDirOnDisk: existsSync(join(libPath, '收藏', '去重目标', 'E', 'sub2'))
+      }
+
+      // —— IF-8：层级幂等（**同名合并**）——
+      //
+      // 场景必须是「库内已有文件夹名 == 待导入树的根目录名」，否则 `mkdirRel` 的幂等分支压根走不到：
+      // 上一版把树根命名成 `F`、而预建目录叫 `预建`，两者不同名 → 「同名合并」从未真正发生
+      //（实得 dirsCreated=2，多建了一个 `收藏/F`）。现在树根**就叫 `预建`**，与库内已有目录同名。
+      //
+      // 预建目录里先放一个**已有素材**：合并必须把它保住（不是把整个目录替换掉），
+      // 这样「合并」与「覆盖」才有可区分的行为差异。
+      const preFolder = mkdirChild('收藏', '预建')
+      const preFile = join(pRoot, 'if8-existing.png')
+      writeBlob(preFile, 601)
+      const rPre = await importFilesTo([preFile], preFolder.id)
+      const treeF = join(pRoot, '预建')
+      writeBlob(join(treeF, 'f1.png'), 523)
+      writeBlob(join(treeF, 'subF', 'f2.png'), 547)
+      const foldersBeforeF = folderPaths()
+      const rF = await importFolderTo(treeF, fav.id)
+      const foldersAfterF = folderPaths()
+      const mergedRels = assetRels().filter((r) => r.startsWith('收藏/预建/'))
+      R.p_treeF = {
+        ...rF,
+        preTimeout: rPre.timeout === true,
+        preAdded: rPre.added,
+        // 「收藏/预建」在 folders 里只能有 1 行（同名合并，不是建出两个同名文件夹）
+        dupRows: foldersAfterF.filter((p) => p === '收藏/预建').length,
+        // 只应新建树里新出现的子目录 `收藏/预建/subF`（根目录已存在，不算新建）
+        foldersDelta: foldersAfterF.length - foldersBeforeF.length,
+        // 不许出现 `预建 (1)` 这类改名副本
+        noDupSuffix: !foldersAfterF.some((p) => p.startsWith('收藏/预建 (')),
+        relImported: assetRels().includes('收藏/预建/f1.png'),
+        subImported: assetRels().includes('收藏/预建/subF/f2.png'),
+        preExistingKept: assetRels().includes('收藏/预建/if8-existing.png'),
+        mergedRels
+      }
+
+      // —— BE-1 边界：根目录名以 `.` 开头 → **不套层**（退化为旧行为，内容直接倒进「收藏」）——
+      //
+      // 为什么必须不套：watcher 的索引判据是「路径里任一段以 `.` 开头就整棵不索引」，
+      // 套层会造出 `收藏/.cache` 这种 folders 表里有、文件却永远不进索引的幽灵目录；
+      // 而且它还撞上 rename/delete 的 `path.startsWith('.')` → ERR_PROTECTED_FOLDER，用户看不见也删不掉。
+      const treeG = join(pRoot, '.cache')
+      writeBlob(join(treeG, 'z.png'), 641)
+      const rG = await importFolderTo(treeG, fav.id)
+      R.p_treeG = {
+        ...rG,
+        relPaths: assetRels().filter((r) => r.endsWith('/z.png')),
+        // 落点必须在「收藏」根层
+        landedInFav: existsSync(join(libPath, '收藏', 'z.png')),
+        // 且**不许**出现套层后的物理目录 `lib/收藏/.cache`
+        layeredOnDisk: existsSync(join(libPath, '收藏', '.cache')),
+        dotFolders: dotSegmentFolders()
+      }
+      step(`P ${JSON.stringify(R.p_treeA)} / ${JSON.stringify(R.p_treeB)} / ${JSON.stringify(R.p_treeF)}`)
+      step(`P2 ${JSON.stringify(R.p_treeE)} / ${JSON.stringify(R.p_treeG)}`)
+    }
 
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
@@ -1803,6 +2013,41 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
           failed?: boolean
         } | null
       }
+    }
+
+    // —— P 段：导入文件夹（IF-1 ~ IF-8）——
+    const pA = (R.p_treeA ?? {}) as {
+      timeout?: boolean; added?: number; skipped?: number; renamed?: number
+      failed?: Array<{ path: string; error: string }>; dirsCreated?: number
+      srcRoot?: string; newFolders?: string[]; relPaths?: string[]
+    }
+    const pB = (R.p_treeB ?? {}) as {
+      timeout?: boolean; added?: number; skipped?: number
+      failed?: Array<{ path: string; error: string }>; relPaths?: string[]
+    }
+    const pC = (R.p_treeC ?? {}) as {
+      timeout?: boolean; added?: number; skipped?: number; okImported?: boolean
+    }
+    const pD = (R.p_treeD ?? {}) as {
+      timeout?: boolean; added?: number; relPaths?: string[]
+    }
+    const pE = (R.p_treeE ?? {}) as {
+      first?: { timeout?: boolean; added?: number; skipped?: number; failed?: unknown[] }
+      second?: { timeout?: boolean; added?: number; skipped?: number; dirsCreated?: number; failed?: unknown[] }
+      foldersDelta?: number; strayFolder?: boolean; strayDirOnDisk?: boolean
+    }
+    const pF = (R.p_treeF ?? {}) as {
+      timeout?: boolean; added?: number; skipped?: number; dirsCreated?: number
+      failed?: Array<{ path: string; error: string }>
+      preTimeout?: boolean; preAdded?: number
+      dupRows?: number; foldersDelta?: number; noDupSuffix?: boolean
+      relImported?: boolean; subImported?: boolean; preExistingKept?: boolean
+      mergedRels?: string[]
+    }
+    const pG = (R.p_treeG ?? {}) as {
+      timeout?: boolean; added?: number; skipped?: number; dirsCreated?: number
+      failed?: Array<{ path: string; error: string }>
+      relPaths?: string[]; landedInFav?: boolean; layeredOnDisk?: boolean; dotFolders?: string[]
     }
 
     R.checks = {
@@ -2055,7 +2300,125 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // 注入验证：去掉删除失败分支里的 `markMissingOnDisk` → goneMarked=false → 红。
       deletePartialMarksMissing: o?.lockReady === true && (o?.suspDp ?? 0) >= 1 &&
         o?.dpErr === 'ERR_FOLDER_DELETE_PARTIAL' && !/EBUSY|EPERM|ENOTEMPTY/i.test(o?.dpErr ?? '') &&
-        (o?.dpGoneRows ?? 0) >= 1 && o?.goneMarked === true && o?.aliveUntouched === true
+        (o?.dpGoneRows ?? 0) >= 1 && o?.goneMarked === true && o?.aliveUntouched === true,
+
+      // ==================== P. 导入文件夹（QA 第六轮 IF-1 ~ IF-8）====================
+      //
+      // 判据全部落在「用户看得见的东西」上：库里的文件夹路径、素材的 rel_path、磁盘上的文件、
+      // 结果里的 added/skipped。**不断** `relDir` / `dirCache` 这类内部量 —— 照实现写断言
+      // 只能防退化，防不了「层级根本没保留」这种设计错误。
+      //
+      // ⚠️ **本轮规格变更**：文件夹导入现在**连被选中那一层自己一起保留**（外层套一层根目录名）。
+      // 选中 `A/{a.png, note.txt, sub/b.png, sub/deep/c.png}` 导入到「收藏」→
+      // `收藏/A/a.png`、`收藏/A/sub/deep/c.png`。下面所有路径常量都已按此换算。
+      // 教训：规格改了口径，**绿着的断言同样要逐条复核** —— 路径常量没跟着加前缀的那几条
+      // （IF-4/IF-5/IF-7）会变成「断一个永远不存在的路径」的空转绿，比红更危险。
+      //
+      // IF-1 层级：套层后库里必须出现 `收藏/A`、`收藏/A/sub`、`收藏/A/sub/deep` 三级文件夹
+      //（`收藏/A` 就是「选中文件夹自己的名字」这一层，是本轮新增），且四条 rel_path 逐一精确匹配。
+      // dirsCreated 也要 = 3：它证明「外层 A」这一层确实被建出来并计入增量，而不是被吃掉。
+      // 注入验证：① `collect` 去掉套层 → 四条变成 `收藏/a.png` 等、newFolders 少一层 → 红。
+      importFolderHierarchy: pA?.timeout !== true && pA?.added === 4 && pA?.skipped === 0 &&
+        (pA?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 && pA?.dirsCreated === 3 &&
+        (pA?.newFolders ?? []).includes('收藏/A') &&
+        (pA?.newFolders ?? []).includes('收藏/A/sub') &&
+        (pA?.newFolders ?? []).includes('收藏/A/sub/deep') &&
+        (pA?.relPaths ?? []).join('|') ===
+          '收藏/A/a.png|收藏/A/note.txt|收藏/A/sub/b.png|收藏/A/sub/deep/c.png',
+      // IF-2 物理落位：不只是「库里有这条 rel_path」，磁盘上 `lib/收藏/A/sub/b.png` 与
+      // `lib/收藏/A/sub/deep/c.png` 必须真实存在、且**字节与原文件完全一致**（拷贝没串行/没串文件）。
+      // 注入验证：同 IF-1 的那次注入（去掉套层）→ 文件落在 `收藏/sub/...`，本条红。
+      importFolderPhysical: pA?.timeout !== true && pA?.srcRoot != null &&
+        existsSync(join(libPath, '收藏', 'A', 'sub', 'b.png')) &&
+        existsSync(join(libPath, '收藏', 'A', 'sub', 'deep', 'c.png')) &&
+        readFileSync(join(libPath, '收藏', 'A', 'sub', 'b.png')).equals(readFileSync(join(pA.srcRoot, 'sub', 'b.png'))) &&
+        readFileSync(join(libPath, '收藏', 'A', 'sub', 'deep', 'c.png')).equals(readFileSync(join(pA.srcRoot, 'sub', 'deep', 'c.png'))),
+      // IF-3 **用户要的就是「不支持的格式不导入」**：`x.xyz` / `readme.pdf` 一律不许进 assets，
+      // 且 skipped 必须**恰好等于**不支持格式的个数（2）—— 少了用户不知道有文件被丢，
+      // 多了就成了「凭空报跳过」。注意 `keep.png` 必须进来，否则这条在「整次导入什么都没做」时也绿。
+      importFolderUnsupported: pB?.timeout !== true && pB?.added === 1 && pB?.skipped === 2 &&
+        (pB?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 &&
+        (pB?.relPaths ?? []).join('|') === '收藏/B/keep.png' &&
+        existsSync(join(libPath, '收藏', 'B', 'keep.png')) &&
+        !assetRels().some((r) => /\.xyz$/i.test(r)) && !assetRels().some((r) => /\.pdf$/i.test(r)),
+      // IF-4 `.` 开头全跳过：`.hidden/d.png` 与 `.DS_Store` 既不许进 assets，也**不许**在 folders
+      // 里留下 `收藏/C/.hidden`（那会变成侧栏里一个看不见、又因为受保护而删不掉的空壳）。
+      // skipped 必须是 0：这两个是被「`.` 开头」规则静默挡掉的，不是「格式不支持」，
+      // 算进提示条的「跳过 N 个」就成了噪音（用户会以为自己的素材被判成不支持格式）。
+      // ⚠️ 探针路径已随套层更新为 `收藏/C/.hidden`；同时保留一个**全库范围**的兜底：
+      // 任何一段以 `.` 开头的文件夹都不许存在（不依赖具体前缀，套层再变也挡得住）。
+      // 注入验证：去掉 `if (d.name.startsWith('.')) continue` → `.hidden/d.png` 会被导入、
+      // `收藏/C/.hidden` 会被建出来 → 本条红。
+      importFolderDotSkipped: pC?.timeout !== true && pC?.added === 1 && pC?.skipped === 0 &&
+        pC?.okImported === true &&
+        !folderPaths().some((p) => p.includes('.hidden')) &&
+        dotSegmentFolders().length === 0 &&
+        !assetRels().some((r) => r.includes('.hidden') || r.includes('.DS_Store')) &&
+        !existsSync(join(libPath, '收藏', 'C', '.hidden')),
+      // IF-5 空目录不建库文件夹：`B/empty/` 里一个文件都没有 → 库里不许出现 `收藏/B/empty`。
+      // （若按「先建目录再放文件」的顺序实现，就会留下一排空文件夹。）
+      // ⚠️ 这是本轮「假绿修正」之一：旧断言断的是 `收藏/empty` —— 套层后真实路径是
+      // `收藏/B/empty`，那句断的是一个**永远不会出现的路径**，删掉套层也照样绿。
+      // 注入验证：把空目录也压进待建目录集合（不再以「有没有条目」为准）→ 本条红。
+      importFolderEmptyDirSkipped: pB?.timeout !== true && pB?.added === 1 &&
+        !folderPaths().includes('收藏/B/empty') && !existsSync(join(libPath, '收藏', 'B', 'empty')),
+      // IF-6 落点是**当前选中的文件夹**，不是写死的库根：
+      //   方向一：folderId = 「收藏」→ 四条全在 `收藏/A/` 下（防止有人把 base 写死成库根）；
+      //   方向二：folderId = null → 落在 `未分类/D/`（与 `importFiles` 的回退规则同源）。
+      // 注入验证：把 `resolveDir` 里的 `toRel(base.path, relDir)` 改成只用 `relDir`（丢掉 base）
+      // 或永远 `base` → 本条与 IF-1 一起红。
+      importFolderRespectsTargetFolder: pD?.timeout !== true && pD?.added === 1 &&
+        (pD?.relPaths ?? []).join('|') === '未分类/D/deep/if6-target.png' &&
+        existsSync(join(libPath, '未分类', 'D', 'deep', 'if6-target.png')) &&
+        (pA?.relPaths ?? []).length === 4 && (pA?.relPaths ?? []).every((r) => r.startsWith('收藏/A/')),
+      // IF-7 重复内容按设置跳过：同一棵树导两次（dedupe 默认开）→ 第二次 added=0、skipped 覆盖全部，
+      // 且**一个目录都不新建**（`收藏/去重目标/E/sub2` 不许出现）。
+      // 为什么这条重要：`resolveDir` 必须在去重判定**之后**才解析 —— 否则全是重复文件的子目录
+      // 会在库里留下一堆空文件夹，用户侧栏里凭空多出一串点进去什么都没有的目录。
+      // ⚠️ 「假绿修正」之二：旧探针断 `收藏/去重目标/sub2`，套层后真实脏路径变成
+      // `收藏/去重目标/E/sub2`（外层 E = 被选中文件夹自己的名字）→ 旧探针永不命中。
+      // 注入验证：把 `const target = resolveDir(entry.relDir)` 移到 `dedupe` 判定之前 →
+      // strayFolder=true、foldersDelta=2 → 本条红。
+      importFolderDedupeSkips: pE?.first?.timeout !== true && pE?.first?.added === 2 &&
+        pE?.first?.skipped === 0 && (pE?.first?.failed ?? ['x']).length === 0 &&
+        pE?.second?.timeout !== true && pE?.second?.added === 0 && pE?.second?.skipped === 2 &&
+        pE?.second?.dirsCreated === 0 && pE?.foldersDelta === 0 &&
+        pE?.strayFolder === false && pE?.strayDirOnDisk === false &&
+        !folderPaths().includes('收藏/去重目标/E') &&
+        !folderPaths().includes('收藏/去重目标/E/sub2'),
+      // IF-8 层级幂等（**同名合并**）：库里**已经有**「收藏/预建」时，导入一棵**根目录也叫「预建」**的树
+      // → 内容合并进同一个文件夹：不报错、不建 `预建 (1)`、folders 里 `收藏/预建` 只有 1 行、
+      //   只新建树里新出现的子目录（`收藏/预建/subF`，dirsCreated=1），且预置的旧素材仍在。
+      // ⚠️ 上一版这条是「假绿修正」之三的反面：树根叫 `F`、预建目录叫 `预建`，两者不同名 →
+      // 合并没有发生（实得 dirsCreated=2、多建 `收藏/F`）。现在树根就叫 `预建`。
+      // 注入验证：把 `mkdirRel` 换成不查 folders 的直接 INSERT → dupRows=2 / 抛 UNIQUE → 本条红。
+      importFolderHierarchyIdempotent: pF?.timeout !== true && pF?.added === 2 &&
+        (pF?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 &&
+        pF?.preTimeout === false && pF?.preAdded === 1 &&
+        pF?.relImported === true && pF?.subImported === true && pF?.preExistingKept === true &&
+        (pF?.mergedRels ?? []).length === 3 &&
+        pF?.dirsCreated === 1 && pF?.dupRows === 1 && pF?.foldersDelta === 1 &&
+        pF?.noDupSuffix === true &&
+        existsSync(join(libPath, '收藏', '预建', 'f1.png')) &&
+        existsSync(join(libPath, '收藏', '预建', 'subF', 'f2.png')),
+      // ==================== P. 边界（BE-1）====================
+      //
+      // BE-1 根目录名以 `.` 开头 → **不套层**（`basename` 得到 `.cache`，落到 `收藏/z.png` 而非
+      // `收藏/.cache/z.png`），且库里**任何**一段以 `.` 开头的文件夹都不许存在。
+      // 为什么：watcher 的索引判据是「任一段以 `.` 开头 → 整棵不索引」，套层会造出
+      // folders 表里有、文件却永不进索引的幽灵目录；它还撞 rename/delete 的
+      // `path.startsWith('.')` → ERR_PROTECTED_FOLDER，用户看不见也删不掉。
+      // 注入验证：去掉 `importFolder.collect` 里的 `rootName.startsWith('.')` 判断 → 本条红。
+      //
+      // BE-2 盘符根（`basename('D:\\') === ''`）：**仅代码审查确认，未运行验证** ——
+      // 真扫一次 C:\ / D:\ 会把整盘拖进冒烟（几分钟 + 数万行索引），代价远大于收益。
+      // 代码依据见 `src/electron/services/importer.ts` 的 `if (!rootName || rootName.startsWith('.'))`，
+      // 且 `basename('D:\\') === ''` 已单独用 node 验证过（见测试报告）。
+      importFolderDotRootNoLayer: pG?.timeout !== true && pG?.added === 1 && pG?.skipped === 0 &&
+        (pG?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 &&
+        (pG?.relPaths ?? []).join('|') === '收藏/z.png' &&
+        pG?.landedInFav === true && pG?.layeredOnDisk === false &&
+        (pG?.dotFolders ?? ['x']).length === 0
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

@@ -182,6 +182,41 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
         return
       }
 
+      // ⓪ 导入按钮 → 下拉菜单（IF-9，**真实鼠标点击**）
+      //
+      // 用户原话：「点击导入，下拉列表会显示导入文件和导入文件夹」。
+      // 所以这里必须真点一次 `.import-btn` —— 只断言 `toggleImportMenu` 函数存在是没意义的
+      // （那正是上一轮的教训：照实现写的断言只能防退化、防不了设计错误）。
+      //
+      // 只验**开合与文案**，不点两个菜单项：它们各自会拉起系统「选文件 / 选文件夹」对话框，
+      // 在冒烟里点下去就是挂死。菜单项真正干活的路径由 `--smoke-folder` 的 IF-1..IF-8 覆盖
+      //（那几条直接调 `importFolder`，覆盖的是同一段扫描/落库逻辑）。
+      const imClick1 = await clickEl('.import-btn')
+      const imOpened1 = imClick1 && (await waitUntil("!!document.querySelector('.import-menu')", 4000))
+      const imItemsRaw = (await js(
+        `JSON.stringify([...document.querySelectorAll('.import-menu-item')].map(x => x.textContent.trim()))`
+      )) as string | null
+      // 按 Esc 关闭（键盘路径）
+      win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' })
+      win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' })
+      const imEscClosed = await waitUntil("!document.querySelector('.import-menu')", 4000)
+      // 再开一次，然后点页面别处关闭（鼠标路径；与 Esc 是两条不同的出口）
+      const imClick2 = await clickEl('.import-btn')
+      const imReopened = imClick2 && (await waitUntil("!!document.querySelector('.import-menu')", 4000))
+      const imBlank = JSON.parse(
+        (await js(`(() => { const r = document.querySelector('.grid-wrap').getBoundingClientRect(); return JSON.stringify({ x: r.left + 6, y: r.top + 60 }) })()`)) as string
+      ) as { x: number; y: number }
+      click(imBlank.x, imBlank.y)
+      const imOutsideClosed = await waitUntil("!document.querySelector('.import-menu')", 4000)
+      R.step0_importMenu = {
+        clicked: imClick1 && imClick2,
+        opened: imOpened1,
+        reopened: imReopened,
+        items: imItemsRaw ? (JSON.parse(imItemsRaw) as string[]) : null,
+        escClosed: imEscClosed,
+        outsideClosed: imOutsideClosed
+      }
+
       // ① 普通点击 = 单选
       click(cs[1].cx, cs[1].cy)
       await sleep(250)
@@ -531,6 +566,9 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
 
     // —— 断言汇总 ——
     const s1 = R.step1_singleClick as number[]
+    const im = R.step0_importMenu as
+      | { clicked: boolean; opened: boolean; reopened: boolean; items: string[] | null; escClosed: boolean; outsideClosed: boolean }
+      | undefined
     const s2 = R.step2_ctrlClick as number[]
     const s3 = R.step3_ctrlBand as { count: number }
     const s4p = R.step4_bbStarPaint as { fill: string; stroke: string; color: string } | null
@@ -560,6 +598,11 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
     } | null
 
     R.checks = {
+      // ⓘ 导入下拉（IF-9）：真实点击后才算数。`opened`/`reopened`/`escClosed`/`outsideClosed`
+      // 都是**有界轮询的返回值**，必须并进断言 —— 否则超时后菜单恰好还在/已不在，就会假绿。
+      importMenuDropdown: im?.clicked === true && im?.opened === true && im?.reopened === true &&
+        (im?.items ?? []).join('|') === '导入文件|导入文件夹' &&
+        im?.escClosed === true && im?.outsideClosed === true,
       singleClick: s1?.length === 1,
       ctrlClickAdds: s2?.length === 2,
       ctrlBandAdds: s3?.count >= 5,

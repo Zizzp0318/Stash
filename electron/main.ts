@@ -16,6 +16,7 @@ import * as cacheSvc from './services/cache'
 import * as healthSvc from './services/health'
 import * as genmetaSvc from './services/genmeta'
 import * as compressSvc from './services/compress'
+import * as updateSvc from './services/update'
 import { runSmoke } from './services/smoke'
 import { runSmokeM2 } from './services/smoke2'
 import { runSmokeM3 } from './services/smoke3'
@@ -460,6 +461,8 @@ function bootstrap(): void {
 
     // 导入
     ipcMain.handle('import:files', (_e, args) => wrap(() => importerSvc.importFiles(args)))
+    // 导入整个文件夹：按磁盘目录层级在库里建对应子文件夹
+    ipcMain.handle('import:folder', (_e, args) => wrap(() => importerSvc.importFolder(args)))
 
     // 缩略图
     ipcMain.handle('thumb:ensure', (_e, { assetId, size }) =>
@@ -529,6 +532,36 @@ function bootstrap(): void {
     // 交给系统：浏览器真解不了的格式（avi 等）的兜底出口，以及「在文件夹中显示」
     ipcMain.handle('shell:open', (_e, { id }) => wrap(() => assetsSvc.openAsset(id)))
     ipcMain.handle('shell:reveal', (_e, { id }) => wrap(() => assetsSvc.revealAsset(id)))
+
+    // 用**系统默认浏览器**打开外部链接（关于页的 GitHub 图标 / 「去下载」）。
+    // ⚠️ `openExternal` 是危险能力：白名单必须判在**主进程**（`isAllowedExternalUrl`），
+    // 渲染层的任何 URL 都不许直接透传 —— 渲染层被 XSS 时，透传等于任意协议拉起。
+    ipcMain.handle('shell:open-external', (_e, url) =>
+      wrap(async () => {
+        const target = String(url ?? '')
+        if (!updateSvc.isAllowedExternalUrl(target)) throw new Error('ERR_URL_NOT_ALLOWED')
+        await shell.openExternal(target)
+        return { opened: true }
+      })
+    )
+
+    // 检查更新：只查询最新 tag，**不下载、不安装、不自动更新**（纯提示）。
+    // 当前版本号在 handler 层取 —— `update.ts` 是纯函数模块，冒烟要能直接 import（不许依赖 app 单例）。
+    ipcMain.handle('update:check', () =>
+      wrap(async () => {
+        const current = app.getVersion()
+        const r = await updateSvc.checkLatest()
+        if ('error' in r) throw new Error(r.error || 'ERR_UPDATE_CHECK')
+        // `hasUpdate` 由主进程算：逐段数字比较的唯一一份实现在 `update.ts`，
+        // 渲染层拿不到它（跨进程），让 UI 自己再比一遍迟早跟这里分叉
+        return {
+          latest: r.latest,
+          url: r.url,
+          current,
+          hasUpdate: updateSvc.compareVersion(r.latest, current) > 0
+        }
+      })
+    )
 
     ipcMain.handle('tag:list', () => wrap(() => assetsSvc.listTags()))
     ipcMain.handle('tag:create', (_e, args) => wrap(() => assetsSvc.createTag(args)))

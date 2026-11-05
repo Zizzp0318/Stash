@@ -924,6 +924,52 @@ mark {
 }
 .import-btn:hover { box-shadow: 0 0 0 2px var(--accent-soft); filter: brightness(1.06); }
 .import-btn svg { width: 11px; height: 11px; }
+/* 右侧下三角：暗示「点了会展开」，比只写文案更容易看懂 */
+.import-btn svg.caret { width: 9px; height: 9px; opacity: 0.8; margin-left: -1px; }
+.import-wrap.open .import-btn { box-shadow: 0 0 0 2px var(--accent-soft); }
+
+/*
+ * 「导入」下拉弹层。
+ * ⚠️ `.import-wrap` 与 `.import-menu` 都显式 no-drag：外壳是无边框窗口，
+ * 只要祖先落在拖拽区（标题栏 / 欢迎页那一类），弹层里的点击就会被当成「拖动窗口」——菜单项完全点不动。
+ * 配色全部走既有令牌（与 `.chip-menu` 同一套），不硬编码新的十六进制。
+ */
+.import-wrap { position: relative; -webkit-app-region: no-drag; }
+.import-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 132px;
+  padding: 5px;
+  border-radius: 9px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  z-index: 111;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  -webkit-app-region: no-drag;
+}
+.import-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+.import-menu-item:hover { background: var(--bg-hover); color: var(--text-1); }
+.import-menu-item svg { width: 12px; height: 12px; flex-shrink: 0; opacity: 0.85; }
 
 /* 网格卡片真实缩略图 */
 .card .thumb { position: relative; }
@@ -1997,6 +2043,55 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .sp-note b { color: var(--text-2); font-weight: 400; }
 .sp-actions { display: flex; gap: 8px; }
+
+/* 关于 · 版本行右侧的 GitHub 入口与「检查更新」小按钮。
+   `.sp-kv` 是两列网格，这一整块（版本号 + 两个图标 + 结果小字）占第二列，
+   所以结果文案会自动落在版本行**下方**，不用另外拆行。 */
+.sp-ver { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.sp-ver-line { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.sp-ver-line b { font-variant-numeric: tabular-nums; }
+
+.sp-icon-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+}
+.sp-icon-btn:hover { color: var(--text-1); background: var(--bg-hover); border-color: var(--border-soft); }
+.sp-icon-btn:disabled { cursor: default; }
+.sp-icon-btn:disabled:hover { background: transparent; border-color: transparent; }
+/* 检查中：图标转圈（点一下就知道「正在查」，不用再写一行「检测中…」） */
+.sp-icon-btn.checking { color: var(--accent); }
+.sp-icon-btn.checking svg { animation: sp-spin 0.8s linear infinite; transform-origin: center; }
+@keyframes sp-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 检测结果：只在点过之后出现，比版本号低一级、比正文更轻 */
+.sp-ver-result { font-size: 11px; line-height: 1.5; }
+.sp-ver-result.is-ok { color: var(--text-3); }
+.sp-ver-result.is-new { color: var(--accent); }
+.sp-ver-result.is-err { color: var(--danger); }
+/* 「去下载」是行内链接样式的按钮：不是主操作，别做得像 .sp-btn 那么重 */
+.sp-ver-link {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.sp-ver-link:hover { color: var(--text-1); }
 
 /* 设置面板 · 缓存占用卡片（三个数字并排） */
 .sp-cards {
