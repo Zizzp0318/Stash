@@ -10,8 +10,8 @@
 //
 // 分类靠文件名而不是靠子目录：`{hash}` 目录是三者共用的
 // （同一个素材的缩略图、派生预览、以及派生中途的临时文件都落在里面）。
-import { existsSync, readdirSync, statSync, unlinkSync } from 'fs'
-import { join } from 'path'
+import { existsSync, readdirSync, rmdirSync, statSync, unlinkSync } from 'fs'
+import { basename, dirname, join } from 'path'
 import { requireCurrent } from './library'
 
 export type CacheKind = 'thumbs' | 'derived' | 'other'
@@ -121,13 +121,40 @@ export function clearCache(kind: CacheKind | 'all'): { removed: number; freed: n
   const targets = kind === 'all' ? entries : entries.filter((e) => e.kind === kind)
   let removed = 0
   let freed = 0
+  // 删完文件后，把**变空**的 hash 目录一并收掉（见下方说明）
+  const touchedDirs = new Set<string>()
   for (const e of targets) {
     try {
       unlinkSync(e.abs)
       removed++
       freed += e.bytes
+      touchedDirs.add(dirname(e.abs))
     } catch {
       /* 删不掉（被占用）就跳过，别中断整轮清理 */
+    }
+  }
+  /*
+   * 收掉空掉的 hash 目录 —— 不只是「顺手打扫」：
+   *
+   * `thumbs.ensureBatch` 判断「已有 grid 缩略图」用的是**一次 readdir 的目录集合**
+   * （每个 hash 一个目录，比逐条 stat 快一个数量级）。前提是「目录存在 ⇒ 里面真的有
+   * grid.webp」。而清理缓存只 unlink 文件、目录会留下来 —— 那样清完之后的回填会把整库
+   * 误判成「已有缩略图」，一张都不重建（网格全 404）。
+   *
+   * `rmdirSync` 是**非递归**的：目录里还有东西（典型是同一 hash 目录下的
+   * `preview-*.webp` 派生预览、写一半的临时文件）就删不掉、自动跳过 ——
+   * 正好保住「清理缩略图绝不能连带删掉派生预览」这条硬约束。
+   * 剩下的混合目录由 `thumbs.invalidateGridPresence()` 兜（见 main.ts 的 cache:clear）。
+   */
+  if (kind === 'thumbs' || kind === 'all') {
+    for (const dir of touchedDirs) {
+      // 别去 rmdir `.thumbs` 根目录本身（占位图、派生临时文件都躺在这一层）
+      if (basename(dir) === '.thumbs') continue
+      try {
+        rmdirSync(dir)
+      } catch {
+        /* 非空 / 被占用：保留目录，交给 invalidateGridPresence 那一轮重扫 */
+      }
     }
   }
   return { removed, freed }

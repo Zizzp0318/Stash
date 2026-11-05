@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { onMounted, onBeforeUnmount, ref } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import SideBar from './components/SideBar.vue'
 import ColumnResizer from './components/ColumnResizer.vue'
@@ -7,6 +7,7 @@ import GalleryGrid from './components/GalleryGrid.vue'
 import DetailPanel from './components/DetailPanel.vue'
 import Welcome from './components/Welcome.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
+import ThumbProgress from './components/ThumbProgress.vue'
 import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
 import { useSettingsStore } from './stores/settings'
@@ -15,6 +16,29 @@ import { importFailedText } from './utils/format'
 const lib = useLibraryStore()
 const assets = useAssetStore()
 const settings = useSettingsStore()
+
+/**
+ * 缩略图生成进度（`thumb:progress` 的载荷）。`null` = 不显示。
+ *
+ * 为什么放在 App 而不是某个面板里：生成是**全局后台任务**（开库、导入后都会触发），
+ * 与当前停在哪一栏、滚到哪一页都无关 —— 挂在 App 上，切视图 / 切筛选都不会把它弄丢。
+ */
+const thumbProgress = ref<{ done: number; total: number } | null>(null)
+
+/**
+ * 完成后的淡出定时器。**必须留着句柄**：
+ * ① 下一批生成开始时要把「隐藏计划」撤掉，否则新进度条会在 800ms 后被上一批的定时器抹掉；
+ * ② 组件卸载时清掉（App 实际不会卸载，但不能留悬挂 timer 让测试/热重载出鬼）。
+ */
+let thumbHideTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 撤销「完成后延迟隐藏」的计划（进度还在推进 / 组件卸载时调） */
+function clearThumbHideTimer(): void {
+  if (thumbHideTimer !== null) {
+    clearTimeout(thumbHideTimer)
+    thumbHideTimer = null
+  }
+}
 
 // ⚠️ 这里**不再自带一份 `setNotice`**：它与 `assets.notify` 写的是同一个槽位
 // （`assets.importNotice`）却各持一个 timer —— 于是「本地提示刚弹出、紧接着 store 又弹一条」时，
@@ -32,7 +56,38 @@ onMounted(async () => {
   }
 
   // 缩略图批量生成完成 → bump 版本号，让所有 <img> 重新加载
-  window.stash.thumb.onDone(() => assets.bumpThumbs())
+  window.stash.thumb.onDone((d) => {
+    assets.bumpThumbs()
+    /*
+     * 进度条收尾：先把进度**置满**（100%）再延迟 ~800ms 隐藏 ——
+     * 最后一格的 done 常常是「差 1 个就满」的中间值（每 10 个才广播一次），
+     * 直接按它算会停在 97% 然后消失，看起来像「没跑完就被掐了」。
+     * 800ms 是给用户看清「已经满了」的时间，之后由 ThumbProgress 自己淡出 200ms。
+     */
+    const total = d && Number.isFinite(d.total) && d.total > 0 ? d.total : thumbProgress.value?.total ?? 0
+    if (total > 0) {
+      thumbProgress.value = { done: total, total }
+      clearThumbHideTimer()
+      thumbHideTimer = setTimeout(() => {
+        thumbHideTimer = null
+        thumbProgress.value = null
+      }, 800)
+    }
+  })
+
+  /*
+   * 缩略图生成进度（标题栏下方那条细条）。
+   *
+   * 主进程 `thumbs.ts` 的 `settleBatch` 每 10 个（以及最后一个）广播一次 `thumb:progress`，
+   * 预加载层早就暴露了 `onProgress` —— 之前渲染层只订阅了 onDone，
+   * 于是「几百上千张图在后台慢慢生」这段时间界面毫无反馈，用户以为软件没反应。
+   */
+  window.stash.thumb.onProgress((d) => {
+    // total <= 0 的广播没有意义（空批次），忽略 —— 否则会出现一条 0/0 的常驻条
+    if (!d || !Number.isFinite(d.total) || d.total <= 0) return
+    clearThumbHideTimer() // 还在生成：撤掉上一批的「延迟隐藏」
+    thumbProgress.value = { done: d.done, total: d.total }
+  })
 
   // 外部（资源管理器）改动 → 主进程 watcher 同步完索引后广播过来。
   // 界面因此**不必重开库**就能看到外部新增/改写/删除的素材。
@@ -97,12 +152,27 @@ onMounted(async () => {
     }
   })
 })
+
+// 组件卸载时清掉「完成后延迟隐藏」的定时器（App 不会卸载，但别留悬挂 timer）
+onBeforeUnmount(clearThumbHideTimer)
 </script>
 
 <template>
   <Welcome v-if="!lib.info" />
   <div v-else class="app">
     <TitleBar />
+    <!--
+      缩略图生成进度：标题栏正下方一条 2px 细条（fixed 定位，不进文档流 → 不会顶动面板）。
+      只有当主进程真的在跑生成（total > 0）时才渲染；完成后延迟隐藏，靠 Transition 淡出 200ms。
+      包在 <Transition> 里而不是直接 v-if：硬切会「闪一下」。
+    -->
+    <Transition name="thumb-prog">
+      <ThumbProgress
+        v-if="thumbProgress"
+        :done="thumbProgress.done"
+        :total="thumbProgress.total"
+      />
+    </Transition>
     <div class="body">
       <SideBar />
       <!--

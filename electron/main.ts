@@ -32,7 +32,7 @@ import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
 import { runSmokeWatch } from './services/smoke-watch'
 import { runSmokeVScroll } from './services/smoke-vscroll'
-import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, SIZES, type ThumbSize } from './services/thumbs'
+import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, invalidateGridPresence, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
 import { isThumbHash } from './services/paths'
@@ -591,7 +591,20 @@ function bootstrap(): void {
     // 缓存占用与清理（缩略图 / 派生预览分开算、分开清）
     ipcMain.handle('cache:stats', () => wrap(() => cacheSvc.cacheStats()))
     ipcMain.handle('cache:clear', (_e, { kind }) =>
-      wrap(() => cacheSvc.clearCache(kind === 'derived' || kind === 'thumbs' || kind === 'all' ? kind : 'thumbs'))
+      wrap(() => {
+        const k = kind === 'derived' || kind === 'thumbs' || kind === 'all' ? kind : 'thumbs'
+        const r = cacheSvc.clearCache(k)
+        /*
+         * 清掉缩略图后必须让「目录集合」失效：
+         * `thumbs.ensureBatch` 判断「已有 grid 缩略图」靠的是**一次 readdir 拿到的 hash 目录集合**
+         * （比逐条 stat 快一个数量级，见 thumbs.ts 的 thumbHashDirs）。而清理只 unlink 文件、
+         * hash 目录会留下来，目录集合会撒谎 —— 紧接着的 `thumb:backfill` 就会把整库当成
+         * 「已有缩略图」，一张都不重建（用户看到：清了缓存，网格从此全 404）。
+         * 标记之后，下一次全量 grid 批次退回逐条 existsSync，把该补的重新捞出来。
+         */
+        if (k === 'thumbs' || k === 'all') invalidateGridPresence()
+        return r
+      })
     )
     // 在资源管理器里打开 .thumbs（清理前想自己看一眼时用）
     ipcMain.handle('cache:reveal', () =>

@@ -2,7 +2,7 @@
 // 图片: sharp → webp（两级尺寸）；视频: ffmpeg 截帧 → sharp 缩放；
 // 音频/文本: 生成占位图。缓存: {库目录}/.thumbs/{hash}/{size}.webp
 import { spawn } from 'child_process'
-import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, readFileSync, statSync } from 'fs'
+import { existsSync, mkdirSync, copyFileSync, writeFileSync, unlinkSync, renameSync, readFileSync, statSync, readdirSync } from 'fs'
 import { join } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp, { type Sharp, type Metadata } from 'sharp'
@@ -55,6 +55,174 @@ function quality(): number {
 
 function thumbFile(hash: string, size: ThumbSize): string {
   return join(requireCurrent().path, '.thumbs', hash, `${size}.webp`)
+}
+
+/**
+ * 一次 `readdir` 拿到所有已有缩略图 hash 目录 —— 替代逐条 `existsSync`。
+ *
+ * 为什么：3000 个素材 = 3000 次同步 stat（每次进内核、还要过杀软实时扫描），
+ * 开库时把主进程占住 1–3 秒（渲染层的所有 IPC 都得排队 → 界面点不动）；
+ * 而 `.thumbs` 本来就是「一个 hash 一个目录」（见 `thumbFile`），
+ * 一次 readdir 就能拿到全集，同一份数据 20–30ms 完成。
+ *
+ * 取舍（**已知且接受**）：目录存在 ≠ `grid.webp` 一定写完 —— 生成是先 `mkdirSync` 再
+ * `sharp().toFile()`，若生成中断（进程被杀 / 断电）会留下一个空目录，这里会被误判成「已有」，
+ * 该图 `stash://thumb/…` 404。兜底在渲染层：`GalleryGrid` 的 `onImgErr` 有自愈
+ * （`thumbRetried` → `thumb:ensure` 补生成），下一次加载就回来。
+ * 这个代价换的是开库从「秒级卡死」变「一次 readdir」，值得。
+ *
+ * ⚠️ 还有一个**必须显式处理**的「目录在、文件没了」来源：设置里的**清理缩略图缓存**
+ * （`cache.clearCache('thumbs')`）只 `unlink` 文件、留下 hash 目录。若不管，清完之后的
+ * `thumb:backfill` 会把整库都当成「已有 grid」→ **一张都不重建**，网格全是 404。
+ * 处理方式：清理方调 `invalidateGridPresence()`，下一次「全量」grid 批次改用逐条
+ * `existsSync`（见该函数与 `ensureBatch`）。另外 `clearCache` 会把变空的 hash 目录一并
+ * `rmdir`，让「目录存在」这个前提在磁盘上尽量重新成立（跨进程重启也安全）。
+ *
+ * ⚠️ **只对 `grid` 有效**，`detail` 不要用（见 `ensureBatch` 里的说明）。
+ *
+ * 失败（没有库 / `.thumbs` 还不存在 / 权限问题）返回**空集**：调用方据此把这些素材全当
+ * 「缺缩略图」入队 —— 队列里 `ensureOne` 仍会先 `existsSync` 命中缓存，所以只是多排一轮，
+ * 不会重复生成，也不会出错。
+ */
+function thumbHashDirs(): Set<string> {
+  try {
+    const entries = readdirSync(join(requireCurrent().path, '.thumbs'), { withFileTypes: true })
+    const dirs = new Set<string>()
+    // 只要目录：`.thumbs` 根下还躺着 `placeholder-audio.webp` 这类**文件**，不能算进来
+    for (const e of entries) if (e.isDirectory()) dirs.add(e.name)
+    return dirs
+  } catch {
+    return new Set<string>()
+  }
+}
+
+/**
+ * 「`.thumbs/{hash}` 目录存在」还能不能代表「`grid.webp` 也在」？—— 被清理缓存破坏后置脏。
+ *
+ * 谁置脏：`cache.clearCache('thumbs'|'all')` 之后由 `main.ts` 的 `cache:clear` handler 调
+ * `invalidateGridPresence()`（清缓存只删文件、不删目录，目录集合会撒谎）。
+ * 谁洗白：**下一次覆盖整个索引的 `grid` 批次**（`thumb:backfill` 正是这种）改用逐条
+ * `existsSync`，跑完把标记清掉。
+ *
+ * 为什么只在「全量批次」消费、而不是「下一次批次」：清完缓存后渲染层先发的是
+ * `thumb:ensure-batch`（首屏那几十张），若被它消费掉，紧随其后的全量回填又会被目录集合骗 →
+ * 整库不重建。按「资产数 ≥ 索引总数」认定全量，判定只多一次 `COUNT(*)`（有索引，~0.1ms），
+ * 且只在标记为脏时才算。
+ *
+ * ⚠️ **必须跨进程存活**（这是 meta 那一半存在的唯一理由）：
+ * `clearCache` 的 `rmdirSync` 只能删「变空」的 hash 目录 —— 目录里还有 `preview-*.webp`
+ * （打开过高清预览的素材）就删不掉、目录原地保留。于是「清理缩略图 → 重启软件」后：
+ * 内存标记早没了（模块级变量），空目录也没删掉（非空），目录集合凭空撒谎 →
+ * 那些素材永远不会被重建，只能等渲染层 `onImgErr` 自愈（没滚到的卡片一直缺图）。
+ * 所以标记**双写 `meta`**：`meta` 是**按库**存的（`.stash` 里），重启后照样读得到。
+ */
+let gridPresenceUnreliable = false
+
+/**
+ * 内存标记**属于哪个库**的绝对路径。
+ *
+ * `gridPresenceUnreliable` 是模块级变量、跨库残留：A 库清过缓存脏着，`closeCurrent()` 不会
+ * 清零，直接 `openLibrary(B)` 就会让 B 的第一次回填也退回逐条 stat（慢但不错）。
+ * `meta` 是按库的，所以「库变了 → 只信 meta」是最省事又正确的复位点：
+ * 不用在 `library.ts` 的关库/切库收口点插钩子（那里加钩子还得管「没库时」「切到同一个库」等分支）。
+ */
+let gridPresenceLibPath: string | null = null
+
+/** `meta` 里的键名。值只写 `'1'`；洗白是整行 DELETE，不留 `'0'` 这种第二种真值形态。 */
+const GRID_DIRTY_KEY = 'grid_presence_dirty'
+
+/** 当前库路径；没库（切库中途 / 欢迎页）返回 null */
+function libPathOrNull(): string | null {
+  try {
+    return requireCurrent().path
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 标记为脏：**内存 + meta 双写**（meta 让它在重启后依然生效）。
+ * 幂等；多次调用等价于一次（下一次全量 grid 批次统一重扫）。
+ */
+export function invalidateGridPresence(): void {
+  gridPresenceUnreliable = true
+  gridPresenceLibPath = libPathOrNull()
+  try {
+    requireCurrent().db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES(?, '1')").run(GRID_DIRTY_KEY)
+  } catch {
+    /* 没库 / 写失败：退化成只在本进程生效（内存标记已经置了），不影响正确性 */
+  }
+}
+
+/**
+ * 是否脏（= 不能信 `.thumbs` 的目录集合）。内存优先，否则读 `meta`。
+ *
+ * 每次 `ensureBatch` 多一次 meta SELECT（~0.05ms，主键查询）——**刻意不做模块级缓存**：
+ * 缓存一旦跨进程/跨库失效就会重演「清完缓存一张都不重建」，那点查询开销远比这个风险便宜。
+ */
+function gridPresenceIsDirty(): boolean {
+  if (gridPresenceUnreliable) {
+    const cur = libPathOrNull()
+    // 内存标记是模块级、会跨库残留；meta 是按库的 → 库变了就丢掉内存标记、只信 meta。
+    if (cur !== null && gridPresenceLibPath !== null && cur !== gridPresenceLibPath) {
+      gridPresenceUnreliable = false
+      gridPresenceLibPath = null
+    } else {
+      return true
+    }
+  }
+  try {
+    const row = requireCurrent().db.prepare('SELECT value FROM meta WHERE key=?').get(GRID_DIRTY_KEY) as
+      | { value?: string }
+      | undefined
+    return row?.value === '1'
+  } catch {
+    return false
+  }
+}
+
+/** 洗白：内存标记与 meta 行一起清（只清内存会让重启后又变脏，只清 meta 会让本进程继续逐条 stat） */
+function clearGridPresenceDirty(): void {
+  gridPresenceUnreliable = false
+  gridPresenceLibPath = null
+  try {
+    requireCurrent().db.prepare('DELETE FROM meta WHERE key=?').run(GRID_DIRTY_KEY)
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * 只读诊断（冒烟断言取证用）：当前库的「目录集合是否可信」。
+ * 生产代码不依赖它；它也不会写出任何东西（唯一的副作用是顺手复位跨库残留的内存标记）。
+ */
+export function gridPresenceState(): { dirty: boolean } {
+  return { dirty: gridPresenceIsDirty() }
+}
+
+/**
+ * 小批次的阈值：**这么多条以内直接逐条 `existsSync`，不值得为几行数据 readdir 整个 `.thumbs`**。
+ *
+ * 谁在用：`preview.ts` 的「新哈希补一张缩略图」是**单条**批次，且挂在**交互路径**上
+ * （每次打开高清预览都会触发）；1 万目录的一次 readdir 约 4ms，而一次 stat 约 0.03ms。
+ * 首屏 `thumb:ensure-batch` 的几十条也会落到这条路径上（只多几十次 stat，可忽略）。
+ *
+ * ⚠️ 这不只是省时间，也**更准**：小批次根本不需要「目录存在」这种近似判据，
+ * 逐条 `existsSync` 是零取舍的真值（连「目录在、文件没了」都不会误判）。
+ */
+const SMALL_BATCH_MAX = 8
+
+/** 这批资产是否覆盖了索引里全部「未缺失」素材（= 一次全量回填） */
+function isFullScan(count: number): boolean {
+  try {
+    const row = requireCurrent().db.prepare('SELECT COUNT(*) AS c FROM assets WHERE missing=0').get() as
+      | { c: number }
+      | undefined
+    return count >= (row?.c ?? 0)
+  } catch {
+    // 读不到就保守地**不**消费标记：多跑一轮逐条判断，总比漏生成好
+    return false
+  }
 }
 
 /**
@@ -621,9 +789,34 @@ export function ensureBatch(
 ): void {
   // grid 顺带回写尺寸与色板 → 「索引里缺这两个字段」的也要进队列（虽然缩略图早就在了）
   const sink = size === 'grid' ? indexFieldsSinkIds(getSettings().importing.palette) : new Set<number>()
-  const fresh = assets.filter(
-    (a) => a.content_hash && (!existsSync(thumbFile(a.content_hash, size)) || sink.has(a.id))
-  )
+  /*
+   * 「这个 hash 是否已有 grid 缩略图」走**一次 readdir** 的目录集合，不再逐条 `existsSync`。
+   *
+   * ⚠️ **必须区分尺寸**：`detail` 那份缩略图是**按需**生成的（放大预览时才要），
+   * 所以「目录存在」**不代表** `detail.webp` 存在 —— 用目录集合判断 detail 会漏生成，
+   * 表现就是「点开放大一直转圈 / 图不出来」。因此 detail 保持逐条 `existsSync`。
+   * （grid 是开库就全量回填的，几乎每个目录都有 grid.webp，才有这个优化空间。）
+   *
+   * ⚠️ 三种情况**不用**目录集合、退回逐条 `existsSync`（都是「省这点时间不值当/不正确」）：
+   *   ① 清过缓存（`gridPresenceIsDirty()`，含**重启后从 meta 读回来的脏标记**）——
+   *      目录在、grid.webp 不在，用它判会「清完缓存一张都不重建」；
+   *   ② 批次很小（`SMALL_BATCH_MAX` 以内，`preview.ts` 的单条补图就走这条）——
+   *      readdir 一个上万目录的 `.thumbs` 要 ~4ms，一次 stat 只要 ~0.03ms，而且 stat 是零取舍的真值；
+   *   ③ `detail` 尺寸（上面那条）。
+   */
+  const stale = size === 'grid' && gridPresenceIsDirty()
+  const useDirSet = size === 'grid' && !stale && assets.length > SMALL_BATCH_MAX
+  const haveGrid = useDirSet ? thumbHashDirs() : null
+  const fresh = assets.filter((a) => {
+    if (!a.content_hash) return false
+    if (sink.has(a.id)) return true // 索引字段欠账：缩略图在也要跑一遍（见 indexFieldsSinkIds 的注释）
+    if (haveGrid) return !haveGrid.has(a.content_hash)
+    return !existsSync(thumbFile(a.content_hash, size))
+  })
+  // 全量批次已经用逐条判断把整库重新捞了一遍 → 目录集合重新可信，标记可以洗白了。
+  // （小批次不消费：否则紧随其后的全量回填又会被目录集合骗过去。）
+  // 洗白同时清 meta —— 只清内存会让「重启后」又变脏、只清 meta 会让本进程继续逐条 stat。
+  if (stale && isFullScan(assets.length)) clearGridPresenceDirty()
   if (fresh.length === 0) {
     onDone?.()
     return

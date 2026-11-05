@@ -25,6 +25,15 @@
 //                    版本比较逐段按数字比、302 Location 解析、白名单（含前缀骗术 / 段边界）、
 //                    checkLatest 三态与「异常收敛成值」、IPC 白名单拒绝、版本行 DOM 结构、
 //                    转圈动画、三态文案真实渲染。**零真实网络、零真实浏览器**（见段内说明）。
+//   OP 开库性能    —— 开库回填不再逐条 stat（QA 增补，编号 OP-1…OP-10 + OP-4b/OP-4c）：
+//                    1 万条夹具下 `thumb:backfill` 的 IPC 往返耗时（绝对上界 + 「目录集合 vs 逐条 stat」比值）、
+//                    已有 grid 不重复生成、detail 不被目录集合误判、清缓存后「重启」与「同进程」两条重建路径、
+//                    派生预览不被连带删除、
+//                    **OP-4b**：派生预览原位、目录删不掉时回填仍须全部重建（真回归面）；
+//                    **OP-4c**：脏标记 meta 双写① / 全量洗白是 DELETE② / 非全量批次不得消费③ /
+//                            内存复位后仍 dirty（只可能来自 meta）④ / 重建后洗白⑤；
+//                    OP-10 小批次（≤8）退回逐条 existsSync、
+//                    进度条的出现/置满/淡出节奏与「不抢点击、不压标题栏」。
 //
 // ⚠️ 本套件会**写真实的 userData/config.json**（设置本来就存在那里，没有库里那份），
 // 所以开头快照、`finally` 里原样写回 —— 冒烟不能把用户的偏好改掉。
@@ -33,9 +42,9 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'os'
 import { basename, join } from 'path'
 import sharp from 'sharp'
-import { closeCurrent, createLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
+import { closeCurrent, createLibrary, forgetLibrary, mkdirRel, openLibrary, requireCurrent } from './library'
 import { importFiles, type ImportResult } from './importer'
-import { ensureBatch } from './thumbs'
+import { ensureBatch, gridPresenceState } from './thumbs'
 import { cacheStats, clearCache } from './cache'
 import { deriveFor } from './preview'
 import { libraryUsage } from './health'
@@ -1646,6 +1655,689 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         await js("document.querySelector('[data-sp-check-update]')?.classList.remove('checking'); true")
         await capture('shot-settings-about-update.png')
       }
+    }
+
+    // ==================== OP 开库性能 + 缩略图进度条（QA 增补：OP-1…OP-8） ====================
+    // 验的是两件事：
+    //   ① 开库回填「判断某个 hash 有没有 grid 缩略图」从**逐条 existsSync** 改成**一次 readdir 的目录集合**；
+    //   ② 缩略图生成过程有进度条、且不抢点击 / 不压标题栏。
+    //
+    // 为什么每条都用**独立判据**：耗时、目录数、mtime、文件是否存在，全部由本段自己量
+    // （`readdirSync` / `statSync` / `existsSync`），**不读 `thumbs.ts` 的内部变量** ——
+    // 否则「实现写错、断言照抄同一份错误认知」会一起错（本项目 I2 的同源盲区）。
+    // 唯一借用的生产入口是 `cache.clearCache` / `ensureBatch` / `thumb:*` IPC，那本身就是被测对象。
+    //
+    // ⚠️ 环境差异（**不要用本机数字反推用户效果**）：本机 warm cache、无杀软、NVMe，
+    //    绝对耗时远低于用户环境（用户报的是 1–3 秒）。所以耗时判据以
+    //    「同一台机器、同一份数据下 有缓存集合 vs 逐条 stat」的**比值**为主，
+    //    绝对阈值（800ms）只作兜底上界。
+    {
+      const thumbsDir = join(lib.path, '.thumbs')
+      const db = requireCurrent().db
+      const opSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+      const fileIn = (rel: string): string => join(lib.path, ...rel.split('/'))
+      const gridOf = (h: string): string => join(thumbsDir, h, 'grid.webp')
+      const detailOf = (h: string): string => join(thumbsDir, h, 'detail.webp')
+      const mtimeOf = (p: string): number => {
+        try {
+          return statSync(p).mtimeMs
+        } catch {
+          return -1
+        }
+      }
+      /** 等到 `files` 全部存在（返回最终存在的个数，不抛） */
+      const waitAll = async (files: string[], ms = 30000): Promise<number> => {
+        const t0 = Date.now()
+        let n = files.filter((f) => existsSync(f)).length
+        while (n < files.length && Date.now() - t0 < ms) {
+          await opSleep(150)
+          n = files.filter((f) => existsSync(f)).length
+        }
+        return n
+      }
+      /**
+       * 在渲染层装一对计数器（`thumb:progress` / `thumb:done` 广播次数）。
+       * ⚠️ 由**真事件**驱动（主进程 `settleBatch` → webContents.send → preload → 这里），
+       *    不是去读主进程变量 —— 顺便也证了「广播在真的发」。
+       * 重复调用会先卸掉上一次的监听（`__opUnsub`），不会越挂越多。
+       */
+      const armThumbCounters = async (): Promise<void> => {
+        await js(
+          'window.__opProg = 0; window.__opDone = 0; window.__opUnsub = window.__opUnsub || [];' +
+            'while (window.__opUnsub.length) { try { window.__opUnsub.pop()() } catch (e) {} }' +
+            'window.__opUnsub.push(window.stash.thumb.onProgress(() => { window.__opProg++ }));' +
+            'window.__opUnsub.push(window.stash.thumb.onDone(() => { window.__opDone++ }));' +
+            'true'
+        )
+      }
+      const thumbCounts = async (): Promise<{ prog: number; done: number }> =>
+        ((await js<{ prog: number; done: number }>(
+          '({ prog: window.__opProg || 0, done: window.__opDone || 0 })'
+        )) ?? { prog: -1, done: -1 })
+
+      /**
+       * 直接读 `meta` 里那行脏标记 —— **独立判据**，不经过 `thumbs.ts` 的 getter。
+       *
+       * 为什么要两个来源：`gridPresenceState()` 可能「记得」内存里的标记（关库不清零），
+       * 而 `meta` 是**唯一能跨进程存活**的载体。两条一起看，才分得清
+       * 「内存标记在起作用」还是「真的持久化住了」。
+       * ⚠️ 必须每次现取 `requireCurrent().db`：本段后面会 `closeCurrent()` 再重开，
+       * 提前捕获的 `db` 句柄会变成 closed。值只应是 `'1'`；洗白是整行 DELETE（不该出现 `'0'`）。
+       */
+      const metaDirty = (): string | null => {
+        try {
+          const row = requireCurrent().db.prepare("SELECT value FROM meta WHERE key='grid_presence_dirty'").get() as
+            | { value?: string }
+            | undefined
+          return row?.value ?? null
+        } catch {
+          return '(读不到)'
+        }
+      }
+
+      // —— 前置：库里那些「文件真的还在磁盘上」的图片素材 ——
+      // 只留这些：`ensureOne` 对源文件缺失的素材会返回 null，拿它做「必须重建」会让断言永远红。
+      const imageRows = (
+        db
+          .prepare(
+            "SELECT id, type, ext, content_hash, rel_path FROM assets " +
+              "WHERE missing=0 AND type='image' AND content_hash IS NOT NULL ORDER BY id"
+          )
+          .all() as Array<{ id: number; type: string; ext: string; content_hash: string; rel_path: string }>
+      ).filter((r) => existsSync(fileIn(r.rel_path)))
+      // 同一个 content_hash 可能对应多行（重复导入 / 库内复制的旧数据）→ 文件级断言按 hash 去重
+      const hashes = [...new Set(imageRows.map((r) => r.content_hash))]
+      // 先把「每张 grid.webp 都存在」这个前提坐稳（前面 S7 清过缓存、S9 又导入过）
+      const missingGrid = hashes.filter((h) => !existsSync(gridOf(h)))
+      if (missingGrid.length > 0) {
+        const rows = imageRows.filter((r) => missingGrid.includes(r.content_hash))
+        await new Promise<void>((resolve) => ensureBatch(rows, 'grid', resolve))
+      }
+      check(
+        'OP-0 前置：库里 ' + hashes.length + ' 个图片 hash 的 grid.webp 全部已在磁盘上（否则后面的「不重复生成」是空转）',
+        hashes.length > 0 && hashes.every((h) => existsSync(gridOf(h))),
+        `hashes=${hashes.length} 缺=${hashes.filter((h) => !existsSync(gridOf(h))).length}`
+      )
+      // 前置归位：把「索引字段欠账」（width/palette/duration_ms）清零，否则它们会被 `sink` 强制入队，
+      // OP-2 的「一张都不生成」会变成假红。gen_state 置满位 → `backfillMeta` 也不再排元数据任务，
+      // 让 OP-1 的耗时只反映缩略图回填本身。
+      db.prepare(
+        "UPDATE assets SET width=COALESCE(width,400), height=COALESCE(height,300), palette=COALESCE(palette,'[]'), gen_state=3 WHERE type='image'"
+      ).run()
+      // 归位：先跑一次全量回填，把可能残留的「目录集合脏标记」洗白。
+      // 为什么必须洗：S7 里点过「清理缩略图」（走 IPC → `invalidateGridPresence()`），
+      // 脏状态会让回填退回逐条 stat —— 那 OP-1 就会变成在测「慢路径」而不自知。
+      await js("window.stash.thumb.backfill('grid')")
+      check(
+        'OP-1 前置：目录集合此刻是「可信」状态（dirty=false 且 meta 无脏行）—— 否则 OP-1 测到的是逐条 stat 的慢路径',
+        gridPresenceState().dirty === false && metaDirty() === null,
+        `dirty=${gridPresenceState().dirty} meta=${metaDirty()}`
+      )
+
+      // ==================== OP-1 全量回填耗时（1 万条夹具）====================
+      // 夹具口径照 `smoke-vscroll.ts`：直插 1 万行，**不落 1 万个真缩略图**。
+      // 但这里不能学它把 content_hash 置 NULL —— 那样 `ensureBatch` 的 filter 会在
+      // `!a.content_hash` 处短路，根本走不到 `haveGrid` 那条分支，注入验证也就抓不到了。
+      // 所以：每行给一个独立 content_hash，并在 `.thumbs` 下**只造一个空目录**（目录在、文件不在）。
+      const OP_N = 10000
+      // ⚠️ 复用**已存在**的文件夹行，绝不 `mkdirRel` 新建目录：新建真实目录会触发 watcher 的
+      // addDir → library:external → 渲染层 refresh → 这 1 万行立刻进画廊，OP-1 的耗时与
+      // OP-2 的「0 次广播」全部被污染。`.thumbs` 那一侧是安全的（watcher 显式忽略 `.thumbs*`）。
+      const opFolder = db.prepare('SELECT id, path FROM folders ORDER BY id LIMIT 1').get() as
+        | { id: number; path: string }
+        | undefined
+      if (!opFolder) throw new Error('OP: 库里没有文件夹行，无法造夹具')
+      const tFx = Date.now()
+      {
+        const ins = db.prepare(
+          'INSERT INTO assets (folder_id, name, rel_path, type, ext, size, width, height, content_hash,' +
+            ' rating, is_fav, file_mtime, imported_at, missing)' +
+            " VALUES (?, ?, ?, 'text', 'txt', 64, NULL, NULL, ?, 0, 0, ?, ?, 0)"
+        )
+        db.exec('BEGIN')
+        try {
+          for (let i = 0; i < OP_N; i++) {
+            const k = String(i).padStart(5, '0')
+            const h = `opfx${k}`
+            mkdirSync(join(thumbsDir, h)) // 只造目录，不写文件（正是新实现赖以判断的那份「目录集合」）
+            ins.run(opFolder.id, `op${k}.txt`, `${opFolder.path}/op${k}.txt`, h, tFx + i, tFx + i)
+          }
+          db.exec('COMMIT')
+        } catch (e) {
+          db.exec('ROLLBACK')
+          throw e
+        }
+      }
+      const fixtureMs = Date.now() - tFx
+      const opDirs = readdirSync(thumbsDir, { withFileTypes: true }).filter((d) => d.isDirectory()).length
+      const totalRows = (db.prepare('SELECT COUNT(*) AS c FROM assets WHERE missing=0').get() as { c: number }).c
+      check(
+        `OP-1 前置：1 万条夹具已落库（${totalRows} 行）且 .thumbs 下真的有 1 万个空 hash 目录（目录在、grid.webp 不在）`,
+        totalRows >= OP_N && opDirs >= OP_N,
+        `行数=${totalRows} 目录数=${opDirs} 造夹具=${fixtureMs}ms`
+      )
+
+      // —— 反事实对照：把**旧实现**在同一份数据上原样跑一遍（SELECT + 逐条 existsSync）——
+      // 这是「同一台机器、同一份数据」的公平对照，不受机器快慢影响（比值判据的依据）。
+      const tOldSel0 = Date.now()
+      const allRows = db
+        .prepare('SELECT id, content_hash FROM assets WHERE missing=0')
+        .all() as Array<{ id: number; content_hash: string | null }>
+      const tOldSel = Date.now() - tOldSel0
+      let oldMiss = 0
+      const tOldStat0 = Date.now()
+      for (const a of allRows) {
+        if (a.content_hash && !existsSync(join(thumbsDir, a.content_hash, 'grid.webp'))) oldMiss++
+      }
+      const tOldStat = Date.now() - tOldStat0
+      const tOld = tOldSel + tOldStat
+
+      // —— 现实现：走**真实 IPC 往返**（渲染层 → preload → main handler → 回来）——
+      // 先拍一次 mtime 快照：OP-2 要用「这三次回填有没有改动任何一张已有 grid.webp」来证明「不重复生成」
+      const gridFiles = hashes.map(gridOf)
+      const mtBefore = gridFiles.map(mtimeOf)
+      await armThumbCounters()
+      const ipcMs: number[] = []
+      let backfillAllOk = true
+      for (let k = 0; k < 3; k++) {
+        const t0 = Date.now()
+        const r = await js<{ ok: boolean; data?: { queued: number }; error?: string }>(
+          "window.stash.thumb.backfill('grid')"
+        )
+        ipcMs.push(Date.now() - t0)
+        if (!r || r.ok !== true) backfillAllOk = false
+      }
+      const tNew = Math.min(...ipcMs) // 取最好的一次（warm）；冷启动那次单独记录
+      const afterCounts = await thumbCounts()
+      check(
+        `OP-1 一次 thumb:backfill 的 IPC 往返 ${tNew}ms < 800ms（实测三次=${ipcMs.join('/')}，1 万条）`,
+        backfillAllOk && tNew < 800,
+        `三次=${ipcMs.join('/')}ms 最好=${tNew}ms 对照旧实现=${tOld}ms（SELECT ${tOldSel} + 逐条 stat ${tOldStat}）`
+      )
+      check(
+        `OP-1 相对判据：目录集合路径比逐条 stat 快 3 倍以上（实测 ${(tOld / Math.max(1, tNew)).toFixed(1)}×）`,
+        tOld >= 3 * Math.max(1, tNew),
+        `新=${tNew}ms（IPC 往返） 旧=${tOld}ms（SELECT+${allRows.length} 次 existsSync） 倍数=${(tOld / Math.max(1, tNew)).toFixed(1)}×`
+      )
+
+      // ==================== OP-2 grid 已有 → 一张都不重复生成 ====================
+      // 上一段那三次回填就是「全量回填」本身：此时 fresh 应当为空 → 0 次广播、0 个文件被动过
+      const mtAfter = gridFiles.map(mtimeOf)
+      const changed = gridFiles.filter((_, i) => mtBefore[i] !== mtAfter[i]).length
+      check(
+        'OP-2 全量回填时「已有 grid」的素材一张都不重复生成（progress 广播 0 次 + 文件 mtime 全未变）',
+        afterCounts.prog === 0 && afterCounts.done === 0 && changed === 0,
+        `progress=${afterCounts.prog} done=${afterCounts.done} mtime 变化=${changed}/${gridFiles.length}`
+      )
+      check(
+        'OP-2 附加：对照旧实现确实认为这些 hash「都缺」时才有意义（否则上一条是空转）',
+        oldMiss >= OP_N && gridFiles.length > 0,
+        `旧判据认为缺失=${oldMiss}（其中 1 万条是夹具：目录在、grid.webp 不在）`
+      )
+
+      // ==================== OP-3 detail 不被目录集合误判 ====================
+      // 关键语义：`detail` 是**按需**生成的，所以「目录在」绝不代表「detail.webp 在」。
+      // 注入「detail 也走目录集合」时，这里会一张都生成不出来。
+      for (const f of hashes.map(detailOf)) {
+        try {
+          unlinkSync(f)
+        } catch {
+          /* 本来就没有 */
+        }
+      }
+      await armThumbCounters()
+      let detailBatchDone = false
+      await new Promise<void>((resolve) => {
+        ensureBatch(imageRows, 'detail', () => {
+          detailBatchDone = true
+          resolve()
+        })
+        void opSleep(30000).then(resolve) // 兜底，别把套件挂死
+      })
+      const detailFiles = hashes.map(detailOf)
+      const detailBack = await waitAll(detailFiles, 15000)
+      check(
+        `OP-3 目录都在、detail.webp 都不在 → detail 批次必须把它们全部入队并生成（${detailBack}/${detailFiles.length}）`,
+        detailBatchDone && detailBack === detailFiles.length,
+        `done=${detailBatchDone} 生成=${detailBack}/${detailFiles.length}`
+      )
+
+      // ==================== OP-4 清缓存 → 重启（跨进程语义）→ 必须重建 ====================
+      // 判据只依赖**磁盘**，不依赖任何模块标记：清完缓存后 hash 目录被 `rmdirSync` 收掉，
+      // 于是「目录集合」自然重新变准 → 重启（关库再开库，模块状态回到初值）后回填必然重建。
+      // 先做这一步的原因：此时各 hash 目录里还没有派生预览，rmdir 能真的删掉（干净的对照）。
+      // 挡路的派生预览（S7X/S8 给 tiff 生成的 preview-{上限}.webp）先挪到一边，清完立刻放回。
+      const parkDir = join(thumbsDir, '.op-park')
+      mkdirSync(parkDir, { recursive: true })
+      const parked: Array<{ from: string; to: string; name: string }> = []
+      for (const h of hashes) {
+        let names: string[] = []
+        try {
+          names = readdirSync(join(thumbsDir, h))
+        } catch {
+          continue
+        }
+        for (const n of names) {
+          if (!n.startsWith('preview') || n.includes('.tmp')) continue
+          const from = join(thumbsDir, h, n)
+          const to = join(parkDir, `${h}__${n}`)
+          try {
+            writeFileSync(to, readFileSync(from))
+            unlinkSync(from)
+            parked.push({ from, to, name: n })
+          } catch {
+            /* 挪不动就算（会体现为下面 kept>0 的前置断言变红） */
+          }
+        }
+      }
+      // ⚠️ 走服务层 `clearCache` 而**不是** IPC handler：刻意绕开 `invalidateGridPresence()`，
+      //    这样这一条只考「rmdirSync 是否让目录集合重新变准」，不靠脏标记救场。
+      //    所以先取证「此刻确实不脏」—— 否则下面测到的可能是脏标记那条路（OP-9 才是它的主场）。
+      const dirtyPre4 = gridPresenceState().dirty
+      const metaPre4 = metaDirty()
+      const pre4Grid = hashes.filter((h) => existsSync(gridOf(h))).length
+      const cleared4 = clearCache('thumbs')
+      const kept4 = hashes.filter((h) => existsSync(join(thumbsDir, h)))
+      const dirtyPost4 = gridPresenceState().dirty
+      const metaPost4 = metaDirty()
+      check(
+        'OP-4 前置：清理前不脏（dirty=false / 无 meta 行），且清理本身**不**置脏（服务层没走 IPC handler）',
+        pre4Grid === hashes.length && dirtyPre4 === false && metaPre4 === null && dirtyPost4 === false,
+        `清前 grid=${pre4Grid}/${hashes.length} dirty ${dirtyPre4}→${dirtyPost4} meta ${metaPre4}→${metaPost4}`
+      )
+      check(
+        'OP-4 前置：清理后变空的 hash 目录被物理删除（rmdirSync 非递归生效，目录集合重新可信）',
+        kept4.length === 0,
+        `删除文件=${cleared4.removed} 残留目录=${kept4.length}${kept4.length ? '：' + kept4.join(',') : ''}`
+      )
+      // ⚠️ 派生预览**到这里还不能放回去**：`rmdirSync` 已经把那个变空的 hash 目录删掉了，
+      //    此刻 `writeFileSync(p.from, …)` 会因为「父目录不存在」静默失败 —— 文件就丢了。
+      //    （这条是 QA 自查抓到的：加了「真 preview-1920 是否仍在」的断言后立刻变红，
+      //      实测 `真 preview-1920 还在=0/1`。所以放回必须等回填把目录重新建出来之后。）
+      // 模拟重启：关库 → 重新打开。
+      // 这一条的隔离靠 **OP-1 那三次全量回填 + 上面的「清理前 dirty=false」取证**：
+      // 脏标记此时一定不在（内存与 meta 两处都验过），所以重建只可能来自 `rmdirSync`
+      // 让目录集合重新变准这条路径。（脏标记那条路径由 OP-4b/OP-4c 单独考。）
+      closeCurrent()
+      openLibrary(lib.path)
+      const r4 = await js<{ ok: boolean }>("window.stash.thumb.backfill('grid')")
+      const rebuilt4 = await waitAll(hashes.map(gridOf), 30000)
+      // 回填已经把 hash 目录重新建出来了 → 现在把真实派生预览放回原位
+      let restored4 = 0
+      for (const p of parked) {
+        try {
+          mkdirSync(join(p.from, '..'), { recursive: true })
+          writeFileSync(p.from, readFileSync(p.to))
+          unlinkSync(p.to)
+          restored4++
+        } catch {
+          /* 放不回就让它红（下面的断言会暴露） */
+        }
+      }
+      try {
+        rmSync(parkDir, { recursive: true, force: true }) // 空的暂存目录一并收掉，别留在 .thumbs 里
+      } catch {
+        /* ignore */
+      }
+      check(
+        'OP-4 收尾：真实派生预览（preview-1920.webp）确实放回了原位 —— 否则 OP-4b「原位不挪走」的前提是假的',
+        parked.length >= 1 && restored4 === parked.length,
+        `放回=${restored4}/${parked.length}`
+      )
+      check(
+        `OP-4 清缓存后重启 → 回填必须把缩略图真的重建出来（${rebuilt4}/${hashes.length}）`,
+        r4?.ok === true && rebuilt4 === hashes.length,
+        `backfill.ok=${r4?.ok} 重建=${rebuilt4}/${hashes.length} 删除文件=${cleared4.removed} 放回派生=${restored4}/${parked.length}`
+      )
+
+      // ==================== OP-6 派生预览不能被连带删除 ====================
+      // 给每个 hash 目录写一份 `preview-4x.webp`（派生预览就住在同一个 hash 目录里）：
+      // `rmdirSync` 是**非递归**的，只要里面还有东西就删不掉 → 这正是「清理缩略图不得连带删派生」的护栏。
+      const previewBytes = hashes.length > 0 ? readFileSync(gridOf(hashes[0])) : Buffer.alloc(0)
+      for (const h of hashes) writeFileSync(join(thumbsDir, h, 'preview-4x.webp'), previewBytes)
+      const gridBefore6 = hashes.filter((h) => existsSync(gridOf(h))).length
+      const derBefore6 = hashes.filter((h) => existsSync(join(thumbsDir, h, 'preview-4x.webp'))).length
+      // 这一条走**真实 IPC handler**（`cache:clear` → clearCache + invalidateGridPresence）
+      const cleared5 = await js<{ ok: boolean; data?: { removed: number } }>("window.stash.cache.clear('thumbs')")
+      const gridAfter6 = hashes.filter((h) => existsSync(gridOf(h))).length
+      const derAfter6 = hashes.filter((h) => existsSync(join(thumbsDir, h, 'preview-4x.webp'))).length
+      const dirsAfter6 = hashes.filter((h) => existsSync(join(thumbsDir, h))).length
+      check(
+        'OP-6 清理缩略图只删 grid/detail，绝不连带删同目录下的派生预览 preview-4x.webp',
+        cleared5?.ok === true &&
+          gridBefore6 === hashes.length &&
+          gridAfter6 === 0 &&
+          derBefore6 === hashes.length &&
+          derAfter6 === hashes.length,
+        `IPC.ok=${cleared5?.ok} 删除数=${cleared5?.data?.removed} grid ${gridBefore6}→${gridAfter6} preview ${derBefore6}→${derAfter6}`
+      )
+      check(
+        'OP-6 附加：目录里有派生预览时 rmdir 删不掉 → hash 目录必须原地保留（非递归删除的证据）',
+        dirsAfter6 === hashes.length,
+        `目录保留=${dirsAfter6}/${hashes.length}`
+      )
+      // 走 IPC 清缓存必须**同时**置脏（内存 + meta 双写）—— 这是 OP-4b / OP-5 / OP-4c 的前提，
+      // 也是「换个进程回来还记得」的唯一载体。
+      const dirty6 = gridPresenceState().dirty
+      const meta6 = metaDirty()
+      check(
+        "OP-4c① 清缩略图后必须置脏：gridPresenceState().dirty=true 且 meta['grid_presence_dirty']='1'（跨进程的唯一载体）",
+        dirty6 === true && meta6 === '1',
+        `dirty=${dirty6} meta=${meta6}`
+      )
+
+      // ==================== OP-4c③ 反向：非全量批次**不能**消费掉标记 ====================
+      // 这是 OP-4b / OP-5 能成立的前提，也是实现里 `isFullScan()` 那段的唯一理由：
+      // 清完缓存后渲染层先发的是「首屏那几十张」的局部批次，若它把标记洗白，
+      // 紧随其后的全量回填又会被目录集合骗 → 整库不重建（用户看到「清了缓存，网格从此全 404」）。
+      // 两个尺寸各测一次：
+      //   · 9 条 → 故意 > SMALL_BATCH_MAX，确保它走的是「读脏标记」那条分支（而不是因为批次小才碰巧逐条 stat）；
+      //   · 3 条 → lead 口径的原样复现（小批次连目录集合都不查，但也绝不能顺手洗白）。
+      {
+        const partRows = imageRows.slice(0, Math.min(9, imageRows.length))
+        const missingBefore11 = partRows.filter((r) => !existsSync(gridOf(r.content_hash))).length
+        await new Promise<void>((resolve) => {
+          ensureBatch(partRows, 'grid', resolve)
+          void opSleep(20000).then(resolve)
+        })
+        // 等这一批真的落盘（顺带证明「部分批次确实跑了」，否则下面 dirty 不变可能只是因为它没跑）
+        const partBack = await waitAll(partRows.map((r) => gridOf(r.content_hash)), 15000)
+        const stillDirty = gridPresenceState().dirty
+        const metaStill = metaDirty()
+        check(
+          'OP-4c③ 反向：9 条非全量批次不会消费掉脏标记（isFullScan 判据生效）—— 否则紧随其后的全量回填会被目录集合骗',
+          partRows.length >= 9 && missingBefore11 >= 9 && partBack === partRows.length && stillDirty === true && metaStill === '1',
+          `批次=${partRows.length} 条、其中缺图=${missingBefore11}、补回=${partBack}；跑完 dirty=${stillDirty}（应 true） meta=${metaStill}（应 '1'）`
+        )
+        // 3 条（lead 口径）—— 小批次不走目录集合，但同样不能顺手洗白
+        const tinyRows = imageRows.slice(0, Math.min(3, imageRows.length))
+        await new Promise<void>((resolve) => {
+          ensureBatch(tinyRows, 'grid', resolve)
+          void opSleep(10000).then(resolve)
+        })
+        const stillDirty3 = gridPresenceState().dirty
+        const metaStill3 = metaDirty()
+        check(
+          'OP-4c③ 反向：3 条批次同样不得消费脏标记（dirty 仍 true / meta 仍有那行）',
+          tinyRows.length >= 3 && stillDirty3 === true && metaStill3 === '1',
+          `批次=${tinyRows.length} 条；跑完 dirty=${stillDirty3}（应 true） meta=${metaStill3}（应 '1'）`
+        )
+      }
+
+      // ==================== OP-5 同进程清缓存 → 脏标记必须救场 ====================
+      // 此刻的状态正是最危险的组合：hash 目录**都在**（rmdir 删不掉）、grid.webp **都不在**。
+      // 目录集合会撒谎 → 只有脏标记（由 cache:clear handler 置位、由下一次全量回填消费）
+      // 能让回填退回逐条 existsSync。
+      // 注入「去掉 handler 里的 invalidateGridPresence()」时，这一条必须变红。
+      await armThumbCounters()
+      const r5 = await js<{ ok: boolean }>("window.stash.thumb.backfill('grid')")
+      const rebuilt5 = await waitAll(hashes.map(gridOf), 30000)
+      const counts5 = await thumbCounts()
+      check(
+        `OP-5 同进程清缓存（目录还在）→ 回填必须全部重建（${rebuilt5}/${hashes.length}）`,
+        r5?.ok === true && rebuilt5 === hashes.length,
+        `backfill.ok=${r5?.ok} 重建=${rebuilt5}/${hashes.length} progress 广播=${counts5.prog}`
+      )
+      // 全量回填跑完必须把标记**洗白**：内存置 false，且 meta 那一行是**整行 DELETE**（不是写成 '0'）。
+      // 写成 '0' 会让「值是字符串 '0'」和「没有这一行」变成两种语义，迟早有人 `if (value)` 判错。
+      const dirty5 = gridPresenceState().dirty
+      const meta5 = metaDirty()
+      check(
+        "OP-4c② 全量回填后必须洗白：dirty=false 且 meta 那一行被 DELETE 掉（不是写成 '0'）",
+        dirty5 === false && meta5 === null,
+        `dirty=${dirty5} meta=${meta5 === null ? '(行已删除)' : meta5}`
+      )
+
+      // ==================== OP-4b / OP-4c④⑤ 硬场景：派生预览**原位不挪走** + 跨进程脏标记 ====================
+      // 这才是真回归面，也是本方案的**唯一理由**：
+      //   ① 目录里有 `preview-*.webp` → `rmdirSync` 删不掉 → 目录原地保留（OP-6 已证）；
+      //   ② 脏标记若只存在内存里，`closeCurrent()` 不会清零但它**属于旧库**、
+      //      而真正的「重启软件」内存标记直接没了 —— 新进程只剩 meta。
+      //   ③ 于是必须验证：脏标记真的写进了 meta，并且**下一个进程**读得回来 → 回填仍会重建。
+      // 做法：先把内存标记「弄丢」（切到一个别的库再切回来，等价于新进程里内存标记为空），
+      //      然后只靠 meta 问 `gridPresenceState()`。
+      // ⚠️ 与 OP-4 的分工：OP-4 把派生预览**挪走**了（目录会变空 → 考的是 `rmdirSync` 那条路）；
+      //    这里**原位不动**（目录必然删不掉 → 只能靠脏标记）。两条各考一半，缺一条就有覆盖洞。
+      {
+        // 此刻 hash 目录都在、preview-4x.webp 都在、grid.webp 都在 → 再走一次 IPC 清缩略图
+        const gridBefore9 = hashes.filter((h) => existsSync(gridOf(h))).length
+        const cleared9 = await js<{ ok: boolean }>("window.stash.cache.clear('thumbs')")
+        const gridAfter9 = hashes.filter((h) => existsSync(gridOf(h))).length
+        const dirsAfter9 = hashes.filter((h) => existsSync(join(thumbsDir, h))).length
+        const derAfter9 = hashes.filter((h) => existsSync(join(thumbsDir, h, 'preview-4x.webp'))).length
+        // 真实派生管线产出的那份 `preview-{上限}.webp`（OP-4 挪出去又放回来的，就在 tiff 的 hash 目录里）
+        const realPreviewAlive = parked.filter((p) => existsSync(p.from)).length
+        check(
+          'OP-4b 前置：清缩略图后「目录全在、grid 全没、派生预览全在」—— 目录集合此刻必然撒谎（这才是真回归面）',
+          gridBefore9 === hashes.length && cleared9?.ok === true && gridAfter9 === 0 &&
+            dirsAfter9 === hashes.length && derAfter9 === hashes.length &&
+            parked.length >= 1 && realPreviewAlive === parked.length,
+          `IPC.ok=${cleared9?.ok} grid ${gridBefore9}→${gridAfter9} 目录=${dirsAfter9}/${hashes.length} preview-4x=${derAfter9} 真 preview-1920 还在=${realPreviewAlive}/${parked.length}`
+        )
+        // 模拟「重启软件」：内存标记属于旧库，切到另一个库再问 → 复位；切回来时**只剩 meta**
+        const tmpBase = mkdtempSync(join(tmpdir(), 'stash-op-restart-'))
+        const tmpLibPath = join(tmpBase, 'op-restart-lib')
+        let dirtyInOther = true
+        let dirtyBackFromMeta = false
+        try {
+          createLibrary({ name: 'op-restart-lib', parentDir: tmpBase })
+          dirtyInOther = gridPresenceState().dirty // 新库没清过缓存 → 必须是 false（也证明内存标记没串库）
+          openLibrary(lib.path)
+          dirtyBackFromMeta = gridPresenceState().dirty // 内存已被复位 → 这个 true 只可能来自 meta
+        } finally {
+          try {
+            forgetLibrary(tmpLibPath)
+          } catch {
+            /* ignore */
+          }
+          closeCurrent()
+          openLibrary(lib.path)
+          try {
+            rmSync(tmpBase, { recursive: true, force: true })
+          } catch {
+            /* 句柄没释放就留着，系统会回收 */
+          }
+        }
+        check(
+          'OP-4c④ 持久化取证：清缓存后切库（内存标记复位）→ 回原库仍 dirty=true 且 meta 行仍在（只可能来自 meta）',
+          dirtyInOther === false && dirtyBackFromMeta === true && metaDirty() === '1',
+          `别的库 dirty=${dirtyInOther}（应 false，防串库） 回原库 dirty=${dirtyBackFromMeta}（应 true，只来自 meta） meta=${metaDirty()}`
+        )
+        // 此刻内存标记是「空」、只有 meta 脏 —— 正是「重启后」的真实状态：回填必须重建全部
+        const r9 = await js<{ ok: boolean }>("window.stash.thumb.backfill('grid')")
+        const rebuilt9 = await waitAll(hashes.map(gridOf), 30000)
+        const derFinal9 = hashes.filter((h) => existsSync(join(thumbsDir, h, 'preview-4x.webp'))).length
+        const realPreviewFinal = parked.filter((p) => existsSync(p.from)).length
+        check(
+          `OP-4b 「清缓存（派生预览原位、目录删不掉）」→ 回填必须全部重建：${rebuilt9}/${hashes.length}`,
+          r9?.ok === true && rebuilt9 === hashes.length,
+          `backfill.ok=${r9?.ok} 重建=${rebuilt9}/${hashes.length}`
+        )
+        check(
+          'OP-4b 派生预览全程未被连带删除（preview-4x × ' + hashes.length + ' + 真实 preview-1920 那份）',
+          derFinal9 === hashes.length && parked.length >= 1 && realPreviewFinal === parked.length,
+          `preview-4x 仍在=${derFinal9}/${hashes.length} 真 preview-1920 仍在=${realPreviewFinal}/${parked.length}`
+        )
+        check(
+          'OP-4c⑤ 重建后洗白（dirty=false 且 meta 行已 DELETE）—— 下一轮开库恢复 readdir 快路径',
+          gridPresenceState().dirty === false && metaDirty() === null,
+          `dirty=${gridPresenceState().dirty} meta=${metaDirty() === null ? '(行已删除)' : metaDirty()}`
+        )
+
+        // ==================== OP-10 小批次（≤8 条）必须逐条 existsSync ====================
+        // `preview.ts` 的「新哈希补一张缩略图」就是**单条** grid 批次，而且在交互路径上
+        // （每次打开高清预览都触发）。它不能依赖「目录存在」这种近似判据 —— 否则
+        // 「目录在、grid.webp 没了」的素材永远补不回来。
+        // 造这个大坑：删掉一张 grid.webp（目录与 preview-4x 都还在），然后只提交这一条。
+        const victim = imageRows.find((r) => r.content_hash === hashes[0])
+        if (victim) {
+          try {
+            unlinkSync(gridOf(hashes[0]))
+          } catch {
+            /* 本来就不在 */
+          }
+          const dirStillThere = existsSync(join(thumbsDir, hashes[0]))
+          const dirtyBefore10 = gridPresenceState().dirty
+          // 反空转：这条素材**不能**落在「索引字段欠账」（sink）里 —— sink 会让它无条件入队，
+          // 那样即使实现用的是目录集合也照样会补图，断言就失去区分度。
+          // 判据按 `derived.ts` 注册表对图片的定义手写（width/palette 都不能为空），不用生产代码自证。
+          const vMeta = requireCurrent().db.prepare('SELECT width, palette FROM assets WHERE id=?').get(victim.id) as
+            | { width: number | null; palette: string | null }
+            | undefined
+          const notInSink = vMeta !== undefined && vMeta.width != null && vMeta.palette != null
+          let smallDone = false
+          await new Promise<void>((resolve) => {
+            ensureBatch([victim], 'grid', () => {
+              smallDone = true
+              resolve()
+            })
+            void opSleep(20000).then(resolve)
+          })
+          const oneBack = await waitAll([gridOf(hashes[0])], 15000)
+          check(
+            'OP-10 单条 grid 批次（≤8）必须逐条 existsSync：「目录在、grid.webp 没了」也要补回来',
+            smallDone && notInSink && dirtyBefore10 === false && dirStillThere && oneBack === 1,
+            `done=${smallDone} 不在 sink=${notInSink} 清前 dirty=${dirtyBefore10}(应 false) 目录还在=${dirStillThere} 补回来=${oneBack}/1`
+          )
+        } else {
+          check('OP-10 前置：找得到用于小批次测试的那条素材', false)
+        }
+      }
+
+      // ==================== OP-7 进度条出现 / 置满 / 消失（真实事件驱动）====================
+      // ⚠️ 先等后台队列彻底排空：OP-5 走的是「逐条 existsSync」那一轮，1 万条夹具也各自入了一次队
+      //    （源文件不存在 → `ensureOne` 立刻返回 null，不产生任何文件，但会照常广播 progress）。
+      //    不等的话，它的广播会在 OP-7 期间把进度条的数字改掉 → 偶发假红。
+      {
+        const idleStart = Date.now()
+        let quietSince = Date.now()
+        let last = (await thumbCounts()).prog
+        while (Date.now() - idleStart < 40000) {
+          await opSleep(120)
+          const now = (await thumbCounts()).prog
+          if (now !== last) {
+            last = now
+            quietSince = Date.now()
+          } else if (Date.now() - quietSince > 700) break
+        }
+      }
+      // 先收掉设置面板（不然后面 S1 尾巴的 Esc 断言会退化成空转 —— 测完再打开还原）。
+      await js("window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))")
+      const opPanelClosed = await waitFor("!document.querySelector('[data-settings-panel]')", 3000)
+      await waitFor("!document.querySelector('.thumb-progress')", 6000) // 等前面那批的进度条彻底退场
+
+      win.webContents.send('thumb:progress', { done: 3, total: 12 })
+      const opBarShown = await waitFor("!!document.querySelector('.thumb-progress')", 3000)
+      const opBar1 = await js<{
+        pos: string
+        pe: string
+        text: string
+        role: string
+        now: string
+        max: string
+        h: number
+      }>(`(() => {
+        const el = document.querySelector('.thumb-progress')
+        if (!el) return null
+        const cs = getComputedStyle(el)
+        const r = el.getBoundingClientRect()
+        return {
+          pos: cs.position, pe: cs.pointerEvents, h: Math.round(r.height * 100) / 100,
+          text: (el.querySelector('.tp-label')?.textContent ?? '').replace(/\\s+/g, ''),
+          role: el.getAttribute('role') ?? '',
+          now: el.getAttribute('aria-valuenow') ?? '', max: el.getAttribute('aria-valuemax') ?? ''
+        }
+      })()`)
+      check(
+        'OP-7 收到 thumb:progress 就出现进度条：position=fixed / pointer-events=none / 文案含「生成缩略图 3/12」',
+        opBarShown &&
+          opBar1 !== null &&
+          opBar1.pos === 'fixed' &&
+          opBar1.pe === 'none' &&
+          opBar1.text.includes('生成缩略图3/12') &&
+          opBar1.role === 'progressbar' &&
+          opBar1.now === '3' &&
+          opBar1.max === '12',
+        JSON.stringify(opBar1)
+      )
+      // 最后一个 done 常常是「差 1 个就满」的中间值（每 10 个才广播一次）→ 完成时必须先置满再淡出
+      win.webContents.send('thumb:done', { done: 12, total: 12 })
+      await opSleep(300)
+      const opFull = await js<{ w: string; text: string }>(`(() => {
+        const el = document.querySelector('.thumb-progress')
+        if (!el) return null
+        const fill = el.querySelector('.tp-fill')
+        return {
+          w: fill ? (fill.style.width || '') : '(无 tp-fill)',
+          text: (el.querySelector('.tp-label')?.textContent ?? '').replace(/\\s+/g, '')
+        }
+      })()`)
+      check(
+        'OP-7 完成时进度条先置满 100%（不是停在 3/12）—— 满格要看得见',
+        opFull?.w === '100%' && (opFull?.text ?? '').includes('12/12'),
+        JSON.stringify(opFull)
+      )
+      await opSleep(300) // 距 thumb:done 约 600ms
+      const opStillThere = await js<boolean>("!!document.querySelector('.thumb-progress')")
+      await opSleep(1200) // 距 thumb:done 约 1.8s（800ms 停留 + 200ms 淡出）
+      const opGone = await js<boolean>("!document.querySelector('.thumb-progress')")
+      check(
+        'OP-7 收尾节奏：800ms 内不立刻消失（留时间看到满格）、800ms+200ms 淡出后必须消失',
+        opStillThere === true && opGone === true,
+        `600ms 时还在=${opStillThere} 1.8s 后已消失=${opGone}`
+      )
+
+      // ==================== OP-8 进度条不遮挡 ====================
+      win.webContents.send('thumb:progress', { done: 1, total: 4 })
+      const opBarShown2 = await waitFor("!!document.querySelector('.thumb-progress')", 3000)
+      const opGeo = await js<{
+        bar: { top: number; bottom: number; h: number }
+        label: { top: number; bottom: number; w: number; h: number; cx: number; cy: number } | null
+        titleBottom: number
+        pe: string
+        z: string
+        hitIsBar: boolean
+      }>(`(() => {
+        const el = document.querySelector('.thumb-progress')
+        const title = document.querySelector('.titlebar')
+        if (!el || !title) return null
+        const bar = el.getBoundingClientRect()
+        const label = el.querySelector('.tp-label')
+        const lb = label ? label.getBoundingClientRect() : null
+        const hit = lb ? document.elementFromPoint(lb.left + lb.width / 2, lb.top + lb.height / 2) : null
+        return {
+          bar: { top: bar.top, bottom: bar.bottom, h: Math.round(bar.height * 100) / 100 },
+          label: lb ? {
+            top: lb.top, bottom: lb.bottom, w: lb.width, h: lb.height,
+            cx: lb.left + lb.width / 2, cy: lb.top + lb.height / 2
+          } : null,
+          titleBottom: title.getBoundingClientRect().bottom,
+          pe: getComputedStyle(el).pointerEvents,
+          z: getComputedStyle(el).zIndex,
+          hitIsBar: hit ? !!(hit.closest && hit.closest('.thumb-progress')) : false
+        }
+      })()`)
+      check(
+        'OP-8 进度条贴在标题栏下沿、不压标题栏（细条高度 ≤3px，条与标签都在标题栏下方）',
+        opBarShown2 &&
+          opGeo !== null &&
+          opGeo.bar.h <= 3 &&
+          opGeo.bar.top >= opGeo.titleBottom - 0.5 &&
+          opGeo.label !== null &&
+          opGeo.label.top >= opGeo.titleBottom - 0.5,
+        JSON.stringify(opGeo)
+      )
+      check(
+        'OP-8 进度条不抢操作：pointer-events=none，且标签中心点的命中测试落不到它自己（点击能穿透）',
+        opGeo?.pe === 'none' && opGeo?.hitIsBar === false,
+        `pointer-events=${opGeo?.pe} z-index=${opGeo?.z} 命中到进度条自身=${opGeo?.hitIsBar}`
+      )
+
+      // 收尾：让进度条退场，并把设置面板重新打开（把状态交还给后面的 S1 尾巴）
+      win.webContents.send('thumb:done', { done: 4, total: 4 })
+      await waitFor("!document.querySelector('.thumb-progress')", 6000)
+      const opReopened = await openPanel()
+      check('OP 收尾：设置面板已重新打开（否则 S1 尾巴的 Esc 断言会变成空转）', opPanelClosed && opReopened)
     }
 
     // ==================== S1 尾巴：Esc 关闭 + 无运行期错误 ====================
