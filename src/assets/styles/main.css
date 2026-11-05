@@ -40,6 +40,15 @@
 
   --danger:        #F0705E;
 
+  /*
+   * 评分星与「喜欢」心是**语义色**，不跟强调色走：星永远是金、心永远是红。
+   * 上一轮深黑主题重构把 accent 从金换成蓝时，这两处被一锅端成了蓝色 —— 语义就错了
+   * （蓝色在界面里表示「选中 / 当前」，不表示「打了 4 星」）。
+   * 星星直接复用旧主题的金 #E8B04B（见上面 accent 注释里提到的那个值），保持视觉记忆连续。
+   */
+  --star: #E8B04B;
+  --fav:  #FF5C6E;
+
   --radius: 8px;
   --radius-panel: 10px;
   --font: "MiSans", "HarmonyOS Sans SC", "Source Han Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
@@ -567,7 +576,7 @@ mark {
 .card .fav {
   position: absolute; top: 8px; left: 8px;
   width: 18px; height: 18px;
-  color: var(--accent);
+  color: var(--fav);
   display: grid; place-items: center;
 }
 .card .fav svg { width: 13px; height: 13px; }
@@ -670,7 +679,7 @@ mark {
 .tag-chip:hover .tag-x { opacity: 0.75; }
 .tag-chip.ai { background: var(--accent-soft); color: var(--text-1); border: 1px solid var(--accent-border); }
 .rate-row { display: flex; align-items: center; justify-content: space-between; margin-top: 16px; }
-.stars { display: flex; gap: 3px; color: var(--accent); }
+.stars { display: flex; gap: 3px; color: var(--star); }
 .stars svg { width: 13px; height: 13px; }
 .stars .star-off { color: var(--text-3); }
 .heart-btn {
@@ -679,7 +688,7 @@ mark {
   display: grid; place-items: center;
 }
 .heart-btn svg { width: 15px; height: 15px; }
-.heart-btn:hover { color: var(--accent); }
+.heart-btn:hover { color: var(--fav); }
 .palette { display: flex; height: 22px; border-radius: 6px; overflow: hidden; }
 /* 色块是按钮（可点、可 Tab 到），点一下把该颜色复制成十六进制。
    这里每个色块本身就是**数据**（用户图片的主色），所以 #fff 是「压在任意色块上的对勾」，
@@ -1049,9 +1058,9 @@ mark {
 .stars { display: flex; gap: 2px; }
 .star { width: 14px; height: 14px; cursor: pointer; color: var(--text-3); }
 /* 评分点亮 / 「喜欢」点亮：都归到强调色（预览页里 accent 的职责就是「选中 · 评分」） */
-.star.on { color: var(--accent); }
+.star.on { color: var(--star); }
 .heart-btn { cursor: pointer; color: var(--text-3); background: none; border: none; padding: 2px; display: flex; }
-.heart-btn.on { color: var(--accent); }
+.heart-btn.on { color: var(--fav); }
 .tag-chip { cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
 .tag-chip .tag-dot { width: 7px; height: 7px; border-radius: 50%; }
 
@@ -1445,7 +1454,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
   transition: color 0.12s ease, transform 0.12s ease;
 }
-.bb-star.on { color: var(--accent); }
+.bb-star.on { color: var(--star); }
 .bb-star:hover { transform: scale(1.18); }
 .bb-btn {
   display: inline-flex; align-items: center; gap: 5px;
@@ -1461,6 +1470,10 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .bb-btn:hover { background: var(--bg-hover); color: var(--text-1); }
 /* 「喜欢」已开启：走强调色（本项目里「已开启 / 已选中」统一由 accent 表达） */
 .bb-btn.on { color: var(--text-1); background: var(--accent-soft); }
+/* 但「喜欢」是**语义色**，不跟 accent 走：图标红、底色淡红，**文字仍用 text-1**
+   —— 红字读起来像报错，而这里表达的是「已喜欢」。 */
+.bb-btn.bb-fav.on { color: var(--text-1); background: rgba(255, 92, 110, 0.14); }
+.bb-btn.bb-fav.on svg { color: var(--fav); }
 /* 批量删除：悬停变成危险实底 + 近黑字（与 .w-btn.danger 同一档） */
 .bb-btn.danger:hover { background: var(--danger); color: var(--bg-app); }
 .bb-btn.ghost { color: var(--text-3); font-size: 11px; }
@@ -1559,7 +1572,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .chip-menu-item.on { color: var(--text-1); background: var(--accent-soft); }
 /* 评分项：星星用 --accent（金），未点亮的用描边灰，跟详情页星级一致 */
 .chip-menu-item .cmi-stars { display: inline-flex; align-items: center; gap: 1px; }
-.chip-menu-item .cmi-star { width: 11px; height: 11px; color: var(--accent); flex-shrink: 0; }
+.chip-menu-item .cmi-star { width: 11px; height: 11px; color: var(--star); flex-shrink: 0; }
 .chip-menu-item .cmi-star.off { color: var(--text-3); }
 .chip-menu-item .cmi-text { font-size: 12px; }
 /* 排序项：当前维度的升降序标记靠右 */
@@ -1600,7 +1613,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
   transition: color 0.12s ease, transform 0.12s ease;
 }
-.ctx-star.on { color: var(--accent); }
+.ctx-star.on { color: var(--star); }
 .ctx-star:hover { transform: scale(1.18); }
 .ctx-item {
   display: flex; align-items: center; gap: 8px;

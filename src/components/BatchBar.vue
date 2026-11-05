@@ -245,7 +245,7 @@ const starOn = (n: number): boolean => n <= (hoverStar.value || assets.selectedR
         <span v-if="assets.selectedRatingMixed" class="bb-mixed" title="选中项评分不一致">混合</span>
       </div>
 
-      <button class="bb-btn" :class="{ on: assets.selectedAllFav }" @click="assets.bulkFav(!assets.selectedAllFav)">
+      <button class="bb-btn bb-fav" :class="{ on: assets.selectedAllFav }" @click="assets.bulkFav(!assets.selectedAllFav)">
         <svg viewBox="0 0 13 13" :fill="assets.selectedAllFav ? 'currentColor' : 'none'">
           <path d="M6.5 10.8S1.8 8.2 1.8 4.9c0-1.5 1.2-2.7 2.6-2.7 1 0 1.7.6 2.1 1.2.4-.6 1.1-1.2 2.1-1.2 1.4 0 2.6 1.2 2.6 2.7 0 3.3-4.7 5.9-4.7 5.9z" stroke="currentColor" stroke-width="1.1" />
         </svg>
