@@ -1781,13 +1781,21 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       const rC = await importFolderTo(treeC, fav.id)
       R.p_treeC = { ...rC, okImported: assetRels().includes('收藏/C/ok.png') }
 
-      // —— IF-6（方向二）：folderId = null 时落点是「未分类」，不是库根、也不是上次选的文件夹 ——
+      // —— IF-6（方向二）：folderId = null（「所有素材」/ 标签视图）时落点是**库根** ——
+      // 被选中文件夹的名字本身就是位置：`D/deep/if6-target.png`。
+      // 早先这里会先造一层「未分类」再塞进去，用户反馈「导入文件夹时凭空多一层」，故改。
       // 刻意再套一层子目录：这样本条同时能抓住「落点错」与「层级没还原」两种回归
-      //（把 `resolveDir` 改成永远返回 base 时，期望路径会从 `未分类/deep/...` 变成 `未分类/...` → 红）。
+      //（把 `resolveDir` 改成永远返回 base 时，期望路径会从 `D/deep/...` 变成 `D/...` → 红）。
       const treeD = join(pRoot, 'D')
       writeBlob(join(treeD, 'deep', 'if6-target.png'), 421)
       const rD = await importFolderTo(treeD, null)
-      R.p_treeD = { ...rD, relPaths: assetRels().filter((r) => r.endsWith('/if6-target.png')) }
+      R.p_treeD = {
+        ...rD,
+        relPaths: assetRels().filter((r) => r.endsWith('/if6-target.png')),
+        // 「未分类」这层不该再被造出来（folders 行与磁盘目录都要盯）
+        uncatFolder: folderPaths().includes('未分类'),
+        uncatDirOnDisk: existsSync(join(libPath, '未分类'))
+      }
 
       // —— IF-7：同一棵树导两次（dedupe 默认开）→ 第二次 added=0、skipped 全覆盖，且**不新建任何目录**
       //
@@ -2049,6 +2057,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
     const pD = (R.p_treeD ?? {}) as {
       timeout?: boolean; added?: number; relPaths?: string[]
+      uncatFolder?: boolean; uncatDirOnDisk?: boolean
     }
     const pE = (R.p_treeE ?? {}) as {
       first?: { timeout?: boolean; added?: number; skipped?: number; failed?: unknown[] }
@@ -2384,14 +2393,18 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // 注入验证：把空目录也压进待建目录集合（不再以「有没有条目」为准）→ 本条红。
       importFolderEmptyDirSkipped: pB?.timeout !== true && pB?.added === 1 &&
         !folderPaths().includes('收藏/B/empty') && !existsSync(join(libPath, '收藏', 'B', 'empty')),
-      // IF-6 落点是**当前选中的文件夹**，不是写死的库根：
+      // IF-6 落点：
       //   方向一：folderId = 「收藏」→ 四条全在 `收藏/A/` 下（防止有人把 base 写死成库根）；
-      //   方向二：folderId = null → 落在 `未分类/D/`（与 `importFiles` 的回退规则同源）。
+      //   方向二：folderId = null（「所有素材」/ 标签视图）→ 落在**库根**的 `D/` 下。
+      // 方向二早先是 `未分类/D/`：用户从「所有素材」导入文件夹时，侧栏凭空多出一个
+      // 他从没建过的「未分类」，每次导入都往里堆一层。现在被选中文件夹的名字就是落点。
+      // 三条断言缺一不可：路径对、磁盘在、**「未分类」不许出现**（最后一条才是盯回归的那条）。
       // 注入验证：把 `resolveDir` 里的 `toRel(base.path, relDir)` 改成只用 `relDir`（丢掉 base）
       // 或永远 `base` → 本条与 IF-1 一起红。
       importFolderRespectsTargetFolder: pD?.timeout !== true && pD?.added === 1 &&
-        (pD?.relPaths ?? []).join('|') === '未分类/D/deep/if6-target.png' &&
-        existsSync(join(libPath, '未分类', 'D', 'deep', 'if6-target.png')) &&
+        (pD?.relPaths ?? []).join('|') === 'D/deep/if6-target.png' &&
+        existsSync(join(libPath, 'D', 'deep', 'if6-target.png')) &&
+        pD?.uncatFolder !== true && pD?.uncatDirOnDisk !== true &&
         (pA?.relPaths ?? []).length === 4 && (pA?.relPaths ?? []).every((r) => r.startsWith('收藏/A/')),
       // IF-7 重复内容按设置跳过：同一棵树导两次（dedupe 默认开）→ 第二次 added=0、skipped 覆盖全部，
       // 且**一个目录都不新建**（`收藏/去重目标/E/sub2` 不许出现）。

@@ -132,6 +132,17 @@ interface RunImportOptions {
    */
   collect: () => CollectResult
   folderId: number | null
+  /**
+   * `folderId === null` 时的落点覆盖：在**库根**下建这个名字的目录并当作 base。
+   *
+   * 只有 `importFolder` 会传（且仅当用户当时在「所有素材」/标签视图，没有「当前文件夹」）。
+   * 为什么不复用「未分类」兜底：用户点「所有素材」后导入「风景」，期望的是 `风景/a.png`，
+   * 而不是库里凭空多出一层他没建过的 `未分类/风景/a.png` —— 那层会一直堆在侧栏里。
+   *
+   * 留 `undefined` 就沿用「未分类」兜底（`importFiles` 走这条：单个文件没有"自身名字"可当落点，
+   * 而 `assets.folder_id` 是 NOT NULL，必须有真实文件夹）。
+   */
+  rootBaseName?: string
   mode?: 'copy' | 'move'
   onProgress?: (p: { importId: number; done: number; total: number }) => void
   onDone?: (r: ImportResult) => void
@@ -166,9 +177,12 @@ function runImport(opts: RunImportOptions): { importId: number } {
       if (!f) throw new Error('ERR_FOLDER_NOT_FOUND')
       base = { id: opts.folderId, path: f.path, dest: join(libPath, ...f.path.split('/')) }
     } else {
-      // 未指定文件夹：导入到「未分类」（物理目录 + folders 表同步创建）
-      const fallback = mkdirRel('未分类')
-      base = { id: fallback.id, path: fallback.path, dest: join(libPath, ...fallback.path.split('/')) }
+      // 未指定文件夹（用户当时在「所有素材」/ 标签视图）：
+      // - 文件夹导入带了 `rootBaseName` → 在**库根**建这个目录当落点（`风景/a.png`）；
+      // - 其余（单文件导入）→ 兜底到「未分类」：那时没有"自身名字"可当文件夹名，
+      //   而 `assets.folder_id` 是 NOT NULL，必须有个真实文件夹。
+      const made = mkdirRel(opts.rootBaseName ?? '未分类')
+      base = { id: made.id, path: made.path, dest: join(libPath, ...made.path.split('/')) }
     }
 
     /**
@@ -437,7 +451,11 @@ export function importFiles(args: ImportArgs): { importId: number } {
 export interface ImportFolderArgs {
   /** 磁盘上被选中的文件夹（绝对路径） */
   rootPath: string
-  /** 目标文件夹 id；`null` = 「未分类」 */
+  /**
+   * 目标文件夹 id。
+   * `null` = 用户当时没有选定文件夹（点的是「所有素材」或某个标签）→ 落点是**库根**，
+   * 目录名取 `rootPath` 的 basename（见 `importFolder` 的注释）。
+   */
   folderId: number | null
   mode?: 'copy' | 'move'
   onProgress?: (p: { importId: number; done: number; total: number }) => void
@@ -514,27 +532,42 @@ function countFolders(): number {
  * 用户实际使用时期望外层也留着，否则一次导入多个同名结构的文件夹会互相搅在一起。
  * 目标文件夹里已有同名子目录时**合并进去** —— `mkdirRel` 本身幂等，不需要额外判断。
  *
+ * **没有「当前文件夹」时（`folderId === null`，即用户点的是「所有素材」或某个标签）
+ * 落点是库根**：`风景/a.png`，与上面「选中层自己保留」是同一条规则 —— 外层名字就是位置。
+ * 早先这里会先造一个「未分类」再塞进去（`未分类/风景/a.png`），侧栏因此多出一个
+ * 用户从没建过的目录，且每次在「所有素材」下导入都往它里面堆一层，很难看也不好找。
+ * 单个文件导入没有这个问题（它没有"自身名字"），仍按 `importFiles` 的旧规则落「未分类」。
+ *
  * 层级是靠在库内按 `relDir` 逐级 `mkdirRel` 还原的 —— 没有新写任何建文件夹逻辑，
  * 也就不会出现「导入建目录」与「手动新建目录」两套规则各偏一次。
  */
 export function importFolder(args: ImportFolderArgs): { importId: number } {
   // 基线必须在同步返回前取：`onDone` 是在异步块收尾时回调的，那时才知道最终行数
   const before = countFolders()
+  // `basename` 对尾斜杠是安全的：`D:\素材\` → `素材`（与 `D:\素材` 同结果）
+  const rootName = basename(args.rootPath)
+  // 边界①：盘符根 / 无名字的路径（`basename('D:\\') === ''`）。
+  // 套层就会建出一个**空名**目录，库内路径退化成 `/a.png`（首段为空）→ 直接放弃套层，
+  // 退化为旧行为。绝不能为了「统一」去建空名文件夹。
+  // 边界②：根目录名以 `.` 开头的（如 `C:\x\.cache`）。项目的索引规则是
+  // 「`.` 开头的目录一律不索引」（见 `watcher.ts` 里 `dirRel.split('/').some(p => p.startsWith('.'))`），
+  // 套层会造出一个「folders 表里有、但里面文件全不被索引」的幽灵目录；
+  // 而且它还会撞上 rename/delete 的 `path.startsWith('.')` → `ERR_PROTECTED_FOLDER`，
+  // 用户既看不见也删不掉。同样退化为旧行为：内容直接倒进当前文件夹。
+  const named = !!rootName && !rootName.startsWith('.')
+  /**
+   * 没有「当前文件夹」→ 建在库根，且**外层名不重复套**：
+   * `rootBaseName` 让 base 直接变成 `rootName` 目录，条目的 `relDir` 因此只保留它内部的那几层。
+   * 盘符根 / `.` 开头（`named === false`）时不下发这个参数，落回「未分类」旧行为。
+   */
+  const atRoot = args.folderId == null && named
   return runImport({
     // 扫描放进 runImport 的异步块里跑（同步 readdir 上千个目录会卡主进程）
     collect: () => {
       const { entries, skipped } = scanFolder(args.rootPath)
-      // `basename` 对尾斜杠是安全的：`D:\素材\` → `素材`（与 `D:\素材` 同结果）
-      const rootName = basename(args.rootPath)
-      // 边界①：盘符根 / 无名字的路径（`basename('D:\\') === ''`）。
-      // 套层就会建出一个**空名**目录，库内路径退化成 `/a.png`（首段为空）→ 直接放弃套层，
-      // 退化为旧行为。绝不能为了「统一」去建空名文件夹。
-      // 边界②：根目录名以 `.` 开头的（如 `C:\x\.cache`）。项目的索引规则是
-      // 「`.` 开头的目录一律不索引」（见 `watcher.ts` 里 `dirRel.split('/').some(p => p.startsWith('.'))`），
-      // 套层会造出一个「folders 表里有、但里面文件全不被索引」的幽灵目录；
-      // 而且它还会撞上 rename/delete 的 `path.startsWith('.')` → `ERR_PROTECTED_FOLDER`，
-      // 用户既看不见也删不掉。同样退化为旧行为：内容直接倒进当前文件夹。
-      if (!rootName || rootName.startsWith('.')) return { entries, skipped }
+      if (!named) return { entries, skipped }
+      // 落点已经是 `rootName`，条目按原样保留内部层级
+      if (atRoot) return { entries, skipped }
       return {
         // 把 rootName 拼到每条 relDir 前面；`relDir === ''`（根层文件）时不能再拼 `/`，
         // 否则库内路径会出现 `风景/` 这样的空尾段。
@@ -546,6 +579,7 @@ export function importFolder(args: ImportFolderArgs): { importId: number } {
       }
     },
     folderId: args.folderId ?? null,
+    rootBaseName: atRoot ? rootName : undefined,
     mode: args.mode,
     onProgress: args.onProgress,
     // `dirsCreated` 只在文件夹导入的结果上出现：`importFiles` 的返回对象逐字节保持旧形状
