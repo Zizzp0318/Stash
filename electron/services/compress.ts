@@ -21,7 +21,7 @@ import sharp, { type Metadata } from 'sharp'
 import { requireCurrent } from './library'
 import { contentHash, EXT_TYPE } from './importer'
 import { uniqueName } from './naming'
-import { ensureBatch } from './thumbs'
+import { ensureBatch, orientedDims } from './thumbs'
 import { suppressRel } from './watcher'
 import { scanAssetIfNeeded } from './genmeta'
 import { isThumbHash } from './paths'
@@ -313,8 +313,23 @@ async function compressOne(row: CompressRow, opts: CompressOptions): Promise<Com
     safeUnlink(tmp)
     return { ...base, status: 'failed', reason: `转码结果格式是 ${outMeta.format}，不是 ${wantFormat}` }
   }
-  const expectW = maxEdge > 0 ? Math.min(srcMeta.width, maxEdge) : srcMeta.width
-  const expectH = maxEdge > 0 ? Math.min(srcMeta.height, maxEdge) : srcMeta.height
+  /*
+   * 期望尺寸必须取**显示尺寸**（EXIF 方向烧进像素之后的那一对），不能用
+   * `srcMeta.width/height` —— 那两个是**旋转前**的存储像素。
+   *
+   * 为什么（实测，别再改回去）：管线开头是 `sharp(abs).rotate()`，手机竖拍
+   * （orientation = 6/8，存储 4032×3024）转出来是 **3024×4032**，而 `metadata()`
+   * 报的仍是 4032×3024 → 下面的 height 校验 `4032 > 3024 + 1` 必然成立，
+   * 每一张竖拍照片都会返回「尺寸校验不过：得到 3024x4032，期望不超过 4032x3024」，
+   * 而原图一动不动。默认设置（`maxEdge = 0` 长边不限）正好是必现档位：
+   * 一旦设了长边上限，resize 会把宽高都夹到上限内，反而把这条掩盖掉。
+   *
+   * 口径复用 `thumbs.orientedDims`（同一份 `autoOrient` / orientation∈{5,6,7,8} 判据）——
+   * 缩略图那边早就这么算了，压缩这边漏了，才出现"同一张图缩略图是竖的、压缩却判尺寸不符"。
+   */
+  const srcDims = orientedDims(srcMeta)
+  const expectW = maxEdge > 0 ? Math.min(srcDims.width, maxEdge) : srcDims.width
+  const expectH = maxEdge > 0 ? Math.min(srcDims.height, maxEdge) : srcDims.height
   // 缩放是等比 contain，只要「不超过上限」且比例一致即可，不要求像素级相等
   if (outMeta.width > expectW + 1 || outMeta.height > expectH + 1 || outMeta.width <= 0 || outMeta.height <= 0) {
     safeUnlink(tmp)

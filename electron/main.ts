@@ -512,6 +512,10 @@ function bootstrap(): void {
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（分流在服务层） */
     ipcMain.handle('asset:paste', (_e, { paths, folderId }) => wrap(() => assetsSvc.pastePaths(paths ?? [], folderId ?? null)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))
+    // 批量打标浮层的三态分布：一条 GROUP BY 算完，别让渲染层对每个选中项各发一次 asset:get
+    ipcMain.handle('asset:tag-counts', (_e, ids) =>
+      wrap(() => assetsSvc.tagCountsFor((ids ?? []) as number[]))
+    )
     // 批量打标：**增量**语义（attach = 追加，绝不覆盖素材已有的其他标签），
     // 与上面 setTags 的「单素材整体替换」刻意分开 —— 复用 setTags 会把每张素材原有的标签抹掉
     ipcMain.handle('asset:bulk-tags', (_e, { ids, tagIds, mode }) =>

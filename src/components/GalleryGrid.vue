@@ -1601,7 +1601,8 @@ async function confirmRename(): Promise<void> {
   const from = r.data?.renamedFrom
   renameOpen.value = false
   renameTarget.value = null
-  await assets.refresh()
+  // keepDepth：改名只动这一行，用户可能正在第 N 屏改一串文件，回顶等于打断工作流
+  await assets.refresh({ keepDepth: true })
   // name / rel_path 都变了，详情栏要重拉（用 loadDetail，别动用户的多选状态）
   await assets.loadDetail(t.id)
   // 目标名被占用时后端会自动加 ` (n)`，必须把最终名字说出来，
@@ -1696,6 +1697,22 @@ function onKeyDown(e: KeyboardEvent): void {
   }
 
   if (e.key !== 'Escape') return
+  /**
+   * 焦点在输入框 / 可编辑区里时，Esc 归那个控件自己处理，绝不能再往下走。
+   *
+   * 为什么（用户可见的坑）：详情栏的提示词 textarea（`@keydown.esc="cancelNote"`）和
+   * 标签输入（`@keyup.esc="closeTagInput"`）都会自己吃掉 Esc，但**没有** stopPropagation；
+   * 事件继续冒泡到这个挂在 window 上的处理器，于是照旧落到末尾的 `clearSelection()` ——
+   * 选中项与右侧详情一起被清空，正在编辑的草稿随组件销毁而丢失。
+   *
+   * 为什么不像 SettingsPanel / PreviewStage / BatchBar 那样在捕获阶段 stopPropagation：
+   * 那三处是**自己**挡住自己面板里的 Esc；而详情栏是独立组件，本组件不该依赖它去补一行
+   * 「记得阻止冒泡」。判据放在消费方（这里），以后新加任何输入框都自动受保护。
+   *
+   * 副作用（明确接受）：搜索框里按 Esc 不再"顺手清空多选"—— 那本来也不是它该干的事，
+   * 搜索框右侧有自己的 ✕。
+   */
+  if (isTextInput(e.target)) return
   if (renameOpen.value) return closeRename()
   if (chipMenu.value) return void (chipMenu.value = null)
   if (importMenuOpen.value) return closeImportMenu()

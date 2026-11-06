@@ -14,6 +14,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch, type PropType } from 
 import MarkdownIt from 'markdown-it'
 import type { StashAssetRow } from '../../env'
 import { useAssetStore } from '../../stores/assets'
+import { useLibraryStore } from '../../stores/library'
 
 const props = defineProps({
   asset: { type: Object as PropType<StashAssetRow>, required: true },
@@ -105,7 +106,10 @@ async function save(force = false): Promise<void> {
     pending.value = 0
     assets.previewDirty = false
     // 文件大小与内容哈希都变了：刷新列表，让卡片上的信息同步（缩略图主进程那边已重生成）
-    await assets.refresh()
+    // keepDepth：只是在浮层里改了文本内容，用户浏览到哪一屏与这次保存无关
+    await assets.refresh({ keepDepth: true })
+    // 文本体积变了但条数没变 → 侧栏「占用空间」不会自动重算（见 stores/library 的 usageRev）
+    useLibraryStore().bumpUsage()
     if (isMd.value) mode.value = 'view'
     assets.notify('info', '已保存')
     return

@@ -1,6 +1,6 @@
-import { copyFileSync, readSync, closeSync, openSync, statSync, readdirSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readSync, closeSync, openSync, statSync, readdirSync } from 'fs'
 import type { Dirent } from 'fs'
-import { basename, extname, join } from 'path'
+import { basename, dirname, extname, join } from 'path'
 import { createHash } from 'crypto'
 import { BrowserWindow } from 'electron'
 import { requireCurrent, mkdirRel } from './library'
@@ -9,6 +9,7 @@ import { uniqueName } from './naming'
 import { moveFileSync } from './fsutil'
 import { toRel } from './paths'
 import type { DB } from './db'
+import { relPathTaken } from './db'
 
 export type AssetType = 'image' | 'video' | 'audio' | 'text'
 
@@ -197,7 +198,17 @@ function runImport(opts: RunImportOptions): { importId: number } {
       `INSERT INTO assets(folder_id,name,rel_path,source_path,type,ext,size,content_hash,file_mtime,imported_at)
        VALUES(?,?,?,?,?,?,?,?,?,?)`
     )
-    const dupStmt = db.prepare('SELECT id FROM assets WHERE content_hash=?')
+    /*
+     * 内容查重。
+     *
+     * ⚠️ 必须把 `missing` 一起取出来：同一份内容可能"活行 + 失效行"并存（删过又导过）。
+     * `ORDER BY missing ASC` 让活行优先 —— 不限序的话 `get()` 可能先拿到失效那条，
+     * 把"库里明明还有"误判成"可以复活"，进而把文件写到一条幽灵行的路径上。
+     */
+    const dupStmt = db.prepare(
+      'SELECT id, rel_path, missing FROM assets WHERE content_hash=? ORDER BY missing ASC LIMIT 1'
+    )
+
 
     let done = 0, added = 0, skipped = preSkipped, renamed = 0
     const failed: ImportFailItem[] = []
@@ -255,6 +266,52 @@ function runImport(opts: RunImportOptions): { importId: number } {
       }
     }
 
+    /**
+     * 「复活」一条 `missing=1` 的旧行：把文件补回它原来的库内路径，复用行本身。
+     *
+     * 为什么不是"当重复跳过"：`missing=1` 的来源是文件被外部删除 / 移动盘掉线，而记录还在
+     * （评分、标签、备注、提示词都在里面）。用户重新导入同一个文件，诉求就是"把它找回来"。
+     * 以前 `dedupe` 只按 hash 全库查，命中这条幽灵行就当"库里已有"**静默跳过** ——
+     * 用户看到"跳过 1 个（重复）"却什么也没回来，而库体检那边又在催他清理这条失效记录，
+     * 两个功能互相打架，且用户永远没法自己恢复。复活则一步到位、用户标注一条不丢。
+     *
+     * 只在**同一目录同名**（按 rel_path 比较）时才复活：拖进别的文件夹应该老老实实新建一行，
+     * 把文件搬回旧位置反而莫名其妙。磁盘上若已经有那个文件了（用户手动放回去了）也不复活 ——
+     * 那说明它已经是另一份内容，交给 watcher / 库体检那条线，别在这里覆盖。
+     *
+     * @returns true = 已复活（调用方 `continue`）；false = 不适用，按正常新增走
+     */
+    const tryRevive = (
+      dup: { id: number; rel_path: string; missing: number },
+      target: TargetDir,
+      name: string,
+      src: string,
+      hash: string
+    ): boolean => {
+      const rel = toRel(target.path, name)
+      if (dup.missing !== 1 || dup.rel_path.toLowerCase() !== rel.toLowerCase()) return false
+      const abs = join(libPath, ...dup.rel_path.split('/'))
+      if (existsSync(abs)) return false
+      mkdirSync(dirname(abs), { recursive: true })
+      if (mode === 'move') moveFileSync(src, abs)
+      else copyFileSync(src, abs)
+      const st2 = statSync(abs)
+      if (!inTx) { db.exec('BEGIN'); inTx = true }
+      db.prepare('UPDATE assets SET size=?, file_mtime=?, content_hash=?, missing=0 WHERE id=?').run(
+        st2.size,
+        Math.floor(st2.mtimeMs),
+        hash,
+        dup.id
+      )
+      // 用户视角就是"这个素材回来了" → 计入 added。
+      // 刻意**不新增** `revived` 字段：`importFiles` 的返回形状必须逐字节保持原样
+      // （13 套冒烟在结构上盯着它，见 `dirsCreated` 那段注释的做法）。
+      added++
+      batchInserts++
+      if (batchInserts >= BATCH) commitBatch()
+      return true
+    }
+
     for (const entry of entries) {
       const src = entry.src
       try {
@@ -265,15 +322,28 @@ function runImport(opts: RunImportOptions): { importId: number } {
         if (!type) { skipped++; continue }
 
         const hash = contentHash(src)
-        if (dedupe && dupStmt.get(hash)) { skipped++; continue }
+        const dup = dedupe
+          ? (dupStmt.get(hash) as { id: number; rel_path: string; missing: number } | undefined)
+          : undefined
+        // 活行命中 = 库里确实还有这份内容 → 跳过（原语义不变）
+        if (dup && dup.missing === 0) { skipped++; continue }
 
         // 目标目录**放在去重判定之后**解析：全是重复文件的子目录不会在库里留下空文件夹
         const target = resolveDir(entry.relDir)
+        const origName = basename(src)
+
+        // 命中失效行、且是同一目录同名 → 复活它（保留用户标注），不新增行
+        if (dup && tryRevive(dup, target, origName, src, hash)) continue
 
         // 目标目录已有同名文件 → 自动换一个不冲突的名字（`名字 (1).png`），
         // 绝不覆盖也不跳过。规则与移动/复制/重命名共用 `uniqueName`。
-        const origName = basename(src)
-        const name = uniqueName(target.dest, origName)
+        //
+        // ⚠️ `extraTaken` 不能省：`rel_path` 有 UNIQUE，而「文件已被外部删掉、记录还在」的
+        // missing 行在磁盘上完全看不出来（existsSync 恒 false）。不把它算进来就会算出同一个
+        // 名字，文件已经 copy 进库、INSERT 才抛 `UNIQUE constraint failed: assets.rel_path`
+        // —— 用户看到裸英文 SQL 报错，而且那个文件**永远不会被索引**（watcher 的 add 也会因
+        // rel_path 已存在而 skip），卡片永久是灰的。判据见 `db.relPathTaken`。
+        const name = uniqueName(target.dest, origName, (n) => relPathTaken(db, toRel(target.path, n)))
         const dest = join(target.dest, name)
 
         // ⚠️ 用 `moveFileSync`，别裸调 `renameSync`：跨盘（库在 D:、源在 C:）时 rename 必失败
@@ -293,11 +363,20 @@ function runImport(opts: RunImportOptions): { importId: number } {
         if (batchInserts >= BATCH) commitBatch()
       } catch (err) {
         failed.push({ path: src, error: String((err as Error).message ?? err) })
-      }
-      done++
-      if (done % 50 === 0 || done === total) {
-        opts.onProgress?.({ importId, done, total })
-        BrowserWindow.getAllWindows()[0]?.webContents.send('import:progress', { importId, done, total })
+      } finally {
+        /*
+         * 进度计数必须放在 `finally`：上面有多处 `continue`（格式不支持 / 内容重复 /
+         * 复活成功），`continue` 会跳过循环体尾部、但**一定会执行 finally**。
+         *
+         * 以前写成"循环体末尾 done++"，于是每个被跳过的文件都不计数 → done 永远小于 total：
+         * 进度条停在半截（全是重复时一条进度事件都不发），`done === total` 的收尾广播
+         * 永远不触发，只能靠 `import:done` 硬关浮层。
+         */
+        done++
+        if (done % 50 === 0 || done === total) {
+          opts.onProgress?.({ importId, done, total })
+          BrowserWindow.getAllWindows()[0]?.webContents.send('import:progress', { importId, done, total })
+        }
       }
     }
     // 收尾提交最后不足一批的剩余（`inTx === false` 时是空操作，不会再碰已提交的批次）。
@@ -308,7 +387,32 @@ function runImport(opts: RunImportOptions): { importId: number } {
     opts.onDone?.(result)
     BrowserWindow.getAllWindows()[0]?.webContents.send('import:done', result)
   })().catch((e) => {
-    opts.onDone?.({ importId, added: 0, skipped: 0, renamed: 0, failed: [{ path: '*', error: String(e) }] })
+    /*
+     * 顶层异常也**必须**走完 done 通道。
+     *
+     * 这条不是"补个日志"，是修一个能把界面锁死的缺陷：渲染层的导入浮层只认
+     * `import:done` 来清 `assets.importing`（App.vue），而 IPC 侧 `opts.onDone` 恒为
+     * undefined（main.ts 只传 paths/folderId/mode）—— 以前这里只调了那个不存在的回调，
+     * 于是「选好文件后目标文件夹刚好被删」「导入途中库被关掉导致 db 已关闭」这类
+     * 异步块内的抛错，会让用户**一点反应都没有**；若抛错发生在首个 progress 之后，
+     * `.import-overlay`（position:fixed; inset:0; z-index:100）就永久挡住整个窗口，只能重启。
+     *
+     * 形状与成功分支严格对齐：先回调（给冒烟/内部调用方），再广播（给渲染层）。
+     * 回调自己抛错不能把广播一起带走，所以单独 try。
+     */
+    const result: ImportResult = {
+      importId,
+      added: 0,
+      skipped: 0,
+      renamed: 0,
+      failed: [{ path: '*', error: String((e as Error)?.message ?? e) }]
+    }
+    try {
+      opts.onDone?.(result)
+    } catch {
+      /* 回调抛错不能挡住下面的 IPC 广播 */
+    }
+    BrowserWindow.getAllWindows()[0]?.webContents.send('import:done', result)
   })
 
   return { importId }

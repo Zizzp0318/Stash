@@ -17,6 +17,30 @@ export function escapeLike(s: string): string {
 }
 
 /**
+ * 索引里是否已经有人占着这条 `rel_path`（`exceptId` 用来排除"自己"）。
+ *
+ * 为什么需要它（本项目的复发型缺陷，"磁盘判据 ≠ 索引判据"）：
+ * `assets.rel_path` 是 `UNIQUE NOT NULL`，而**文件已被外部删掉的行仍然占着它**（`missing=1`）——
+ * 这种行在磁盘上完全看不出来，`existsSync` 一律返回 false。于是「只查磁盘」的命名逻辑
+ * （`naming.uniqueName` 唯一的默认判据）会算出同一个名字，写库时才撞 UNIQUE：
+ *   · 导入：文件已经 copy 进库，INSERT 抛 `UNIQUE constraint failed` → 那张卡永远进不了索引；
+ *   · 移动：文件已经搬走，UPDATE 失败被内层 catch 吞成 failed → 索引还指旧路径，素材当场变失效；
+ *   · 复制：副本落在磁盘上、没有对应行（watcher 也会因 rel_path 已存在而 skip）。
+ * `naming.ts` 早就为此留了 `extraTaken` 扩展点（注释里点名了这条约束），`renameAsset` 也早就在用；
+ * 导入 / 移动 / 复制三处漏了 —— 那正是"改一处漏三处"。判据收在这里，四处共用一份。
+ *
+ * 比较用 `LOWER()`：Windows 文件系统大小写不敏感，`A.png` 与 `a.png` 是同一个文件，
+ * 但 SQLite 的 UNIQUE 是二进制比较、会放它们过去 —— 与 `renameAsset` 的既有口径一致。
+ */
+export function relPathTaken(db: DB, relPath: string, exceptId?: number): boolean {
+  const row =
+    exceptId == null
+      ? db.prepare('SELECT 1 AS x FROM assets WHERE LOWER(rel_path)=LOWER(?) LIMIT 1').get(relPath)
+      : db.prepare('SELECT 1 AS x FROM assets WHERE LOWER(rel_path)=LOWER(?) AND id<>? LIMIT 1').get(relPath, exceptId)
+  return !!row
+}
+
+/**
  * 当前库 schema 版本号（**单一真相源**）。
  *
  * 库是一个可被任意版本软件打开的普通目录，索引 `.stash` 里必须能回答两个问题：

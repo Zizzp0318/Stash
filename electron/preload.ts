@@ -79,6 +79,8 @@ contextBridge.exposeInMainWorld('stash', {
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线 */
     paste: (paths: string[], folderId?: number | null) => ipcRenderer.invoke('asset:paste', { paths, folderId }),
     setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds }),
+    /** 一批素材的标签分布（tagId → 命中数）：批量打标浮层的三态，一条 SQL 算完 */
+    tagCounts: (ids: number[]) => ipcRenderer.invoke('asset:tag-counts', ids),
     /**
      * 批量挂 / 摘标签（多选批量条用）。
      * **追加语义**：attach 只往素材上加，不覆盖已有的其他标签；detach 只摘指定标签。

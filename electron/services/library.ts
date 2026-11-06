@@ -187,7 +187,12 @@ export function mkdirChild(parentPath: string, rawName: string): { id: number; p
     if (!p) throw new Error('ERR_FOLDER_NOT_FOUND')
   }
   const rel = parent ? `${parent}/${name}` : name
-  if (db.prepare('SELECT id FROM folders WHERE path=?').get(rel)) throw new Error('ERR_FOLDER_EXISTS')
+  // ⚠️ 大小写不敏感比较：Windows 的文件系统里 `Photos` 与 `photos` 是**同一个目录**，
+  // 而 SQLite 的 `path=?` 是二进制比较、会放它过去 —— 于是 mkdirSync 成功（目录已存在也没关系），
+  // ensureFolderRows 又为同一个目录插第二条 folders 行：侧栏出现两个文件夹、素材计数被劈成两半，
+  // 同一个文件还能被两条不同大小写的 rel_path 各索引一次。
+  // 对照：同文件的 `renameFolder` 专门处理了 `caseOnly`（老名 → 新名仅大小写），说明这里当年是漏改。
+  if (db.prepare('SELECT id FROM folders WHERE LOWER(path)=LOWER(?)').get(rel)) throw new Error('ERR_FOLDER_EXISTS')
   return mkdirRel(rel)
 }
 
@@ -752,9 +757,16 @@ export function ensureFolderRows(db: DB, parts: string[]): { id: number; path: s
   let lastId = 0
   for (const part of parts) {
     cur = cur ? `${cur}/${part}` : part
-    const exist = db.prepare('SELECT id FROM folders WHERE path=?').get(cur) as { id: number } | undefined
+    // 大小写不敏感查找，命中后**沿用库里存的大小写**继续往下拼。
+    // 两件事都不能省：① 找不到就会为同一个物理目录插第二条 folders 行（Windows 上
+    // `Photos` 与 `photos` 是同一个目录）；② 不改写 `cur` 的话，子孙路径会拼成
+    // `photos/子目录` 这种库里不存在的写法，后续按 path 查 folders 全部落空。
+    const exist = db.prepare('SELECT id, path FROM folders WHERE LOWER(path)=LOWER(?)').get(cur) as
+      | { id: number; path: string }
+      | undefined
     if (exist) {
       lastId = exist.id
+      cur = exist.path
     } else {
       const r = db.prepare('INSERT INTO folders(parent_id,path,name,created_at) VALUES(?,?,?,?)').run(parentId, cur, part, Date.now())
       lastId = Number(r.lastInsertRowid)

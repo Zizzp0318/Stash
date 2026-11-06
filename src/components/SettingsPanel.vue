@@ -246,7 +246,8 @@ async function cleanMissing(): Promise<void> {
   assets.notify('info', parts.join('、'))
   scan.value = null
   await loadLibStats()
-  await assets.refresh()
+  // 清理失效记录会删掉列表里的行，但用户"看的是哪一批"没变 → 保住浏览深度
+  await assets.refresh({ keepDepth: true })
   await lib.refreshCounts()
 }
 
@@ -332,7 +333,8 @@ async function rescanMeta(): Promise<void> {
     assets.notify('error', `重新提取失败：${r.error ?? '未知原因'}`)
     return
   }
-  await assets.refresh()
+  // 重扫是后台任务，结果会在 meta:done 时再刷一次；这里先保住浏览深度
+  await assets.refresh({ keepDepth: true })
   await assets.reloadDetail()
   assets.notify(
     'info',

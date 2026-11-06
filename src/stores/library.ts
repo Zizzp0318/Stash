@@ -269,6 +269,19 @@ export const useLibraryStore = defineStore('library', () => {
     if (c.data) counts.value = c.data
   }
 
-  return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, forgetLibrary, refreshCounts, loadMeta,
+  /**
+   * 「占用空间」的重算信号（侧栏底部那一行）。
+   *
+   * 为什么需要它：那个数字是「素材字节 + 缓存字节」，侧栏只 watch `counts.total` 来触发重算。
+   * 而**压缩**（原地替换、体积大降）与**文本保存**（内容变长变短）都只改 `size`、不改条数 ——
+   * 条数没变 → 不触发 → 数字停在操作前，和刚弹出的「已压缩 N 张，省下 X MB」自相矛盾，
+   * 用户只能手动点那一行才会更新。凡改了文件体积但不改条数的路径，收尾调一次 `bumpUsage()`。
+   */
+  const usageRev = ref(0)
+  function bumpUsage(): void {
+    usageRev.value++
+  }
+
+  return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, forgetLibrary, refreshCounts, usageRev, bumpUsage, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo }
 })

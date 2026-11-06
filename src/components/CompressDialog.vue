@@ -11,6 +11,7 @@
 // 选项直接读写全局设置（同一个 `compress` 段，设置面板里也有），所以这里改一次就记住了。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useAssetStore } from '../stores/assets'
+import { useLibraryStore } from '../stores/library'
 import { useSettingsStore } from '../stores/settings'
 import { fmtSize } from '../utils/format'
 import type { StashCompressSummary, StashSettingsChoices } from '../env'
@@ -82,9 +83,13 @@ async function run(): Promise<void> {
     return
   }
   announce(r.data)
-  // 文件名 / 路径 / 体积都变了，列表与详情都得重拉
-  await assets.refresh()
+  // 文件名 / 路径 / 体积都变了，列表与详情都得重拉。
+  // keepDepth：压缩不改变"看的是哪一批"，把用户弹回第一页是纯打扰（尤其批量压几十张时）。
+  await assets.refresh({ keepDepth: true })
   await assets.reloadDetail()
+  // 体积大降但**条数没变** → `counts.total` 不会动，侧栏「占用空间」得靠这个信号重算，
+  // 否则数字停在压缩前，和刚弹出的「省下 X MB」自相矛盾。
+  useLibraryStore().bumpUsage()
   emit('close')
 }
 

@@ -132,12 +132,25 @@ function onTagEnter(e: KeyboardEvent): void {
   void confirmTag()
 }
 
+/**
+ * 新建文件夹 / 标签的**提交闸**。
+ *
+ * 这两处各有两条提交入口：回车（`@keydown.enter`）与失焦（`@blur`）。回车之后、IPC 还没返回时
+ * 焦点若移出（用户顺手点一下网格或侧栏别处），blur 会拿**同一个名字**再提交一次 ——
+ * 第二次必然返回 `ERR_FOLDER_EXISTS` / `ERR_TAG_EXISTS`，于是弹一条红字「新建失败：已存在同名」，
+ * 而那个文件夹其实**已经建好了**。同文件的 `commitDraft` 早就有 `draftSeq` 防重入，这两处漏了。
+ */
+let folderSubmitting = false
+let tagSubmitting = false
+
 async function confirmFolder(): Promise<void> {
+  if (folderSubmitting) return
   const name = newFolderName.value.trim()
   if (!name) {
     creatingFolder.value = false
     return
   }
+  folderSubmitting = true
   try {
     // 顶部 ＋ 统一建在库根目录；子级嵌套走文件夹右键菜单
     const r = await window.stash.folder.mkdirChild('', name)
@@ -147,15 +160,19 @@ async function confirmFolder(): Promise<void> {
     newFolderName.value = ''
   } catch (e) {
     fail(`新建文件夹失败：${errText((e as Error).message)}`)
+  } finally {
+    folderSubmitting = false
   }
 }
 
 async function confirmTag(): Promise<void> {
+  if (tagSubmitting) return
   const name = newTagName.value.trim()
   if (!name) {
     creatingTag.value = false
     return
   }
+  tagSubmitting = true
   try {
     const r = await window.stash.tag.create({ name })
     if (!r.ok) throw new Error(r.error ?? '创建失败')
@@ -164,6 +181,8 @@ async function confirmTag(): Promise<void> {
     newTagName.value = ''
   } catch (e) {
     fail(`新建标签失败：${String((e as Error).message ?? e)}`)
+  } finally {
+    tagSubmitting = false
   }
 }
 
@@ -561,7 +580,9 @@ const usageTitle = computed(() => {
   return `素材 ${fmtSize(u.assetsBytes)} · 缩略图缓存 ${fmtSize(u.thumbsBytes)}（点一下重新统计）`
 })
 
-watch(() => lib.counts.total, scheduleUsage)
+// 条数变了（导入/删除）与体积变了（压缩/文本保存）都要重算；
+// 后者不改条数，只靠 `usageRev` 这个显式信号（见 stores/library 的说明）
+watch([() => lib.counts.total, () => lib.usageRev], scheduleUsage)
 
 onMounted(() => {
   window.addEventListener('keydown', onKeyDown)

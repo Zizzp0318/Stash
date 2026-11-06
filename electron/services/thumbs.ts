@@ -9,7 +9,7 @@ import sharp, { type Sharp, type Metadata } from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
-import { relFromLib } from './paths'
+import { isThumbHash, relFromLib } from './paths'
 import { thumbSinkWhere } from './derived'
 
 export const SIZES = { grid: 320, detail: 800 } as const
@@ -53,7 +53,18 @@ function quality(): number {
   return getSettings().thumbs.quality
 }
 
+/**
+ * `.thumbs/{hash}/{size}.webp` 的绝对路径。
+ *
+ * ⚠️ 这里的 `throw` 是**最后一道闸**，不是常规分支：`paths.ts` 明确要求「凡是用 hash 拼路径
+ * 或删缓存的代码，必须先过 `isThumbHash`」，因为 `content_hash` 一旦被写成 `..` 这类脏值，
+ * `join(lib, '.thumbs', '..')` 会归一成**库根**，缩略图就被写到 `.thumbs` 之外去了。
+ * 本项目其余五处（assets / library / compress / watcher / preview）都校验了，只有这里漏 ——
+ * 而它恰恰是写 `.thumbs` 的主路径。调用方（`ensureOne` / `ensureBatch`）现在都先过类型守卫，
+ * 所以这个 throw 正常永不触发；真触发了说明新调用点忘了守卫，宁可报错也别写脏文件。
+ */
 function thumbFile(hash: string, size: ThumbSize): string {
+  if (!isThumbHash(hash)) throw new Error('ERR_BAD_CONTENT_HASH')
   return join(requireCurrent().path, '.thumbs', hash, `${size}.webp`)
 }
 
@@ -233,9 +244,11 @@ function isFullScan(count: number): boolean {
  * 素材行里的 hash —— 见 `ensureThumb` 与 `GalleryGrid.onImgErr` 的注释。
  */
 async function ensureOne(asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }, size: ThumbSize): Promise<{ path: string; generated: boolean; hash: string } | null> {
-  if (!asset.content_hash) return null
-  const out = thumbFile(asset.content_hash, size)
-  if (existsSync(out)) return { path: out, generated: false, hash: asset.content_hash }
+  // 形状不合法的 hash 一律当"没有 hash"：不拿它拼路径（见 thumbFile 的说明）
+  const hash = asset.content_hash
+  if (!isThumbHash(hash)) return null
+  const out = thumbFile(hash, size)
+  if (existsSync(out)) return { path: out, generated: false, hash }
 
   const libPath = requireCurrent().path
   const abs = join(libPath, ...asset.rel_path.split('/'))
@@ -277,7 +290,7 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
       }
     }
     renameTmp(tmp, out)
-    return { path: out, generated: true, hash: asset.content_hash }
+    return { path: out, generated: true, hash }
   } catch {
     try { unlinkSync(tmp) } catch { /* ignore */ }
     return null
@@ -447,7 +460,7 @@ async function generatePlaceholder(key: string, type: string): Promise<string> {
  * 取法：优先用 sharp 的 `autoOrient`（sharp 0.35.4 实测提供）；它缺失时按
  * `orientation ∈ {5,6,7,8}`（这四种需要转置/旋转 90°）手动交换宽高；都没有就保持原样。
  */
-function orientedDims(m: Metadata): { width: number; height: number } {
+export function orientedDims(m: Metadata): { width: number; height: number } {
   const ao = m.autoOrient as { width?: number; height?: number } | undefined
   if (ao && typeof ao.width === 'number' && typeof ao.height === 'number' && ao.width > 0 && ao.height > 0) {
     return { width: ao.width, height: ao.height }
@@ -808,10 +821,12 @@ export function ensureBatch(
   const useDirSet = size === 'grid' && !stale && assets.length > SMALL_BATCH_MAX
   const haveGrid = useDirSet ? thumbHashDirs() : null
   const fresh = assets.filter((a) => {
-    if (!a.content_hash) return false
+    // 形状校验而不是裸 `!hash`：脏值（`..` / 手改 DB）不能拿去拼 `.thumbs` 下的路径
+    const h = a.content_hash
+    if (!isThumbHash(h)) return false
     if (sink.has(a.id)) return true // 索引字段欠账：缩略图在也要跑一遍（见 indexFieldsSinkIds 的注释）
-    if (haveGrid) return !haveGrid.has(a.content_hash)
-    return !existsSync(thumbFile(a.content_hash, size))
+    if (haveGrid) return !haveGrid.has(h)
+    return !existsSync(thumbFile(h, size))
   })
   // 全量批次已经用逐条判断把整库重新捞了一遍 → 目录集合重新可信，标记可以洗白了。
   // （小批次不消费：否则紧随其后的全量回填又会被目录集合骗过去。）

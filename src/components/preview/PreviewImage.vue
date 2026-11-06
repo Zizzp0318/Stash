@@ -26,6 +26,49 @@ const stage = ref<HTMLElement | null>(null)
 const imgEl = ref<HTMLImageElement | null>(null)
 const bigLoaded = ref(false)
 let pz: ReturnType<typeof Panzoom> | null = null
+/**
+ * 我们自己挂的 wheel 监听（元素 + 处理函数）—— 存引用才摘得掉。
+ *
+ * 为什么必须单独记账：`@panzoom/panzoom` 的 `destroy()` 只解绑**它自己**绑的
+ * pointerdown/move/up，对调用方外部 `addEventListener` 上去的 wheel 一无所知。
+ * 而 `stage` 是 `v-show`（元素跨图复用），于是每 `setupPz()` 一次就多一个缩放处理器，
+ * 且都闭包着自己那个实例：首图就 setup 两次（url watcher + onBigLoad），
+ * 之后每翻一张再叠一层 → 一次滚轮被 N 个实例各放大一次，画面跳变/回弹，
+ * 残留实例还各自持有元素引用（内存只增不减）。
+ */
+let wheelEl: HTMLElement | null = null
+let wheelHandler: ((e: Event) => void) | null = null
+
+function destroyPz(): void {
+  // 先摘我们自己的监听，再销毁实例（顺序无关，但必须两件都做）
+  if (wheelEl && wheelHandler) wheelEl.removeEventListener('wheel', wheelHandler)
+  wheelEl = null
+  wheelHandler = null
+  pz?.destroy()
+  pz = null
+}
+
+function setupPz(): void {
+  destroyPz()
+  const el = stage.value
+  if (!el) return
+  const inst = Panzoom(el, {
+    maxScale: 8,
+    minScale: 1,
+    step: 0.35,
+    contain: 'outside',
+    panOnlyWhenZoomed: true,
+    cursor: 'grab'
+  })
+  pz = inst
+  // panzoom 文档要求 wheel 监听必须**非 passive**，否则 preventDefault 无效、页面会跟着滚。
+  // 用箭头函数而不是直接传 `inst.zoomWithWheel`：既保住 this 绑定，
+  // 也让 removeEventListener 拿到的是**同一个**函数引用（绑定后的新函数摘不掉）。
+  const onWheel = (ev: Event): void => inst.zoomWithWheel(ev as WheelEvent)
+  el.addEventListener('wheel', onWheel, { passive: false })
+  wheelEl = el
+  wheelHandler = onWheel
+}
 
 /* 底部操作提示：静止 / 离开画面就淡出，别长期压在图片上（规则见 `useIdleHide.ts`）。
    判定区传 `stage` 而不是让它退回父级：`.pv-stage` 是 `v-show`（一直在 DOM 里），
@@ -53,26 +96,6 @@ const fitScale = computed(() => {
   if (!el || !el.naturalWidth) return 1
   return Math.max(1, el.naturalWidth / Math.max(1, el.clientWidth))
 })
-
-function destroyPz(): void {
-  pz?.destroy()
-  pz = null
-}
-
-function setupPz(): void {
-  destroyPz()
-  if (!stage.value) return
-  pz = Panzoom(stage.value, {
-    maxScale: 8,
-    minScale: 1,
-    step: 0.35,
-    contain: 'outside',
-    panOnlyWhenZoomed: true,
-    cursor: 'grab'
-  })
-  // panzoom 文档要求 wheel 监听必须**非 passive**，否则 preventDefault 无效、页面会跟着滚
-  stage.value.addEventListener('wheel', pz.zoomWithWheel, { passive: false })
-}
 
 watch(
   () => url.value,

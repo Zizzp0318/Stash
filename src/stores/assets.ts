@@ -283,19 +283,42 @@ export const useAssetStore = defineStore('assets', () => {
    *
    * ⚠️ 默认行为必须与改动前一字不差：大量调用点与冒烟都依赖它。
    */
+  /**
+   * `refresh` / `loadMore` 的**世代令牌**。
+   *
+   * 为什么必须有（两个真实可复现的交错）：
+   *  ① 外部变更（`library:external`，长拷贝期间每 ~1.4s 一次）会 `await refresh({keepDepth})`，
+   *     用户这时点侧栏换文件夹 → 又发起一次 refresh。两个请求在飞，**先发的可能后到**，
+   *     旧结果无条件 `items.value = rows` 会把新筛选的列表盖掉 —— 侧栏高亮是 B，
+   *     列表里却是 A，用户会以为文件被搬乱了。
+   *  ② 深浏览（>1000 条）时 `refresh` 要发 2~3 个分页 IPC；循环里若重新展开 `...query`，
+   *     中途改筛选会让第 2 段用新条件、第 1 段用旧条件 → concat 出「A 的前 1000 条 + B 的后半段」。
+   *
+   * 所以：入口 `++refreshGen` 取号，每次 `await` 回来先比号，不是最新就整段作废；
+   * 查询条件在入口**一次性快照**，循环里只复用快照。
+   */
+  let refreshGen = 0
+
   async function refresh(opts?: { keepDepth?: boolean }): Promise<void> {
+    const my = ++refreshGen
+    // 查询条件快照：分页补齐要发多个 IPC，循环里再展开 `...query` 就会读到中途被改过的值
+    const q = { ...query, ...deepOpt() }
     loading.value = true
     let rows: StashAssetRow[] | null = null
     let nextTotal = 0
+    let failMsg: string | null = null
     try {
       // 目标深度：默认一页；keepDepth 时「至少一页，且不少于当前已加载的条数」
       const target = opts?.keepDepth ? Math.max(items.value.length, PAGE) : PAGE
       const first = await window.stash.asset.list({
-        ...query,
-        ...deepOpt(),
+        ...q,
         offset: 0,
         limit: Math.min(target, SERVER_LIST_LIMIT_MAX)
       })
+      if (my !== refreshGen) return // 已有更新的一次 refresh 在跑 → 这次的结果作废
+      // ⚠️ 必须判 ok：`{ok:false}` 时静默 return 会让界面停在旧列表 + 旧计数上，
+      // 用户对着早已失效的行继续删/移动，而屏幕上没有任何提示。
+      if (!first.ok) failMsg = first.error ?? '加载失败'
       if (first.data) {
         rows = first.data.items
         nextTotal = first.data.total
@@ -304,11 +327,11 @@ export const useAssetStore = defineStore('assets', () => {
           const want = Math.min(SERVER_LIST_LIMIT_MAX, target - rows.length)
           if (want <= 0) break
           const next = await window.stash.asset.list({
-            ...query,
-            ...deepOpt(),
+            ...q,
             offset: rows.length,
             limit: want
           })
+          if (my !== refreshGen) return // 中途换了一批数据 → 已拼好的部分也不能要
           if (!next.data) break
           nextTotal = next.data.total
           const seen: Set<number> = new Set(rows.map((i) => i.id))
@@ -319,9 +342,15 @@ export const useAssetStore = defineStore('assets', () => {
         }
       }
     } finally {
-      loading.value = false
+      // 只有最新那次才有资格关 loading（旧的那次关掉会把新请求的转圈一起抹了）
+      if (my === refreshGen) loading.value = false
     }
-    if (!rows) return
+    if (my !== refreshGen) return
+    if (!rows) {
+      // 关库/切库导致的失败不提示：用户已经回到欢迎页，弹一条红字只会莫名其妙
+      if (failMsg && failMsg !== 'ERR_NO_LIBRARY') notify('error', `加载素材列表失败：${failMsg}`)
+      return
+    }
     items.value = rows
     total.value = nextTotal
     // 选中项可能已不在列表中（被删/被移走/切换了筛选条件）
@@ -336,9 +365,19 @@ export const useAssetStore = defineStore('assets', () => {
 
   async function loadMore(): Promise<void> {
     if (loading.value || items.value.length >= total.value) return
+    // 记下这次续页属于哪一代：期间若发生过 refresh（换筛选/切库），这批行属于旧列表，必须丢掉 ——
+    // 否则会把 A 的下一页追加到 B 的列表尾巴上。
+    const my = refreshGen
+    const q = { ...query, ...deepOpt() }
+    const offset = items.value.length
     loading.value = true
-    const r = await window.stash.asset.list({ ...query, ...deepOpt(), offset: items.value.length, limit: PAGE })
+    const r = await window.stash.asset.list({ ...q, offset, limit: PAGE })
+    if (my !== refreshGen) return // 换代了：结果作废，loading 由新那次负责收
     loading.value = false
+    if (!r.ok) {
+      notify('error', `加载更多失败：${r.error ?? '未知原因'}`)
+      return
+    }
     if (r.data) {
       const seen = new Set(items.value.map((i) => i.id))
       items.value.push(...r.data.items.filter((i) => !seen.has(i.id)))
@@ -496,7 +535,8 @@ export const useAssetStore = defineStore('assets', () => {
     const lib = useLibraryStore()
     const target = lib.folderById.get(folderId)?.name
     await lib.loadMeta()
-    await refresh()
+    // keepDepth：移动只是把一部分行从这个文件夹挪走，"看到第几屏"没变
+    await refresh({ keepDepth: true })
     // 目标文件夹里已有同名文件时会被自动改成 `名字 (1).ext`，得说清楚，否则用户会以为文件被覆盖了
     const note = renamed ? `（${renamed} 个因重名已自动改名）` : ''
     if (failed.length) notify('error', `${moved} 项已移动，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
@@ -549,7 +589,8 @@ export const useAssetStore = defineStore('assets', () => {
     const pruned = r.data?.pruned
     dropPrunedTagFilter(pruned)
     await lib.loadMeta()
-    await refresh()
+    // keepDepth：批量删除后停在原地比弹回第一页自然（尤其"删完接着看下面的"这种扫库式操作）
+    await refresh({ keepDepth: true })
     const note = prunedNote(pruned)
     const tail = note ? `；${note}` : ''
     if (failed.length) notify('error', `${deleted} 项已删除，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）${tail}`)
@@ -560,20 +601,22 @@ export const useAssetStore = defineStore('assets', () => {
    * 选中集合的标签分布：`tagId → 选中项里挂了它的个数`。
    *
    * 批量打标浮层要显示每个标签的三态（全部挂 / 部分挂 / 都没挂），而列表行
-   * （`StashAssetRow`）**不带 tags** —— 标签只挂在详情对象上。所以打开浮层时
-   * 逐张拉一次详情（并发 invoke；主进程是同步 DB 查询，几十到几百张也是毫秒级）。
-   * 选中规模本来就是用户手框/手点的结果，不值得为它再加一条 IPC。
+   * （`StashAssetRow`）**不带 tags** —— 标签只挂在详情对象上。
+   *
+   * ⚠️ 以前这里是 `Promise.all(ids.map(id => asset.get(id)))`，也就是"每个选中项一次 IPC"。
+   * 框选是能跨屏的（见 GalleryGrid 的 D5），选中上千张时就是上千次往返，主进程被占满、
+   * 界面几秒内没响应。现在收口成服务层的一条 GROUP BY（`asset:tag-counts`）。
    */
   async function selectedTagCounts(): Promise<Record<number, number>> {
     const ids = selectedIds.value.slice()
-    const map: Record<number, number> = {}
-    if (!ids.length) return map
-    const rs = await Promise.all(ids.map((id) => window.stash.asset.get(id)))
-    for (const r of rs) {
-      if (!r.ok || !r.data) continue
-      for (const t of r.data.tags) map[t.id] = (map[t.id] ?? 0) + 1
+    if (!ids.length) return {}
+    const r = await window.stash.asset.tagCounts(ids)
+    if (!r.ok || !r.data) {
+      // 静默返回空表会让浮层把"全都未挂"当成事实画出来 —— 说清楚比猜好
+      notify('error', `读取标签分布失败：${r.error ?? '未知原因'}`)
+      return {}
     }
-    return map
+    return r.data
   }
 
   /**

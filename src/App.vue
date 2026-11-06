@@ -119,8 +119,13 @@ onMounted(async () => {
 
   // 生成参数是**后台异步**扫的（导入后/开库时补扫）。扫完必须把列表与详情重拉一次，
   // 否则卡片角标与详情栏会一直停在「没有 AI 信息」那一版 —— 用户会以为功能没生效。
+  //
+  // ⚠️ 必须 `keepDepth`：这是**纯粹的后台完成事件**，用户没换查询条件。
+  // 大库的补扫可能跑几分钟，用户早就滚到第 N 屏了 —— 不带 keepDepth 会把列表整体换成
+  // 只有 200 条（`PAGE`），锚点一丢，Grid 的布局 watcher 直接 `scrollTop = 0` 把人弹回顶部。
+  // 同文件里 `library:external` 那条路径早就这么写了（见上面 onExternal），这里是漏改。
   window.stash.meta.onDone(async () => {
-    await assets.refresh()
+    await assets.refresh({ keepDepth: true })
     await assets.reloadDetail()
   })
 

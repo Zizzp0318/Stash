@@ -7,7 +7,7 @@ import { uniqueName } from './naming'
 import { derivedCopyCols } from './derived'
 import { moveFileSync, renameWithShortRetrySync } from './fsutil'
 import { isThumbHash, relFromLib, subtreeOfPath, toRel, validateName } from './paths'
-import { escapeLike, type DB } from './db'
+import { escapeLike, relPathTaken, type DB } from './db'
 
 export interface AssetQuery {
   folderId?: number | null
@@ -235,8 +235,9 @@ export function renameAsset(id: number, rawName: string): RenameResult {
   if (wantedAbs.toLowerCase() !== oldAbs.toLowerCase()) {
     // 除了磁盘，还要把索引算进来：`rel_path` 有 UNIQUE 约束，
     // 「记录还在、文件已被外部删掉」的 missing 行在磁盘上完全看不出来（见 naming.ts）
-    const relTaken = (n: string): boolean =>
-      !!db.prepare('SELECT id FROM assets WHERE LOWER(rel_path)=LOWER(?) AND id<>?').get(toRel(dirRel, n), id)
+    // 除了磁盘，还要把索引算进来：`rel_path` 有 UNIQUE 约束，
+    // 「记录还在、文件已被外部删掉」的 missing 行在磁盘上完全看不出来（见 naming.ts / db.relPathTaken）
+    const relTaken = (n: string): boolean => relPathTaken(db, toRel(dirRel, n), id)
     const final = uniqueName(dirAbs, wanted, relTaken)
     if (final !== wanted) {
       name = final
@@ -310,7 +311,12 @@ export function moveAssets(ids: number[], folderId: number): { moved: number; re
           failed.push({ id: row.id, name: row.name, error: '源文件不存在' })
           continue
         }
-        const name = uniqueName(destDir, row.name)
+        // ⚠️ 必须把索引里被占用的 rel_path 也算进来（`exceptId = row.id`）：
+        // 目标文件夹里若有一条 `missing=1` 的同名行（文件被外部删了、记录还在），
+        // 磁盘上完全看不出冲突，只查 existsSync 会算出同一个名字，
+        // 于是文件被搬过去之后 UPDATE 才撞 UNIQUE —— 索引仍指旧路径、素材当场变失效，
+        // 而文件已经躺在目标目录里没人认领。见 db.relPathTaken。
+        const name = uniqueName(destDir, row.name, (n) => relPathTaken(db, toRel(folder.path, n), row.id))
         if (name !== row.name) renamed++
         const dest = join(destDir, name)
         // 搬动同样**不释放**预览读流（理由见 `renameAsset` 那段）：
@@ -396,7 +402,10 @@ export function copyAssets(
           failed.push({ id: row.id, name: row.name, error: '源文件不存在' })
           continue
         }
-        const name = uniqueName(destDir, row.name)
+        // 同 moveAssets：目标 rel_path 被一条 missing 行占着时，只查磁盘会算出同名，
+        // 副本落地后 INSERT 才撞 UNIQUE → 磁盘上多一份没有索引的垃圾文件。
+        // 复制不排除任何 id：即便占用者就是源行本身（复制到同一文件夹），也该让位成 ` (1)`。
+        const name = uniqueName(destDir, row.name, (n) => relPathTaken(db, toRel(target.path, n)))
         if (name !== row.name) renamed++
         const dest = join(destDir, name)
         copyFileSync(src, dest)
@@ -645,6 +654,31 @@ export function bulkUpdateTags(
   return { attached, detached, pruned }
 }
 
+/**
+ * 一批素材的标签分布：`tagId → 命中素材数`（批量打标浮层的三态靠它）。
+ *
+ * 为什么要有这条：以前渲染层是「每个选中项各发一次 `asset:get`」再在前端累加
+ * （`stores/assets.ts` 的 `selectedTagCounts`）。框选上千张 = 上千次 IPC，
+ * 主进程每次都要同步查库 + 查该素材的 tags —— 实测界面会卡死几秒。
+ * 这里一条 GROUP BY 就算完，往返固定为 1 次。
+ *
+ * 不校验 id 是否存在：不入库的 id 天然不进结果集，前端拿到的计数只会偏小不会错——
+ * 而调用方（批量条）的选中集本来就来自当前列表。
+ */
+export function tagCountsFor(ids: number[]): Record<number, number> {
+  const { db } = requireCurrent()
+  const out: Record<number, number> = {}
+  // 去重 + 只留整数：入参来自渲染层，别把重复 id 变成重复的占位符
+  const list = Array.from(new Set((ids ?? []).filter((x) => Number.isInteger(x))))
+  if (!list.length) return out
+  const ph = list.map(() => '?').join(',')
+  const rows = db
+    .prepare(`SELECT tag_id AS t, count(*) AS c FROM asset_tags WHERE asset_id IN (${ph}) GROUP BY tag_id`)
+    .all(...list) as Array<{ t: number; c: number }>
+  for (const r of rows) out[r.t] = r.c
+  return out
+}
+
 export function listTags(): unknown[] {
   const { db } = requireCurrent()
   return db.prepare('SELECT id, name, color FROM tags ORDER BY name').all()
@@ -795,12 +829,28 @@ export function revealAsset(id: number): { revealed: boolean } {
   return { revealed: true }
 }
 
-/** 侧栏计数：总数 + 按文件夹直挂数 + 按标签数（子树聚合由渲染层按路径前缀计算） */
+/**
+ * 侧栏计数：总数 + 按文件夹直挂数 + 按标签数（子树聚合由渲染层按路径前缀计算）。
+ *
+ * ⚠️ **口径不变量：这里的三个数字必须与 `listAssets()` 的行数同一口径，即「不过滤 `missing`」。**
+ *
+ * 为什么：网格是**刻意**把 `missing=1` 的行也渲染出来的（`.card.missing { opacity: .4 }`，
+ * 库体检的注释也依赖"界面上表现为一张点不开的灰卡"这个表现）。而列表查询没有任何 `missing`
+ * 条件（`AssetQuery.missing` 只在调用方显式传入时才生效，渲染层从不传）→ 列表含失效行。
+ * 以前 `counts` 却在 total/byFolder 上写了 `WHERE missing=0`（byTag 又没写，三个数字各说各话），
+ * 于是用户会看到两种自相矛盾的界面：
+ *   · 侧栏「所有素材 12」，网格里却有 14 张卡（含 2 张灰卡）；
+ *   · 带筛选时工具栏显示「14 / 共 12 个匹配」—— 分子比分母还大。
+ *
+ * 「有效素材 / 占用空间」是**另一套口径**，只属于库体检与占用统计（`health.libraryStats` /
+ * `health.libraryUsage`，那里同样排除 missing，因为死文件不占磁盘）。两套口径各自有名字，
+ * 不要互相借。
+ */
 export function counts(): { total: number; byFolder: Record<string, number>; byTag: Record<string, number> } {
   const { db } = requireCurrent()
-  const total = (db.prepare('SELECT count(*) AS c FROM assets WHERE missing=0').get() as { c: number }).c
+  const total = (db.prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
   const byFolder: Record<string, number> = {}
-  for (const r of db.prepare('SELECT folder_id AS f, count(*) AS c FROM assets WHERE missing=0 GROUP BY folder_id').all() as Array<{ f: number; c: number }>) {
+  for (const r of db.prepare('SELECT folder_id AS f, count(*) AS c FROM assets GROUP BY folder_id').all() as Array<{ f: number; c: number }>) {
     byFolder[String(r.f)] = r.c
   }
   const byTag: Record<string, number> = {}

@@ -6,11 +6,22 @@ export function fmtSize(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+/**
+ * 时长：1 小时以内 `mm:ss`，满 1 小时进位成 `h:mm:ss`。
+ *
+ * ⚠️ 进位这条不能省：以前 90 分钟会显示成 `90:00`，而播放条（`PreviewPlayerBar` 的 `fmt`）
+ * 同一份数据显示 `1:30:00` —— 两套口径并存，用户会以为时长算错了。
+ * 卡片的「尺寸」列、列表行、详情栏都读这里（`dimsOnly`）。
+ * 1 小时以内保持**零填充**的 `mm:ss`（与历史显示一致，不因为这条修复改变既有观感）。
+ */
 export function fmtDuration(ms: number | null | undefined): string {
   if (!ms || ms <= 0) return ''
-  const s = Math.round(ms / 1000)
-  const m = Math.floor(s / 60)
-  return `${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+  const total = Math.round(ms / 1000)
+  const s = total % 60
+  const m = Math.floor(total / 60) % 60
+  const h = Math.floor(total / 3600)
+  const ss = String(s).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${String(m).padStart(2, '0')}:${ss}`
 }
 
 export function fmtDate(ts: number): string {

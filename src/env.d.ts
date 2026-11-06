@@ -142,6 +142,11 @@ export interface StashAssetApi {
   }) => Promise<{ ok: boolean; data?: { total: number; items: StashAssetRow[] }; error?: string }>
   counts: () => Promise<{ ok: boolean; data?: { total: number; byFolder: Record<string, number>; byTag: Record<string, number> }; error?: string }>
   get: (id: number) => Promise<{ ok: boolean; data?: StashAssetDetail; error?: string }>
+  /**
+   * 一批素材的标签分布（`tagId → 命中素材数`）。
+   * 批量打标浮层用它渲染三态；**不要**退化成"每个 id 各发一次 get"（框选上千张会卡死主进程）。
+   */
+  tagCounts: (ids: number[]) => Promise<{ ok: boolean; data?: Record<number, number>; error?: string }>
   update: (id: number, patch: { rating?: number; isFav?: boolean; note?: string }) => Promise<{ ok: boolean; data?: null; error?: string }>
   /** 批量评分 / 喜欢 */
   bulkUpdate: (ids: number[], patch: { rating?: number; isFav?: boolean }) => Promise<{ ok: boolean; data?: { updated: number }; error?: string }>
