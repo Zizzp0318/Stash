@@ -4,6 +4,7 @@ import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
 import { isThumbHash, subtreeOfPath, validateName } from './paths'
 import { isBusyRenameError, renameWithRetry } from './fsutil'
+import { uniqueName } from './naming'
 import {
   beginRenameIsolationTrail,
   clearMediaSuppression,
@@ -302,11 +303,28 @@ export async function renameFolder(
   opts: RenameFolderOptions = {}
 ): Promise<{ id: number; path: string; folders: number; assets: number }> {
   // ⚠️ 排队必须在**读行之前**：第二次并发调用要读到第一次的最终状态（row.name === name → 早返回）
-  return withFolderWriteLock(() => renameFolderUnlocked(id, rawName, opts))
+  return withFolderWriteLock(() => relocateUnlocked(id, undefined, rawName, opts))
 }
 
-async function renameFolderUnlocked(
+/** 取库内相对路径的父路径（`a/b/c` → `a/b`；顶层 → `''`） */
+function parentPathOf(rel: string): string {
+  return rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+}
+
+/**
+ * 把文件夹**重新安置**到 `newParentPath` 下并（可选）改名 —— `renameFolder` 与 `moveFolder`
+ * 的共同内核。
+ *
+ * 为什么合并：「换父」与「换名」在实现层是**同一个动作** —— 物理目录搬一次，
+ * 再把 `folders.path` 与 `assets.rel_path` 按前缀批量改写。分成两份就等于把
+ * 「隔离窗口 / 事务回滚 / 监听器重挂 / 盲窗对账」这一整套 200 行复制一遍，
+ * 迟早有一份漏改（本项目已经吃过"改一处漏三处"的亏）。
+ *
+ * `newParentPath === undefined` 表示**保持原父**（纯改名，`renameFolder` 走这条）。
+ */
+async function relocateUnlocked(
   id: number,
+  newParentPath: string | undefined,
   rawName: string,
   opts: RenameFolderOptions
 ): Promise<{ id: number; path: string; folders: number; assets: number }> {
@@ -317,9 +335,13 @@ async function renameFolderUnlocked(
     | undefined
   if (!row) throw new Error('ERR_FOLDER_NOT_FOUND')
   if (row.path.startsWith('.')) throw new Error('ERR_PROTECTED_FOLDER')
-  if (row.name === name) return { id, path: row.path, folders: 0, assets: 0 }
 
-  const parentPath = row.path.includes('/') ? row.path.slice(0, row.path.lastIndexOf('/')) : ''
+  const parentPath = newParentPath ?? parentPathOf(row.path)
+  // 同父同名 = 什么都不用做。移动时这条同时兜住「拖回原处」（用户手抖落回原位置）
+  if (parentPath === parentPathOf(row.path) && row.name === name) {
+    return { id, path: row.path, folders: 0, assets: 0 }
+  }
+
   const newRel = parentPath ? `${parentPath}/${name}` : name
   const oldAbs = resolveInLib(libPath, row.path)
   const newAbs = resolveInLib(libPath, newRel)
@@ -512,7 +534,92 @@ async function renameFolderUnlocked(
 }
 
 /**
- * 挑选并删除「一个素材都没挂」的标签，返回被删掉的标签（供 UI 提示）。
+ * 把文件夹（**连同整棵子树**）移动到另一个文件夹下。
+ *
+ * `targetParentId === null` = 移到**库根**（把子文件夹从某个分类里拖出来）。
+ *
+ * 实现上不新写搬目录：物理 rename、`folders.path` / `assets.rel_path` 的前缀批量改写、
+ * 事务失败回滚、以及那套隔离窗口（媒体抑制 → 泵暂停 → 监听器停摆 → 盲窗对账）
+ * 全在 `relocateUnlocked` 里，这里只负责「算出新位置」并守住三条边界。
+ *
+ * 三条边界（都是**动手前**拦住，不能让它走到 rename 那一步）：
+ *  - 移到自己或自己的子孙里 → `ERR_FOLDER_CYCLE`。物理上 rename 会失败（EINVAL），
+ *    但那时已经暂停过泵、停过监听器，报出来的还是裸错误码；而且这种移动在语义上是死循环。
+ *  - 目标父目录在磁盘上不存在（索引有行、目录被外部删了）→ `ERR_FOLDER_MISSING`。
+ *  - 同名：**自动改名**（`风景 (1)`），与素材移动的口径一致（`uniqueName` 是唯一命名真相）。
+ *    直接报 `ERR_FOLDER_EXISTS` 会让用户"拖过去失败、还得先回去改名"，多两步。
+ *  - 拖回原处（同父）→ 直接返回 0，**必须在算重名之前判**：否则目标位置上那个目录
+ *    就是它自己，`uniqueName` 会认为重名，把 `风景` 改成 `风景 (1)`。
+ */
+export async function moveFolder(
+  id: number,
+  targetParentId: number | null,
+  opts: RenameFolderOptions = {}
+): Promise<{ id: number; path: string; name: string; renamed: boolean; folders: number; assets: number }> {
+  return withFolderWriteLock(() => moveFolderUnlocked(id, targetParentId, opts))
+}
+
+async function moveFolderUnlocked(
+  id: number,
+  targetParentId: number | null,
+  opts: RenameFolderOptions
+): Promise<{ id: number; path: string; name: string; renamed: boolean; folders: number; assets: number }> {
+  const { db, path: libPath } = requireCurrent()
+  const row = db.prepare('SELECT id, path, name FROM folders WHERE id=?').get(id) as
+    | { id: number; path: string; name: string }
+    | undefined
+  if (!row) throw new Error('ERR_FOLDER_NOT_FOUND')
+  if (row.path.startsWith('.')) throw new Error('ERR_PROTECTED_FOLDER')
+
+  let targetPath = ''
+  if (targetParentId != null) {
+    if (targetParentId === id) throw new Error('ERR_FOLDER_CYCLE')
+    const t = db.prepare('SELECT path FROM folders WHERE id=?').get(targetParentId) as
+      | { path: string }
+      | undefined
+    if (!t) throw new Error('ERR_FOLDER_NOT_FOUND')
+    targetPath = t.path
+  }
+
+  // 防环：大小写不敏感比较 —— Windows 上 `Photos` 与 `photos` 是同一个目录
+  const lowerTarget = targetPath.toLowerCase()
+  const lowerSelf = row.path.toLowerCase()
+  if (lowerTarget === lowerSelf || lowerTarget.startsWith(`${lowerSelf}/`)) {
+    throw new Error('ERR_FOLDER_CYCLE')
+  }
+
+  const currentParent = parentPathOf(row.path)
+  // 拖回原处：什么都不做（也避免把自己当成"重名"而改叫「风景 (1)」）
+  if (targetPath === currentParent) {
+    return { id, path: row.path, name: row.name, renamed: false, folders: 0, assets: 0 }
+  }
+
+  // ⚠️ 库根（`targetPath === ''`）不能走 `resolveInLib`：它把空 relPath 判成越界
+  // （`relative(lib, lib) === ''` → `ERR_OUTSIDE_LIBRARY`）。库根就是 libPath 本身。
+  const targetAbs = targetPath ? resolveInLib(libPath, targetPath) : libPath
+  if (!existsSync(targetAbs)) throw new Error('ERR_FOLDER_MISSING')
+
+  // 目标位置重名 → 自动换一个（与素材移动同一个 `uniqueName`，规则不许分裂）。
+  // `relTaken` 把**索引里的 folders 行**也算占用：磁盘上可能还看不出来（行是 dirty 的），
+  // 但 `folders.path` 有 UNIQUE 约束，不提前避开就会在事务里炸约束错。
+  const relTaken = (n: string): boolean => {
+    const rel = targetPath ? `${targetPath}/${n}` : n
+    return !!db.prepare('SELECT 1 FROM folders WHERE LOWER(path)=LOWER(?) AND id<>?').get(rel, id)
+  }
+  const finalName = uniqueName(targetAbs, row.name, relTaken)
+
+  const r = await relocateUnlocked(id, targetPath, finalName, opts)
+  return {
+    id,
+    path: r.path,
+    name: finalName,
+    renamed: finalName !== row.name,
+    folders: r.folders,
+    assets: r.assets
+  }
+}
+
+/**
  *
  * 背景：标签的全部用途就是给素材分类，挂着 0 个素材的标签没有任何信息量 ——
  * 留在侧栏只会显示一个孤零零的 `0`，看起来像 bug（用户就是这么报上来的）。

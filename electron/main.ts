@@ -456,6 +456,9 @@ function bootstrap(): void {
     ipcMain.handle('folder:mkdir', (_e, relPath) => wrap(() => librarySvc.mkdirRel(relPath)))
     ipcMain.handle('folder:mkdir-child', (_e, { parentPath, name }) => wrap(() => librarySvc.mkdirChild(parentPath, name)))
     ipcMain.handle('folder:rename', (_e, { id, name }) => wrap(() => librarySvc.renameFolder(id, name)))
+    // 移动整个文件夹（含子树）：物理目录与索引一起搬，`targetParentId === null` = 库根
+    ipcMain.handle('folder:move', (_e, { id, targetParentId }) =>
+      wrap(() => librarySvc.moveFolder(id, targetParentId)))
     ipcMain.handle('folder:delete', (_e, id) => wrap(() => librarySvc.deleteFolder(id)))
     ipcMain.handle('folder:list', () => wrap(() => librarySvc.listFolders()))
 

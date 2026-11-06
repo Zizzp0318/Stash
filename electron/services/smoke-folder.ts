@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import sharp from 'sharp'
 import {
-  closeCurrent, createLibrary, deleteFolder, forgetLibrary, mkdirChild, openLibrary, renameFolder, requireCurrent
+  closeCurrent, createLibrary, deleteFolder, forgetLibrary, mkdirChild, moveFolder, openLibrary, renameFolder, requireCurrent
 } from './library'
 import { createTag, setTags } from './assets'
 import { importFiles, importFolder } from './importer'
@@ -676,6 +676,58 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         notice: await js(`document.querySelector('.notice-toast')?.textContent.trim() ?? null`)
       }
     }
+    // —— 拖动文件夹的 **UI 绑定**（不真的移动，只验 dragover 的合法/非法判定）——
+    //
+    // 主进程那条链路由 Q 段覆盖；这里专盯「模板里到底有没有把 dragstart/dragover 接上」。
+    // 这类错误主进程测试完全看不见：绑定漏一行，用户就是拖不动，而服务层全绿。
+    //
+    // 只派发 dragover、**不派发 drop**：真 drop 会把「对照/树A」搬走，K 段那些计数断言当场失效。
+    {
+      const ui = await js(`(async () => {
+        const q = (p) => document.querySelector('.side-item[data-folder-path="' + p + '"]')
+        const src = q('对照/树A'), okDst = q('对照/目标'), child = q('对照/树A/树B')
+        if (!src || !okDst || !child) return { missing: true }
+        const dt = new DataTransfer()
+        src.dispatchEvent(new DragEvent('dragstart', { dataTransfer: dt, bubbles: true }))
+        const fire = (el) => {
+          const ev = new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true })
+          el.dispatchEvent(ev)
+          return ev.defaultPrevented
+        }
+        const wait = () => new Promise((r) => setTimeout(r, 40))
+        const goodPrevented = fire(okDst)
+        await wait()
+        const goodOn = okDst.classList.contains('drop-on')
+        const childPrevented = fire(child)
+        await wait()
+        const childOn = child.classList.contains('drop-on')
+        const selfPrevented = fire(src)
+        src.dispatchEvent(new DragEvent('dragend', { dataTransfer: dt, bubbles: true }))
+        return {
+          types: Array.from(dt.types),
+          goodPrevented, goodOn, childPrevented, childOn, selfPrevented
+        }
+      })()`)
+      R.q_ui = ui
+
+      // drop 绑定也要在：拖到自己身上触发一次，断言「不发 IPC、不提示、路径不变」。
+      // （`canDropInto` 对自身返回 false，所以这是一次完全无害的 drop。）
+      const beforeSelfDrop = assetRels().filter((r) => r.startsWith('对照/树A/'))
+      await js(`(() => {
+        const el = document.querySelector('.side-item[data-folder-path="对照/树A"]')
+        const dt = new DataTransfer()
+        el.dispatchEvent(new DragEvent('dragstart', { dataTransfer: dt, bubbles: true }))
+        el.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }))
+        el.dispatchEvent(new DragEvent('dragend', { dataTransfer: dt, bubbles: true }))
+        return true
+      })()`)
+      await sleep(300)
+      R.q_ui_drop_self = {
+        relUnchanged: JSON.stringify(assetRels().filter((r) => r.startsWith('对照/树A/'))) === JSON.stringify(beforeSelfDrop),
+        stillOnDisk: existsSync(abs('对照/树A/树B'))
+      }
+    }
+
     await capture('shot-folder-done.png')
 
     // ==================== K. 侧栏计数与列表口径：都含整棵子树 ====================
@@ -1886,6 +1938,74 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       step(`P2 ${JSON.stringify(R.p_treeE)} / ${JSON.stringify(R.p_treeG)}`)
     }
 
+    // ==================== Q. 拖动文件夹：整棵子树搬家 ====================
+    //
+    // 用户需求：「拖动一个文件夹，文件夹里的文件和子文件夹可以移动到另一个文件夹里，
+    // 相当于整个文件夹移动」。
+    //
+    // 这条链路最容易断的不是 UI，而是**索引**：物理目录搬过去很简单，难的是
+    // `folders.path` 与 `assets.rel_path` 的子树前缀必须整体改写 —— 漏一条，
+    // 那张卡就会变成指向旧路径的灰卡，而磁盘上文件明明还在。
+    step('Q')
+    {
+      const srcQ = mkdirChild('', '移动源Q')
+      const subQ = mkdirChild(srcQ.path, '子层Q')
+      const dstQ = mkdirChild('', '移动目标Q')
+      // 自建临时源目录：`pRoot` / `writeBlob` / `importFilesTo` 都是 P 段的局部变量，
+      // Q 段在块外借不到（能借到也是隐式耦合，P 段一改 Q 就编译不过）。
+      // 用 .txt 而不是 .png：这条测的是"路径搬没搬"，不需要顺带触发缩略图管线。
+      const qSrc = mkdtempSync(join(tmpdir(), 'stash-moveq-'))
+      const qFile = join(qSrc, 'move-q.txt')
+      writeFileSync(qFile, 'move-q payload')
+      await new Promise<void>((resolve) =>
+        importFiles({ paths: [qFile], folderId: subQ.id, mode: 'copy', onDone: () => resolve() })
+      )
+      const relBefore = assetRels().filter((r) => r.endsWith('move-q.txt'))
+      const foldersBefore = folderPaths()
+
+      const moved = await moveFolder(srcQ.id, dstQ.id)
+      // 磁盘判定必须在「移回库根」之前取，否则会被后面的步骤覆盖成假值
+      const diskNew = existsSync(join(libPath, '移动目标Q', '移动源Q', '子层Q', 'move-q.txt'))
+      const diskOldGone = !existsSync(join(libPath, '移动源Q'))
+      const relAfter = assetRels().filter((r) => r.endsWith('move-q.txt'))
+      const foldersAfter = folderPaths()
+
+      // 防环：此时「移动目标Q」是源的父，把它移进源里必须被拒（物理 rename 也会失败，但要在动手前拦住）
+      const cycleErr = await moveFolder(dstQ.id, srcQ.id).then(
+        () => null,
+        (e) => String((e as Error).message ?? e)
+      )
+      // 同父 = no-op（用户手抖落回原处不该报错，也不能把自己改名成「移动源Q (1)」）
+      const noop = await moveFolder(srcQ.id, dstQ.id)
+      // 重名：库根再建一个同名文件夹再移进去 → 自动改成「移动源Q (1)」
+      const dupSrc = mkdirChild('', '移动源Q')
+      const dupMoved = await moveFolder(dupSrc.id, dstQ.id)
+      // 移回库根（把子文件夹从分类里拖出来）
+      const backRoot = await moveFolder(srcQ.id, null)
+
+      R.q_move = {
+        relBefore,
+        relAfter,
+        foldersBefore,
+        foldersAfter,
+        moved,
+        cycleErr,
+        noop,
+        dupMoved: { path: dupMoved.path, name: dupMoved.name, renamed: dupMoved.renamed },
+        backRoot: { path: backRoot.path, folders: backRoot.folders, assets: backRoot.assets },
+        diskNew,
+        diskOldGone,
+        diskBack: existsSync(join(libPath, '移动源Q', '子层Q', 'move-q.txt')),
+        // 搬目录不该重写文件内容 → hash 必须仍是 20 位（证明索引没被"重新导入"式覆盖）
+        hashAfter: (
+          D().prepare("SELECT content_hash AS h FROM assets WHERE rel_path LIKE '%move-q.txt'").get() as
+            | { h?: string }
+            | undefined
+        )?.h ?? ''
+      }
+      step(`Q ${JSON.stringify(R.q_move)}`)
+    }
+
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
     const bCase = (R.b_case ?? {}) as { rejected?: string; rows?: number; onDisk?: boolean }
@@ -2088,6 +2208,22 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       failed?: Array<{ path: string; error: string }>
       relPaths?: string[]; landedInFav?: boolean; layeredOnDisk?: boolean; dotFolders?: string[]
     }
+
+    const q = (R.q_move ?? {}) as {
+      relBefore?: string[]; relAfter?: string[]; foldersBefore?: string[]; foldersAfter?: string[]
+      moved?: { id: number; path: string; folders: number; assets: number }
+      cycleErr?: string | null
+      noop?: { folders: number; assets: number }
+      dupMoved?: { path: string; name: string; renamed: boolean }
+      backRoot?: { path: string; folders: number; assets: number }
+      diskNew?: boolean; diskOldGone?: boolean; diskBack?: boolean; hashAfter?: string
+    }
+
+    const qUi = (R.q_ui ?? {}) as {
+      missing?: boolean; types?: string[]; goodPrevented?: boolean; goodOn?: boolean
+      childPrevented?: boolean; childOn?: boolean; selfPrevented?: boolean
+    }
+    const qUiDrop = (R.q_ui_drop_self ?? {}) as { relUnchanged?: boolean; stillOnDisk?: boolean }
 
     R.checks = {
       // A 多级新建
@@ -2468,7 +2604,41 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         (pG?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 &&
         (pG?.relPaths ?? []).join('|') === '收藏/z.png' &&
         pG?.landedInFav === true && pG?.layeredOnDisk === false &&
-        (pG?.dotFolders ?? ['x']).length === 0
+        (pG?.dotFolders ?? ['x']).length === 0,
+
+      // Q 拖动文件夹（整棵子树搬家）
+      // 返回值本身就带「改了多少行」—— 2 个文件夹（源 + 子层）与 1 个素材都必须被算进去，
+      // 少了就是有子树被漏改（那正是最危险的失败形态：物理搬了、索引还指着旧路径）
+      moveFolderRelocatesTree: q?.moved?.path === '移动目标Q/移动源Q' &&
+        q?.moved?.folders === 2 && q?.moved?.assets === 1,
+      // 素材的 rel_path 跟到新位置（**这一条才是"整棵子树"的证据**：祖先改了、叶子的路径没改）
+      moveFolderIndexFollows: (q?.relBefore ?? []).join('|') === '移动源Q/子层Q/move-q.txt' &&
+        (q?.relAfter ?? []).join('|') === '移动目标Q/移动源Q/子层Q/move-q.txt',
+      // 物理目录也真的搬了（不是只改索引）
+      moveFolderDiskFollows: q?.diskNew === true && q?.diskOldGone === true,
+      // 防环：把父移进子必须拒绝。物理上这时 rename 会失败，但错误会变成裸 EINVAL 甚至先暂停了泵
+      moveFolderRejectsCycle: q?.cycleErr === 'ERR_FOLDER_CYCLE',
+      // 拖回原处 = no-op（且不能因为"目标位置已有同名"把自己改名成「移动源Q (1)」）
+      moveFolderSameParentNoop: q?.noop?.folders === 0 && q?.noop?.assets === 0 &&
+        q?.moved?.path === '移动目标Q/移动源Q',
+      // 目标位置重名 → 自动改名（与素材移动同一套 uniqueName 规则）
+      moveFolderRenamesOnConflict: q?.dupMoved?.renamed === true && q?.dupMoved?.name === '移动源Q (1)',
+      // 移到库根（把子文件夹从分类里拖出来）
+      moveFolderToRoot: q?.backRoot?.path === '移动源Q' && q?.diskBack === true && q?.backRoot?.assets === 1,
+      // 搬目录不该重写文件内容：hash 仍是 20 位，说明索引是按行改的，没有"重新导入"一遍
+      moveFolderKeepsHash: (q?.hashAfter ?? '').length === 20,
+
+      // Q-UI：模板里 dragstart/dragover 真的接上了（主进程测试完全看不见这类错 ——
+      // 绑定漏一行，用户就是拖不动，而服务层全绿）。
+      // `goodOn`（drop-on 高亮）同时证明「合法落点会 preventDefault 且给出视觉反馈」；
+      // `childPrevented === false` 证明拖进自己的子孙**没有**被 preventDefault（浏览器显示禁止光标）。
+      folderDragUiWired: qUi?.missing !== true &&
+        (qUi?.types ?? []).includes('application/x-stash-folder') &&
+        qUi?.goodPrevented === true && qUi?.goodOn === true &&
+        qUi?.childPrevented === false && qUi?.childOn === false &&
+        qUi?.selfPrevented === false,
+      // 拖到自己身上 drop 必须无害：`canDropInto` 拦掉 → 不发 IPC、路径与磁盘都不动
+      folderDropSelfIsNoop: qUiDrop?.relUnchanged === true && qUiDrop?.stillOnDisk === true
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

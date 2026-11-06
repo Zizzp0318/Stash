@@ -45,6 +45,12 @@ export interface StashFolderApi {
   mkdirChild: (parentPath: string, name: string) => Promise<{ ok: boolean; data?: { id: number; path: string }; error?: string }>
   /** 重命名文件夹：物理目录与索引（folders 子树 + assets.rel_path）一起同步 */
   rename: (id: number, name: string) => Promise<{ ok: boolean; data?: { id: number; path: string; folders: number; assets: number }; error?: string }>
+  /**
+   * 移动整个文件夹（含子树）到 `targetParentId` 下；`null` = 库根。
+   *
+   * `renamed` 为真表示目标位置已有同名文件夹，已自动改成 `名字 (1)` —— 调用方要提示用户。
+   */
+  move: (id: number, targetParentId: number | null) => Promise<{ ok: boolean; data?: { id: number; path: string; name: string; renamed: boolean; folders: number; assets: number }; error?: string }>
   /** 删除整个文件夹：直接从磁盘删除，不可恢复（无回收站）。`pruned` = 连带失去全部素材的标签 */
   remove: (id: number) => Promise<{ ok: boolean; data?: { folders: number; assets: number; thumbsRemoved: number; pruned: StashPrunedTag[] }; error?: string }>
   list: () => Promise<{ ok: boolean; data?: Array<{ id: number; parent_id: number | null; path: string; name: string }>; error?: string }>

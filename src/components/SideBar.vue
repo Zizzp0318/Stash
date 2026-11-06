@@ -78,6 +78,104 @@ async function pickTag(id: number): Promise<void> {
   await assets.refresh()
 }
 
+// ==================== 拖动文件夹（连同整棵子树）到另一个文件夹 ====================
+/**
+ * 为什么这里用 **HTML5 原生 DnD**，而网格里的「拖素材到文件夹」是自绘 ghost：
+ * 本功能的拖动源与落点**都在侧栏内**，原生 DnD 自带「禁止光标 / 自动滚动 / Esc 取消」；
+ * 自绘还得自己做命中测试，收益为零。且素材拖拽走 mousedown+mousemove，不会触发
+ * `dragstart` 之类的事件 —— 两套互不干扰，不需要额外开关。
+ *
+ * 落点判定放在渲染层（`canDropInto`）**只是提前反馈**（非法落点显示禁止光标），
+ * 真正的把关在主进程 `moveFolder`：防环、目标缺失、重名改名都在那边，UI 骗不过它。
+ */
+const FOLDER_MIME = 'application/x-stash-folder'
+const draggingFolderId = ref<number | null>(null)
+/** 当前高亮的落点：文件夹 id 或 `'root'`（「所有素材」= 库根） */
+const dropTargetId = ref<number | 'root' | null>(null)
+
+function isFolderDrag(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes(FOLDER_MIME)
+}
+
+/** 拖动源路径（防环判断用） */
+function dragSourcePath(): string {
+  const id = draggingFolderId.value
+  return id == null ? '' : (lib.folderById.get(id)?.path ?? '')
+}
+
+/**
+ * 落点是否合法：
+ * - 不能拖到自己身上，也不能拖进自己的子孙（那会形成环，物理 rename 也必然失败）
+ * - 拖回当前父位置是合法的，只是后端会 early-return（用户手抖落回原处不该报错）
+ */
+function canDropInto(targetPath: string, targetId: number | 'root'): boolean {
+  const srcPath = dragSourcePath()
+  if (!srcPath) return false
+  if (targetId !== 'root' && targetId === draggingFolderId.value) return false
+  const a = srcPath.toLowerCase()
+  const b = targetPath.toLowerCase()
+  return b !== a && !b.startsWith(`${a}/`)
+}
+
+function onFolderDragStart(f: { id: number; path: string }, e: DragEvent): void {
+  draggingFolderId.value = f.id
+  dropTargetId.value = null
+  if (e.dataTransfer) {
+    e.dataTransfer.setData(FOLDER_MIME, String(f.id))
+    // 只设自定义类型时个别 Chromium 版本不启动拖拽，补一个 text/plain（内容不参与判断）
+    e.dataTransfer.setData('text/plain', f.path)
+    e.dataTransfer.effectAllowed = 'move'
+  }
+}
+
+function onFolderDragEnd(): void {
+  draggingFolderId.value = null
+  dropTargetId.value = null
+}
+
+function onFolderDragOver(targetPath: string, targetId: number | 'root', e: DragEvent): void {
+  if (!isFolderDrag(e)) return
+  // 非法落点**不 preventDefault**：浏览器显示禁止光标，也不会派发 drop
+  if (!canDropInto(targetPath, targetId)) {
+    dropTargetId.value = null
+    return
+  }
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+  dropTargetId.value = targetId
+}
+
+function onFolderDragLeave(targetId: number | 'root'): void {
+  if (dropTargetId.value === targetId) dropTargetId.value = null
+}
+
+async function onFolderDrop(targetPath: string, targetId: number | 'root', e: DragEvent): Promise<void> {
+  if (!isFolderDrag(e)) return
+  const srcId = draggingFolderId.value
+  // ⚠️ 顺序：**先判合法再清状态** —— `canDropInto` 依赖 draggingFolderId，清早了会恒判非法
+  const ok = srcId != null && canDropInto(targetPath, targetId)
+  e.preventDefault()
+  dropTargetId.value = null
+  draggingFolderId.value = null
+  if (!ok || srcId == null) return
+
+  const r = await window.stash.folder.move(srcId, targetId === 'root' ? null : targetId)
+  if (!r.ok) {
+    fail(`移动失败：${errText(r.error)}`)
+    return
+  }
+  const where = targetId === 'root' ? '库根' : (lib.folderById.get(targetId)?.name ?? '目标文件夹')
+  await lib.loadMeta()
+  // 整棵子树的 rel_path 都变了 → 列表必须重拉。keepDepth：用户看的是同一批内容，不该被弹回顶部
+  await assets.refresh({ keepDepth: true })
+  if (r.data?.renamed) {
+    // 重名是**自动改名**而不是失败，所以走 warn 色的红条并把新名字说清楚
+    fail(`已移动到「${where}」，但目标位置已有同名文件夹，已重命名为「${r.data.name}」`)
+  } else {
+    assets.notify('info', `已移动「${r.data?.name ?? ''}」到「${where}」（含其中的子文件夹与素材）`)
+  }
+}
+
 // —— 内联新建输入（文件夹 / 标签共用模式）——
 const creatingFolder = ref(false)
 const newFolderName = ref('')
@@ -93,6 +191,9 @@ const FOLDER_ERR: Record<string, string> = {
   ERR_FOLDER_EXISTS: '同级下已存在同名文件夹',
   ERR_FOLDER_NOT_FOUND: '文件夹不存在（可能已被外部删除）',
   ERR_FOLDER_MISSING: '磁盘上找不到该目录，请重新打开库以同步',
+  // 拖动文件夹时把 A 拖进 A 的子孙里（或拖到它自己身上）：物理上 rename 必然失败，
+  // 语义上也是一棵环 —— 动手前就该拦住
+  ERR_FOLDER_CYCLE: '不能把文件夹移动到它自己或它的子文件夹里',
   // 目录内某文件正被占用（缩略图生成中 / 资源管理器或杀软正在读 / 正在预览播放）→ rename 被系统拒绝
   ERR_FOLDER_BUSY: '该文件夹正被占用（可能有文件正在预览/播放，或被其它程序读取），请稍后重试',
   // 删除进行到一半被系统拒绝（目录里有文件被别的程序独占）。**文件可能已经被删掉一部分**，
@@ -600,7 +701,15 @@ onBeforeUnmount(() => {
   <aside class="sidebar">
     <div class="side-scroll">
       <div class="side-section">
-        <div class="side-item" :class="{ active: noFilter }" @click="pickAll">
+        <div
+          class="side-item"
+          :class="{ active: noFilter, 'drop-on': dropTargetId === 'root' }"
+          data-side-root
+          @click="pickAll"
+          @dragover="onFolderDragOver('', 'root', $event)"
+          @dragleave="onFolderDragLeave('root')"
+          @drop="onFolderDrop('', 'root', $event)"
+        >
           <svg viewBox="0 0 14 14" fill="none">
             <rect x="1.4" y="1.4" width="11.2" height="11.2" rx="2.4" stroke="currentColor" stroke-width="1.2" />
             <path d="M1.4 5h11.2" stroke="currentColor" stroke-width="1.2" />
@@ -630,12 +739,21 @@ onBeforeUnmount(() => {
         <template v-for="f in folderRows" :key="f.id">
           <div
             class="side-item"
-            :class="{ active: assets.query.folderId === f.id, 'drop-on': assets.dragOverFolderId === f.id }"
+            :class="{
+              active: assets.query.folderId === f.id,
+              'drop-on': assets.dragOverFolderId === f.id || dropTargetId === f.id
+            }"
             :data-folder-id="f.id"
             :data-folder-path="f.path"
             :style="{ paddingLeft: 8 + f.indent * 13 + 'px' }"
+            :draggable="renamingId !== f.id"
             @click="pickFolder(f)"
             @contextmenu="openMenu($event, f)"
+            @dragstart="onFolderDragStart(f, $event)"
+            @dragend="onFolderDragEnd"
+            @dragover="onFolderDragOver(f.path, f.id, $event)"
+            @dragleave="onFolderDragLeave(f.id)"
+            @drop="onFolderDrop(f.path, f.id, $event)"
           >
             <span
               class="fold-toggle"

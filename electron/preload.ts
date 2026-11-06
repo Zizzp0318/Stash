@@ -41,6 +41,9 @@ contextBridge.exposeInMainWorld('stash', {
     mkdirChild: (parentPath: string, name: string) => ipcRenderer.invoke('folder:mkdir-child', { parentPath, name }),
     /** 重命名：物理目录 + folders 子树 path + assets.rel_path 一并同步 */
     rename: (id: number, name: string) => ipcRenderer.invoke('folder:rename', { id, name }),
+    /** 移动整个文件夹（含子树）到另一个文件夹下；`targetParentId === null` = 移到库根 */
+    move: (id: number, targetParentId: number | null) =>
+      ipcRenderer.invoke('folder:move', { id, targetParentId }),
     /** 删除整个文件夹：物理删除，不可恢复（无回收站） */
     remove: (id: number) => ipcRenderer.invoke('folder:delete', id),
     list: () => ipcRenderer.invoke('folder:list')
