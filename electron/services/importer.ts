@@ -11,10 +11,21 @@ import { toRel } from './paths'
 import type { DB } from './db'
 import { relPathTaken } from './db'
 
-export type AssetType = 'image' | 'video' | 'audio' | 'text'
+/**
+ * 素材类型。
+ *
+ * `'file'` = **能导入、但不能预览**的任意格式（psd / ai / zip / pdf / exe …）。
+ * 它没有对应的预览器，界面上只给一个「用系统默认应用打开」的出口 —— 见 `preview.ts`
+ * 与 `PreviewFile.vue`。为什么不干脆不导入：用户把整个文件夹拖进来时，被静默丢掉的那几个
+ * 正是他最想留住的工程文件；而"看不见文件"比"打不开预览"糟糕得多。
+ */
+export type AssetType = 'image' | 'video' | 'audio' | 'text' | 'file'
 
 /**
- * 扩展名 → 素材类型。**这是素材类型判定的唯一真相源**（`watcher.ts` 也 import 它）。
+ * 扩展名 → 素材类型。**这是「能预览的格式」的唯一真相源**（`watcher.ts` 也 import 它）。
+ *
+ * ⚠️ 不在这张表里的扩展名**不再等于"不导入"**，而是 `typeOfExt` 判成 `'file'`。
+ * 想在导入阶段真正拒掉某个格式，请加到 `BLOCKED_EXT` / `JUNK_NAMES`，别在这里"省略"。
  *
  * ⚠️ **HEIC / HEIF 不支持，别好心加回来**：这份预编译 sharp 的 libheif 不带 HEVC 编解码器 ——
  * 决定性证据是 `sharp(...).heif({ compression: 'hevc' })` 直接抛 `heifsave: Unsupported compression`
@@ -33,6 +44,39 @@ export const EXT_TYPE: Record<string, AssetType> = {
   mp4: 'video', mov: 'video', mkv: 'video', webm: 'video', avi: 'video',
   mp3: 'audio', wav: 'audio', flac: 'audio', aac: 'audio', ogg: 'audio', m4a: 'audio',
   txt: 'text', md: 'text'
+}
+
+/**
+ * **永不导入 / 永不索引**的扩展名：内部临时产物。
+ *
+ * 以前它们靠在 `EXT_TYPE` 里"不存在"被挡掉（`compress.ts` 的 `.stash-compress-*.tmp`
+ * 就吃了这层保护）。放开任意格式导入之后，这层隐含保护会失效 —— 压缩过程中写下的
+ * 临时文件会被 watcher 当成新素材索引进来，所以必须显式列出来。
+ */
+const BLOCKED_EXT = new Set(['tmp'])
+
+/**
+ * **永不导入 / 永不索引**的文件名（小写比较）。系统垃圾不带 `.` 前缀，扩展名白名单挡不住。
+ */
+const JUNK_NAMES = new Set(['thumbs.db', 'desktop.ini'])
+
+/** 是否是系统垃圾文件名（`.DS_Store` 这类点开头的一并由 `startsWith('.')` 挡住） */
+export function isJunkName(name: string): boolean {
+  const n = name.toLowerCase()
+  return JUNK_NAMES.has(n) || n.startsWith('.')
+}
+
+/**
+ * 扩展名 → 素材类型。**「能不能进库」与「是什么类型」的唯一判据**（`watcher.ts` 共用）。
+ *
+ * - 未知扩展名 → `'file'`（能导入、不能预览，界面上给系统打开按钮）
+ * - 内部临时产物 → `null`，调用方必须把它当作"不要这个文件"
+ *
+ * 返回 `null` 而不是抛错，是因为扫目录的调用方本来就在 `continue` 分支上。
+ */
+export function typeOfExt(ext: string): AssetType | null {
+  if (BLOCKED_EXT.has(ext)) return null
+  return EXT_TYPE[ext] ?? 'file'
 }
 
 /**
@@ -79,7 +123,7 @@ export interface ImportFailItem {
 export interface ImportResult {
   importId: number
   added: number
-  /** 因内容重复 / 扩展名不在 EXT_TYPE 被跳过的数量（两个成因共用这一个计数器） */
+  /** 因内容重复 / 内部临时产物被跳过的数量（两个成因共用这一个计数器） */
   skipped: number
   /** 因目标目录已有同名文件、被自动改成 `名字 (1).ext` 的数量 */
   renamed: number
@@ -106,7 +150,7 @@ export interface ImportEntry {
 
 /** 一次扫描的产物 */
 interface CollectResult {
-  /** 真正会尝试导入的条目（**只含 EXT_TYPE 认得的文件**） */
+  /** 真正会尝试导入的条目（任意格式；只排除内部临时产物与系统垃圾） */
   entries: ImportEntry[]
   /** 扫描阶段就已确定要计入 `skipped` 的条数（扩展名不受支持） */
   skipped: number
@@ -332,7 +376,8 @@ function runImport(opts: RunImportOptions): { importId: number } {
         const st = statSync(src)
         if (!st.isFile()) throw new Error('not a file')
         const ext = extname(src).slice(1).toLowerCase()
-        const type = EXT_TYPE[ext]
+        // 未知扩展名 → 'file'（能导入、不能预览）；只有内部临时产物返回 null
+        const type = typeOfExt(ext)
         if (!type) { skipped++; continue }
 
         const hash = contentHash(src)
@@ -468,12 +513,13 @@ export interface ImportFolderArgs {
  *
  * 规则（与 `watcher.ts` 的索引判据同源，别各写一份）：
  * - 递归用**显式栈**而不是函数递归：用户选中的可能是几个层级的资料盘，递归有爆栈风险；
- * - **跳过** `.` 开头的目录与文件名（`.stash*` / `.thumbs` / `.stash-compress-*` 全在其中，
- *   顺带挡掉 `.git` / `.DS_Store` 这类系统垃圾）；
+ * - **跳过** `.` 开头的目录与文件名，以及 `Thumbs.db` / `desktop.ini` 这类系统垃圾
+ *   （判据收在 `isJunkName`，watcher 同步用同一份）；
  * - **跳过**符号链接 / 联接点：Windows 的 junction 能让同一目录无限嵌套，跟进去就是死循环；
  * - 只收 `isFile()`，其他类型（FIFO / socket）静默略过；
- * - 扩展名不在 `EXT_TYPE` 的文件**不进 entries、但计入 `skipped`** —— 这样提示条会显示
- *   「跳过 N 个（重复或格式不支持）」，用户才知道有多少文件没被导进来；
+ * - **任意扩展名都收**：认识的按 `EXT_TYPE` 分类，不认识的记为 `'file'`（能导入、不能预览）。
+ *   只有内部临时产物（`.tmp`）例外 —— 不进 entries、但计入 `skipped`，让提示条显示
+ *   「跳过 N 个（重复或内部临时文件）」，用户才知道有文件没进来；
  * - 空目录不产生条目，因此**也不会在库里建出空文件夹**。
  */
 function scanFolder(rootPath: string): CollectResult {
@@ -492,7 +538,8 @@ function scanFolder(rootPath: string): CollectResult {
     }
     for (const d of dirents) {
       if (d.isSymbolicLink()) continue
-      if (d.name.startsWith('.')) continue
+      // `.` 开头（`.DS_Store` / `.thumbs` / `.stash*`）与系统垃圾名：连目录都不进栈
+      if (isJunkName(d.name)) continue
       const abs = join(cur.abs, d.name)
       const rel = cur.rel ? `${cur.rel}/${d.name}` : d.name
       if (d.isDirectory()) {
@@ -500,8 +547,9 @@ function scanFolder(rootPath: string): CollectResult {
         continue
       }
       if (!d.isFile()) continue
-      const ext = extname(d.name).slice(1).toLowerCase()
-      if (!EXT_TYPE[ext]) {
+      // 未知扩展名**照样收**（`typeOfExt` → 'file'，能导入不能预览）；
+      // 只有内部临时产物（`.tmp`）在这层就丢掉，不占条目也不进条目表。
+      if (!typeOfExt(extname(d.name).slice(1).toLowerCase())) {
         skipped++
         continue
       }

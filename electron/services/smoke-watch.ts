@@ -7,12 +7,12 @@
 //   W1 拷进**库根目录**       → 自动 mkdir「未分类」→ uniqueName 取名 → 物理移入「未分类/」→ 落行（hash 非空）
 //   W2 拷进**外部新建的子目录** → ensureFolderRows 逐级补齐 folders 行 → 落行（hash 非空）
 //   W3 拷进**已存在的库文件夹** → 落行，content_hash 非空 → 缩略图/尺寸/色板管线恢复
-//   W4 扩展名不在 EXT_TYPE（.psd）→ 不索引，且**文件仍留在原处**（不擅自动用户不认的文件）
+//   W4 未知扩展名（.psd）→ **照样索引，type=file**（能导入不能预览）；文件留在原处
 //   W5 以 `.` 开头的目录（任意层级）→ 不索引，且不为它造 folders 行
 //
 // 边界用例：
 //   B1 重名不覆盖（库根放同名文件 → 变成「名字 (1)」且原文件未被碰）
-//   B2 非素材类型（同 W4，独立再断一次「文件没被移动」）
+//   B2 未知格式（同 W4，独立再断一次「文件没被移动」）
 //   B3 隐藏目录（同 W5，独立再断「没建 folders 行」）
 //   B4 嵌套新目录（新建 A/B → folders 出现两行：A 与 A/B）
 //   B5 压缩流程不受影响 → 由 --smoke-compress 负责（本套不重复）
@@ -296,13 +296,41 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       check('W3 没有被误标 missing', row?.missing === 0, String(row?.missing))
     }
 
-    // ==================== W4 + B2 非素材类型 ====================
+    // ==================== W4 + B2 未知格式（可导入 / 不可预览）====================
     {
-      check('W4/B2 .psd 不在 EXT_TYPE → 不索引',
-        count(`SELECT count(*) AS c FROM assets WHERE rel_path='raw.psd'`) === 0 &&
-          count("SELECT count(*) AS c FROM assets WHERE name='raw.psd'") === 0)
-      check('W4/B2 .psd 仍留在库根目录（没被擅自移动/改名）',
-        existsSync(join(lib.path, 'raw.psd')))
+      // 需求变更：以前 `.psd` 这类"不认识的扩展名"一律不索引；现在**照样入库**，
+      // 类型记为 `file`（能看见、能双击用系统默认应用打开，只是没有内置预览器）。
+      // 用户原话：「当添加不支持的格式时，可以导入，但是不能预览」。
+      //
+      // ⚠️ 必须按 **name** 查，不能按 `rel_path='raw.psd'` 查：库根文件会被 watcher 移进
+      // 「未分类」，真实 rel_path 是 `未分类/raw.psd`。旧版正是拿 `rel_path='raw.psd'` 断言
+      // `count === 0` —— 那个条件**永远成立**（无论索引与否都查不到），是一条纯假绿。
+      // 现在改成正向断言后它才第一次真正生效。
+      // 注入验证：把 `typeOfExt` 改回「不在 EXT_TYPE 就返回 null」→ 本条红（查不到行）。
+      const psd = q<{ type?: string; rel_path?: string }>(
+        `SELECT type, rel_path FROM assets WHERE name='raw.psd' LIMIT 1`
+      )
+      check('W4/B2 .psd 被索引且 type=file（未知格式不再被丢弃）',
+        psd?.type === 'file', `type=${psd?.type ?? '-'} rel=${psd?.rel_path ?? '-'}`)
+      check('W4/B2 .psd 仍留在库内（没被擅自改名/删除）',
+        !!psd?.rel_path && existsSync(join(lib.path, ...(psd?.rel_path ?? '').split('/'))),
+        String(psd?.rel_path ?? '-'))
+
+      // 内部临时产物与系统垃圾：放开任意格式后，这层从"隐含保护"变成必须显式挡住。
+      // （压缩过程写的 `.stash-compress-*.tmp` 若被索引，库里会凭空多出素材；
+      //   `Thumbs.db` / `desktop.ini` 则是每个 Windows 文件夹都有的垃圾。）
+      // 正对照 = 等一下 `raw.psd` 那一轮事件被处理完（watcher 的 add 是异步的），
+      // 不额外写文件，避免污染「总素材数」基线。
+      writeFileSync(join(lib.path, 'probe.tmp'), Buffer.from('internal temp'))
+      writeFileSync(join(lib.path, 'Thumbs.db'), Buffer.from('junk'))
+      const psdLanded = await waitDb(
+        () => !!q<{ id?: number }>(`SELECT id FROM assets WHERE name='raw.psd' LIMIT 1`),
+        20000
+      )
+      check('W4 前置：raw.psd 已入库（证明这一轮 watcher 处理过批次）', psdLanded)
+      check('W4 .tmp 与 Thumbs.db 不被索引（内部产物 / 系统垃圾）',
+        count("SELECT count(*) AS c FROM assets WHERE name IN ('probe.tmp','Thumbs.db')") === 0,
+        `tmp=${count("SELECT count(*) AS c FROM assets WHERE name='probe.tmp'")} db=${count("SELECT count(*) AS c FROM assets WHERE name='Thumbs.db'")}`)
     }
 
     // ==================== W5 + B3 隐藏目录 ====================
@@ -365,8 +393,10 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         String(count("SELECT count(*) AS c FROM assets WHERE name LIKE '.stash-compress-%'")))
     }
 
-    // 全场收尾：共 6 行（种子 a.png + root + child + nested + a (1) + ignorectl），无重复、无 missing
-    check('总素材数恰为 6（5 个外部合法文件 + 1 个种子；噪音文件一条都没进）', totalAssets() === 6, String(totalAssets()))
+    // 全场收尾：共 7 行（种子 a.png + root + child + nested + a (1) + ignorectl + raw.psd），
+    // 无重复、无 missing。`raw.psd` 计入是**本轮需求变更的结果**：未知格式不再被丢弃
+    //（以前这里写 6，正是因为 .psd 被静默跳过）。噪音文件仍必须一条都不进。
+    check('总素材数恰为 7（6 个外部合法文件 + 1 个种子；噪音文件一条都没进）', totalAssets() === 7, String(totalAssets()))
     check('全库没有被误标 missing 的行', count('SELECT count(*) AS c FROM assets WHERE missing=1') === 0)
 
     // ==================== DOM + 缩略图（同时证 DB 与 UI 都对了） ====================
@@ -615,18 +645,20 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         )
       }
 
-      // —— C3 未索引的路径被改写 → 什么都不该发生 ——
-      // 用「正对照真图」保证这一轮 watcher 确实处理过批次，而不是靠固定 sleep 猜时间（铁律 G4）
+      // —— C3 file 类型素材被改写 → 正常同步 ——
+      // 旧版这里断的是「未索引的 .psd 被改写后什么都不该发生」；`typeOfExt` 放开未知格式后，
+      // `.psd` 已经是正常素材，改写必须走 change 分支更新 hash。
       {
-        writeFileSync(join(lib.path, 'raw.psd'), Buffer.from('changed but still not a media type'))
-        writeFileSync(relAbs(`${UNCAT}/ctl-c3.png`), await makePng(120, 120, 30))
-        const ctlOk = await waitDb(() => !!rowByRel(`${UNCAT}/ctl-c3.png`), 20000)
-        check('C3 前置：正对照真图已入库（证明这一轮 watcher 确实处理过批次）', ctlOk)
-        check(
-          'C3 未索引的 .psd 被原地改写后仍不产生 assets 行（change 里查不到行就直接返回）',
-          count("SELECT count(*) AS c FROM assets WHERE name='raw.psd'") === 0 &&
-            count("SELECT count(*) AS c FROM assets WHERE rel_path='raw.psd'") === 0
-        )
+        // 同样按 name 查（库根文件被移进「未分类」，rel_path 不是 `raw.psd`）；
+        // 改写也必须写在它**真实所在的位置**，否则写的是库根那个新文件，与这条行无关。
+        const hashOf = (): string =>
+          q<{ content_hash?: string }>(`SELECT content_hash FROM assets WHERE name='raw.psd' LIMIT 1`)?.content_hash ?? ''
+        const psdRel = q<{ rel_path?: string }>(`SELECT rel_path FROM assets WHERE name='raw.psd' LIMIT 1`)?.rel_path ?? ''
+        const psdBefore = hashOf()
+        writeFileSync(join(lib.path, ...psdRel.split('/')), Buffer.from('changed but still a file asset'))
+        const psdSynced = await waitDb(() => hashOf() !== psdBefore, 20000)
+        check('C3 type=file 素材被外部改写后 content_hash 同步更新（change 分支对 file 同样生效）',
+          !!psdBefore && psdSynced, `${psdRel || '-'}｜${psdBefore} -> ${hashOf()}`)
       }
 
       // —— C4 旧 hash 仍被别的素材引用 → 缓存绝不能被删（引用计数保护）——

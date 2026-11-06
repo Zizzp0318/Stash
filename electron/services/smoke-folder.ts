@@ -1767,11 +1767,21 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // —— IF-3 / IF-5：不支持格式计入 skipped + 空目录不建库文件夹 ——
       const treeB = join(pRoot, 'B')
       writeBlob(join(treeB, 'keep.png'), 251)
-      writeBlob(join(treeB, 'x.xyz'), 283)
-      writeBlob(join(treeB, 'readme.pdf'), 317)
+      writeBlob(join(treeB, 'x.xyz'), 283) // 未知格式：能导入、不能预览
+      writeBlob(join(treeB, 'readme.pdf'), 317) // 同上（pdf 也不在 EXT_TYPE 里）
       mkdirSync(join(treeB, 'empty'), { recursive: true }) // 空目录：一个文件都没有
       const rB = await importFolderTo(treeB, fav.id)
-      R.p_treeB = { ...rB, relPaths: assetRels().filter((r) => r.startsWith('收藏/B/keep')) }
+      R.p_treeB = {
+        ...rB,
+        relPaths: assetRels().filter((r) => r.startsWith('收藏/B/')),
+        // 未知格式落成的类型必须**恰好是** file：判成 image 会让预览层去找解码器、
+        // 判成 text 会让编辑器尝试按 UTF-8 打开一个 zip —— 都是错的。
+        unknownTypes: D()
+          .prepare(
+            "SELECT name, type FROM assets WHERE rel_path IN ('收藏/B/x.xyz','收藏/B/readme.pdf') ORDER BY name"
+          )
+          .all()
+      }
 
       // —— IF-4：`.` 开头的文件与目录全跳过（库里既无文件、也无隐藏文件夹）——
       const treeC = join(pRoot, 'C')
@@ -2051,6 +2061,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     const pB = (R.p_treeB ?? {}) as {
       timeout?: boolean; added?: number; skipped?: number
       failed?: Array<{ path: string; error: string }>; relPaths?: string[]
+      unknownTypes?: Array<{ name: string; type: string }>
     }
     const pC = (R.p_treeC ?? {}) as {
       timeout?: boolean; added?: number; skipped?: number; okImported?: boolean
@@ -2364,14 +2375,18 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         existsSync(join(libPath, '收藏', 'A', 'sub', 'deep', 'c.png')) &&
         readFileSync(join(libPath, '收藏', 'A', 'sub', 'b.png')).equals(readFileSync(join(pA.srcRoot, 'sub', 'b.png'))) &&
         readFileSync(join(libPath, '收藏', 'A', 'sub', 'deep', 'c.png')).equals(readFileSync(join(pA.srcRoot, 'sub', 'deep', 'c.png'))),
-      // IF-3 **用户要的就是「不支持的格式不导入」**：`x.xyz` / `readme.pdf` 一律不许进 assets，
-      // 且 skipped 必须**恰好等于**不支持格式的个数（2）—— 少了用户不知道有文件被丢，
-      // 多了就成了「凭空报跳过」。注意 `keep.png` 必须进来，否则这条在「整次导入什么都没做」时也绿。
-      importFolderUnsupported: pB?.timeout !== true && pB?.added === 1 && pB?.skipped === 2 &&
+      // IF-3 **需求已反转**：不支持的格式现在**照样导入**（`type='file'`，能看见、不能预览，
+      // 双击走系统默认应用打开）。旧版这里断的是「一律不许进 assets、skipped 恰好 = 2」，
+      // 用户明确要求改掉：「当添加不支持的格式时，可以导入，但是不能预览」。
+      // 仍要保证 keep.png 在（否则「整次导入什么都没做」时本条会假绿），
+      // 且两个未知格式的类型必须**恰好是** file —— 判成 image 会让预览层去找解码器、
+      // 判成 text 会让编辑器按 UTF-8 打开一个 zip，都是错的。
+      importFolderUnsupported: pB?.timeout !== true && pB?.added === 3 && pB?.skipped === 0 &&
         (pB?.failed ?? [{ path: 'x', error: 'x' }]).length === 0 &&
-        (pB?.relPaths ?? []).join('|') === '收藏/B/keep.png' &&
-        existsSync(join(libPath, '收藏', 'B', 'keep.png')) &&
-        !assetRels().some((r) => /\.xyz$/i.test(r)) && !assetRels().some((r) => /\.pdf$/i.test(r)),
+        (pB?.relPaths ?? []).length === 3 &&
+        (pB?.unknownTypes ?? []).length === 2 &&
+        (pB?.unknownTypes ?? []).every((r) => r.type === 'file') &&
+        existsSync(join(libPath, '收藏', 'B', 'keep.png')),
       // IF-4 `.` 开头全跳过：`.hidden/d.png` 与 `.DS_Store` 既不许进 assets，也**不许**在 folders
       // 里留下 `收藏/C/.hidden`（那会变成侧栏里一个看不见、又因为受保护而删不掉的空壳）。
       // skipped 必须是 0：这两个是被「`.` 开头」规则静默挡掉的，不是「格式不支持」，
@@ -2391,7 +2406,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // ⚠️ 这是本轮「假绿修正」之一：旧断言断的是 `收藏/empty` —— 套层后真实路径是
       // `收藏/B/empty`，那句断的是一个**永远不会出现的路径**，删掉套层也照样绿。
       // 注入验证：把空目录也压进待建目录集合（不再以「有没有条目」为准）→ 本条红。
-      importFolderEmptyDirSkipped: pB?.timeout !== true && pB?.added === 1 &&
+      importFolderEmptyDirSkipped: pB?.timeout !== true && pB?.added === 3 &&
         !folderPaths().includes('收藏/B/empty') && !existsSync(join(libPath, '收藏', 'B', 'empty')),
       // IF-6 落点：
       //   方向一：folderId = 「收藏」→ 四条全在 `收藏/A/` 下（防止有人把 base 写死成库根）；

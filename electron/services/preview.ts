@@ -36,7 +36,7 @@ import { ensureBatch } from './thumbs'
 import { isThumbHash } from './paths'
 import { MEDIA_SUPPRESS_MS, type MediaHandleGuard } from './handles'
 
-export type PreviewKind = 'image' | 'video' | 'audio' | 'text'
+export type PreviewKind = 'image' | 'video' | 'audio' | 'text' | 'file'
 /** 派生方式，UI 拿它显示「正在转码…」这类文案 */
 export type DeriveKind = 'image' | 'remux' | 'transcode' | 'audio'
 
@@ -72,7 +72,8 @@ const IMG_NATIVE = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 
  * 它们既不在 `IMG_NATIVE` 里，也**救不回来** —— 这份预编译 sharp 的 libheif 不带 HEVC 编解码器，
  * 决定性证据是 `sharp(...).heif({ compression: 'hevc' })` 直接抛 `heifsave: Unsupported compression`
  * （辅助证据：`libvips-42.dll` 里查不到 `libde265` / `dav1d` 这两个 HEVC 解码器符号），派生必然失败。
- * `EXT_TYPE` 已经不认这几个扩展名（新导入直接 skipped），但**存量库里可能还有**
+ * `EXT_TYPE` 已经不认这几个扩展名 —— 放开任意格式导入后，`.heic` 新导入会落成 `type='file'`
+ * （不尝试解码，直接给「用系统默认应用打开」）；但**存量库里可能还有**
  * `type='image', ext='heic'` 的行，所以要在这里显式返回 unsupported 给出原因，
  * 而不是让它走 derived 撞 sharp 报错、卡片一片空白还看不出为什么。
  *
@@ -244,6 +245,16 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
     return { ...base, strategy: 'unsupported', mime: null, reason: '库内找不到该文件（可能已被外部删除）' }
   }
   const size = statSync(abs).size
+
+  // 未知格式（`type='file'`）：没有内置预览器，也不该排任何派生任务。
+  // 明说原因而不是落进最后的「未知的素材类型」—— 那是给数据坏了准备的措辞，
+  // 而这里是**正常**情况：用户导入了 psd / zip / pdf，界面要给「用系统默认应用打开」的出口。
+  if (row.type === 'file') {
+    return {
+      ...base, kind: 'file', strategy: 'unsupported', mime: mimeOf(ext), bytes: size,
+      reason: '该格式没有内置预览器，可用系统默认应用打开'
+    }
+  }
 
   if (row.type === 'text') {
     return { ...base, kind: 'text', mime: mimeOf(ext), bytes: size, editable: size <= textMaxBytes() }

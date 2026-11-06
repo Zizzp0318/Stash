@@ -756,8 +756,9 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       // 清除筛选芯片是同行唯一保留文字的按钮（高度与图标芯片齐平）
       clearChipKeepsText: /清除筛选/.test(hRa?.clearText ?? '') && hRa?.clearH === 32,
 
-      // H 类型弹层
-      typeMenuItems: hTm?.items?.join('|') === '全部类型|图片|视频|音频|文本',
+      // H 类型弹层。末项「其他文件」是未知格式（type='file'）的筛选入口 ——
+      // 放开任意格式导入后，这类素材必须能被单独挑出来，否则它们只能混在「全部类型」里。
+      typeMenuItems: hTm?.items?.join('|') === '全部类型|图片|视频|音频|文本|其他文件',
       typeMenuDefaultActive: hTm?.active === 'all',
       typeMenuApplies: hTa?.cards?.length === 1 && hTa.cards[0] === 'clip.mp4',
       // 芯片不再有文字，状态改由 title 与图标形状承载

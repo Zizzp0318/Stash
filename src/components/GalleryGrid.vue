@@ -90,7 +90,9 @@ const TYPE_OPTS: Array<{ value: string | null; label: string }> = [
   { value: 'image', label: '图片' },
   { value: 'video', label: '视频' },
   { value: 'audio', label: '音频' },
-  { value: 'text', label: '文本' }
+  { value: 'text', label: '文本' },
+  // 未知格式（psd / zip / pdf …）：能导入不能预览，界面上总要能单独把它们挑出来
+  { value: 'file', label: '其他文件' }
 ]
 
 /** 评分只支持「≥N 星」语义（0 = 不限），与后端 `rating >= ?` 一一对应，没有「恰好 N 星」 */
@@ -266,7 +268,7 @@ async function pickImportFolder(): Promise<void> {
 }
 
 // —— 卡片 ——
-const TYPE_ICON: Record<string, string> = { image: '🖼', video: '🎬', audio: '🎵', text: '📄' }
+const TYPE_ICON: Record<string, string> = { image: '🖼', video: '🎬', audio: '🎵', text: '📄', file: '📦' }
 
 /**
  * 缩略图右上角的类型角标（图标 + 文字）。
@@ -295,6 +297,12 @@ const TYPE_BADGE: Record<string, { label: string; icon: string }> = {
   text: {
     label: '文本',
     icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M3.4 4.6h9.2"/><path d="M3.4 8h9.2"/><path d="M3.4 11.4h5.6"/></svg>'
+  },
+  // 未知格式（能导入、不能预览）：折角文档，与文本的三横线明确区分开 ——
+  // 用户要能一眼看出「这个打不开预览，但可以双击用系统应用打开」
+  file: {
+    label: '文件',
+    icon: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M4.2 2.4h5l3.4 3.4v7.8H4.2z"/><path d="M9.2 2.4v3.4h3.4"/></svg>'
   }
 }
 
@@ -1950,6 +1958,10 @@ function uninstallVsDebug(): void {
             <g v-else-if="assets.query.type === 'text'" data-icon="text">
               <path d="M4 2.7h5.1l3.2 3.2v7.4H4z" />
               <path d="M9.1 2.7v3.2h3.2M6.1 8.7h4M6.1 11h2.7" />
+            </g>
+            <g v-else-if="assets.query.type === 'file'" data-icon="file">
+              <path d="M4.4 2.4h5l3.1 3.1v8.1H4.4z" />
+              <path d="M9.4 2.4v3.1h3.1" />
             </g>
             <g v-else data-icon="all" fill="currentColor" stroke="none">
               <rect x="2.3" y="2.3" width="4.9" height="4.9" rx="1.4" />

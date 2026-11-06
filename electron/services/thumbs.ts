@@ -435,9 +435,16 @@ async function generatePlaceholder(key: string, type: string): Promise<string> {
     return out
   }
   mkdirSync(join(out, '..'), { recursive: true })
+  // 三种占位：音频（音符）/ 未知格式（折角文档）/ 文本（三横线）。
+  // `file` 必须与 `text` 区分开 —— 用户一眼要能看出「这是能打开但预览不了的文件」，
+  // 而不是「一篇文本」。网格里没缩略图时全靠这张图说话。
+  // ⚠️ 不要用 `<text>` 渲染扩展名：sharp 的 SVG 渲染依赖系统字体，缺字体会变成空白框，
+  //    同一份库在不同机器上长得不一样。纯图形表达。
   const svg = type === 'audio'
     ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="#7FA8D9"><circle cx="140" cy="180" r="14"/><circle cx="190" cy="164" r="14"/><rect x="150" y="100" width="6" height="82" rx="3"/><rect x="200" y="84" width="6" height="82" rx="3"/></g></svg>`
-    : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
+    : type === 'file'
+      ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="none" stroke="#9AA3AD" stroke-width="9" stroke-linejoin="round" stroke-linecap="round"><path d="M116 88h60l32 32v96a12 12 0 0 1-12 12H116a12 12 0 0 1-12-12V100a12 12 0 0 1 12-12z"/><path d="M176 88v32h32"/></g></svg>`
+      : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
   const buf = await sharp(Buffer.from(svg)).webp({ quality: quality() }).toBuffer()
   const tmp = tmpPath(out)
   writeFileSync(tmp, buf)

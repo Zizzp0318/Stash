@@ -510,3 +510,65 @@
 .pv-text.compact .ptext-editor,
 .pv-text.compact .ptext-md,
 .pv-text.compact .ptext-plain { padding: 10px 12px; font-size: 12.5px; }
+
+/* ---- 未知格式：能导入、不能预览，中间给一个「用系统默认应用打开」的图标按钮 ---- */
+.pv-file {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+/* 图标本身是按钮 —— 用户点开预览就是想看这个文件，不必再去别处找入口 */
+.pv-file-glyph {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 132px;
+  height: 132px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg-raised);
+  color: var(--text-2);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s;
+}
+.pv-file-glyph:hover {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--bg-hover);
+  transform: translateY(-1px);
+}
+.pv-file-glyph:focus-visible { outline: 2px solid var(--accent-border); outline-offset: 2px; }
+.pv-file-glyph svg { width: 56px; height: 56px; }
+/* 扩展名压在图标下方：一眼看出"这是什么格式"，不必去读文件名后缀 */
+.pv-file-ext {
+  position: absolute;
+  bottom: 9px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: inherit;
+  opacity: 0.85;
+}
+.pv-file-name { max-width: 82%; font-size: 13.5px; color: var(--text-1); word-break: break-all; }
+.pv-file-hint { font-size: 12px; color: var(--text-3); }
+.pv-file-actions { display: flex; gap: 8px; margin-top: 2px; }
+.pv-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pv-btn-primary:hover { background: var(--accent); border-color: var(--accent); opacity: 0.9; }
+
+/* 右侧信息栏：面板窄，缩小图标、收掉次要按钮 */
+.pv-file.compact { gap: 8px; padding: 14px 10px; }
+.pv-file.compact .pv-file-glyph { width: 84px; height: 84px; border-radius: 12px; }
+.pv-file.compact .pv-file-glyph svg { width: 36px; height: 36px; }
+.pv-file.compact .pv-file-ext { font-size: 10px; bottom: 5px; }
+.pv-file.compact .pv-file-name { font-size: 12px; }
+.pv-file.compact .pv-file-hint { font-size: 11px; }
+.pv-file.compact .pv-btn { padding: 5px 10px; font-size: 11.5px; }

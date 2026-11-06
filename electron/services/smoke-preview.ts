@@ -791,6 +791,43 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       check('U2 Esc 关闭浮层', closed)
     }
 
+    // ---- U2b 未知格式：能导入、不能预览，浮层里给「用系统默认应用打开」 ----
+    //
+    // 用户需求原话：「当添加不支持的格式时，可以导入，但是不能预览，仅在预览框中间
+    // 给个按钮图标，用系统默认应用打开」。
+    // 这组断言盯的是**渲染层**真的把出口画出来了 —— 只测主进程的 `type='file'` 不够：
+    // 组件漏接一行分支时，用户点开看到的仍是一片空白，而主进程测试照样全绿。
+    {
+      const psdPath = join(srcDir, 'unknown.psd')
+      writeFileSync(psdPath, Buffer.from('8BPS-not-a-real-psd'))
+      const psdDone = await new Promise<{ added: number; skipped: number }>((resolve) =>
+        importFiles({ paths: [psdPath], folderId: folder.id, mode: 'copy', onDone: (r) => resolve(r) })
+      )
+      check('U2b 未知格式被导入（不再作为"不支持的格式"被跳过）',
+        psdDone.added === 1 && psdDone.skipped === 0, JSON.stringify(psdDone))
+
+      const psdId = idOf('unknown.psd')
+      const cardReady = await waitFor(`document.querySelector('.card[data-id="${psdId}"]')`, 6000)
+      check('U2b 未知格式在网格里有卡片（不是被导入后看不见）', cardReady, `id=${psdId}`)
+
+      if (cardReady) {
+        await fire(psdId, 'dblclick')
+        const pvOpen = await waitFor("document.querySelector('[data-pv-file]')", 4000)
+        const glyph = pvOpen
+          ? await js<boolean>("!!document.querySelector('[data-pv-file] [data-pv-open-external]')")
+          : false
+        const extText = pvOpen
+          ? await js<string>("(document.querySelector('.pv-file-ext')||{}).textContent||''")
+          : ''
+        check('U2b 浮层里画出了「用系统默认应用打开」的图标按钮', pvOpen && glyph,
+          `open=${pvOpen} glyph=${glyph}`)
+        check('U2b 图标上标出格式（PSD），而不是一片空白', (extText || '').trim() === 'PSD', `ext=${extText}`)
+        // 关掉浮层，别让残留状态影响后面的段
+        await js("(() => { const b = document.querySelector('[data-pv-close]'); if (b) b.click(); return true })()")
+        await waitFor("!document.querySelector('[data-pv-wrap]')", 3000)
+      }
+    }
+
     // ---- U2 文本：编辑器 / Ctrl+S 落盘 / 外部改动冲突 ----
     {
       await js('document.querySelector(\'.card[data-id="' + noteId + '"]\').dispatchEvent(new MouseEvent(\'dblclick\', { bubbles: true }))')

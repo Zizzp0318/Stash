@@ -6,6 +6,7 @@ import { fmtSize, fmtDate, fmtDuration } from '../utils/format'
 import PreviewVideo from './preview/PreviewVideo.vue'
 import PreviewAudio from './preview/PreviewAudio.vue'
 import PreviewText from './preview/PreviewText.vue'
+import PreviewFile from './preview/PreviewFile.vue'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
@@ -60,7 +61,8 @@ const previewStyle = computed(() => {
 /** 音频 / 文本：没有比例可用，靠 CSS 的固定高度撑开 */
 const isFixedHeightPreview = computed(() => {
   const t = asset.value?.type
-  return t === 'audio' || t === 'text'
+  // file（未知格式）没有宽高比可用，跟音频/文本一样走固定高度
+  return t === 'audio' || t === 'text' || t === 'file'
 })
 
 /** 加载完成：淡入；索引缺宽高时用图片真实尺寸补出比例 */
@@ -366,6 +368,7 @@ async function copyNote(): Promise<void> {
         <PreviewVideo v-else-if="asset.type === 'video'" :asset="asset" compact />
         <PreviewAudio v-else-if="asset.type === 'audio'" :asset="asset" compact />
         <PreviewText v-else-if="asset.type === 'text'" :asset="asset" view-only />
+        <PreviewFile v-else-if="asset.type === 'file'" :asset="asset" compact />
         <span v-else class="detail-fallback">无预览</span>
       </div>
       <div class="detail-body">
@@ -512,7 +515,7 @@ async function copyNote(): Promise<void> {
 
         <div class="d-section">
           <div class="d-label">基本信息</div>
-          <div class="kv"><span class="k">类型</span><span class="v">{{ { image: '图片', video: '视频', audio: '音频', text: '文本' }[asset.type] }}</span></div>
+          <div class="kv"><span class="k">类型</span><span class="v">{{ { image: '图片', video: '视频', audio: '音频', text: '文本', file: '其他文件' }[asset.type] }}</span></div>
           <div class="kv"><span class="k">格式</span><span class="v">{{ ext }}</span></div>
           <div class="kv"><span class="k">尺寸/时长</span><span class="v">{{ dimsText }}</span></div>
           <div class="kv"><span class="k">文件大小</span><span class="v">{{ fmtSize(asset.size) }}</span></div>

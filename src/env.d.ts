@@ -79,7 +79,7 @@ export interface StashAssetRow {
   folder_id: number
   name: string
   rel_path: string
-  type: 'image' | 'video' | 'audio' | 'text'
+  type: 'image' | 'video' | 'audio' | 'text' | 'file'
   ext: string
   size: number
   width: number | null
@@ -238,7 +238,7 @@ export interface StashPreviewApi {
  */
 export interface StashPreviewInfo {
   id: number
-  kind: 'image' | 'video' | 'audio' | 'text'
+  kind: 'image' | 'video' | 'audio' | 'text' | 'file'
   strategy: 'original' | 'derived' | 'unsupported'
   ready: boolean
   derive: 'image' | 'remux' | 'transcode' | 'audio' | null

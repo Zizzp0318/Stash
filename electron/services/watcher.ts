@@ -3,7 +3,7 @@ import { basename, extname, join, relative } from 'path'
 import { renameSync, rmSync, statSync } from 'fs'
 import { opendir } from 'fs/promises'
 import { BrowserWindow } from 'electron'
-import { contentHash, EXT_TYPE } from './importer'
+import { contentHash, isJunkName, typeOfExt } from './importer'
 import { ensureFolderRows, mkdirRel } from './library'
 import { uniqueName } from './naming'
 import { isThumbHash, relFromLib } from './paths'
@@ -316,7 +316,13 @@ export async function suspendWatchingAsync(): Promise<boolean> {
  */
 function isIgnoredAbs(libPath: string, p: string): boolean {
   const rel = relative(libPath, p)
-  return rel.startsWith('.stash') || rel.startsWith('.thumbs') || basename(rel).startsWith(TMP_PREFIX)
+  // 库根本身永远不能判为忽略（见上面的警告），`['']` 也天然不会命中 junk 判据
+  const parts = rel.split(/[\\/]/)
+  // `.` 开头（`.stash*` / `.thumbs` / `.DS_Store`）与系统垃圾名（Thumbs.db / desktop.ini）：
+  // 判据来自 `importer.isJunkName`，与导入侧同一份 —— 放开任意格式导入后，
+  // 这层不能再依赖"扩展名不在白名单"这种隐含保护（否则垃圾文件会被当成素材索引进来）。
+  if (parts.some((seg) => isJunkName(seg))) return true
+  return basename(rel).startsWith(TMP_PREFIX)
 }
 
 /** `indexFile` 的结局：插入了新行 / 跳过（已存在、非素材、隐藏目录、被抑制） */
@@ -361,8 +367,9 @@ function indexFile(db: DB, libPath: string, abs: string, opts: { external: boole
   if (db.prepare('SELECT id FROM assets WHERE rel_path=?').get(rel)) return 'skipped'
 
   const ext = extname(abs).slice(1).toLowerCase()
-  const type = EXT_TYPE[ext]
-  // 非素材类型（含压缩临时文件 `.stash-compress-*` 等）：不索引
+  // 未知扩展名按 'file' 索引（与导入同源，用户丢进库的工程文件也能看见）；
+  // 只有内部临时产物返回 null —— 那类文件**绝不能**被索引成素材
+  const type = typeOfExt(ext)
   if (!type) return 'skipped'
 
   let dirRel = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''

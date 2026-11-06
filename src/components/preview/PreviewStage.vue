@@ -14,6 +14,7 @@ import PreviewImage from './PreviewImage.vue'
 import PreviewVideo from './PreviewVideo.vue'
 import PreviewAudio from './PreviewAudio.vue'
 import PreviewText from './PreviewText.vue'
+import PreviewFile from './PreviewFile.vue'
 
 const assets = useAssetStore()
 
@@ -24,7 +25,7 @@ const row = computed(() => {
   return assets.items.find((i) => i.id === id) ?? null
 })
 
-const KIND_LABEL: Record<string, string> = { image: '图片', video: '视频', audio: '音频', text: '文本' }
+const KIND_LABEL: Record<string, string> = { image: '图片', video: '视频', audio: '音频', text: '文本', file: '文件' }
 
 function indexOfCurrent(): number {
   const id = assets.previewId
@@ -98,9 +99,8 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onKey, true))
           <PreviewVideo v-else-if="row.type === 'video'" :asset="row" />
           <PreviewAudio v-else-if="row.type === 'audio'" :asset="row" />
           <PreviewText v-else-if="row.type === 'text'" :asset="row" />
-          <div v-else class="pv-wait">
-            <span>{{ KIND_LABEL[row.type] ?? row.type }}暂不支持预览</span>
-          </div>
+          <!-- 未知格式：给一个「用系统默认应用打开」的出口，而不是一句无能为力的提示 -->
+          <PreviewFile v-else :asset="row" />
         </template>
       </div>
 
