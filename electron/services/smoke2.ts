@@ -273,8 +273,18 @@ export async function runSmokeM2(): Promise<void> {
           { path: '（本批文件·索引未写入）', error: 'disk I/O error', batch: true, count: 40 },
           { path: 'C:\\pics\\a.png', error: 'not a file' }
         ])
+        /*
+         * 整条管线在**开始逐个处理文件之前**就抛错 → path 是 '*' 哨兵。
+         * 修复前会渲染成「1 个文件导入失败（首个：*：ERR_FOLDER_NOT_FOUND）」：
+         *   · `*` 不是文件名，用户看不懂；
+         *   · `ERR_…` 是裸错误码（同项目其它地方都有人话映射）。
+         * 现在必须是「导入失败：目标文件夹已不存在（…）」，且不含「首个：」与「ERR_」。
+         */
+        const wholeFail = fmt.importFailedText([{ path: '*', error: 'ERR_FOLDER_NOT_FOUND' }])
+        // 未收进映射表的错误码仍然原样透出（便于排查，不能被吞成"未知错误"）
+        const unknownCode = fmt.importFailedText([{ path: '*', error: 'SQLITE_BUSY' }])
 
-        result.f3 = { entry, batchOnly, fileOnly, empty, mixed }
+        result.f3 = { entry, batchOnly, fileOnly, empty, mixed, wholeFail, unknownCode }
         result.f3ok =
           typeof batchOnly === 'string' &&
           batchOnly.includes('41') &&
@@ -284,7 +294,14 @@ export async function runSmokeM2(): Promise<void> {
           empty === null &&
           typeof mixed === 'string' &&
           mixed.includes('40') &&
-          mixed.includes('首个：')
+          mixed.includes('首个：') &&
+          typeof wholeFail === 'string' &&
+          /^导入失败：目标文件夹已不存在/.test(wholeFail) &&
+          !wholeFail.includes('首个：') &&
+          !wholeFail.includes('ERR_') &&
+          typeof unknownCode === 'string' &&
+          /SQLITE_BUSY/.test(unknownCode) &&
+          !unknownCode.includes('首个：')
       } catch (e) {
         result.f3ok = false
         result.f3Error = String((e as Error)?.message ?? e)

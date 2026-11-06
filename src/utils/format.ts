@@ -89,6 +89,24 @@ export interface ImportFailedItem {
  * - 逐文件失败 → 保留「N 个文件导入失败（首个：name：err）」，用户能对着文件名去查。
  * - 两类同时存在 → 用「；」连接，各说各的，互不吞并。
  */
+/**
+ * 导入链路的「整体失败」错误码 → 人话。
+ *
+ * 为什么需要：这里以前把 `error` 原样拼进提示，用户读到的是「导入失败：ERR_FOLDER_NOT_FOUND」
+ * 这种裸码 —— 同项目里文件夹 / 素材 / 标签的错误都有人话映射（SideBar 的 `FOLDER_ERR`、
+ * GalleryGrid 的 `ASSET_ERR`），唯独导入这条链路没有。
+ * 只收「用户能据此动手」的几个；其余（含 SQLite 原始报错）原样透出，便于排查。
+ */
+const IMPORT_ERR_TEXT: Record<string, string> = {
+  ERR_FOLDER_NOT_FOUND: '目标文件夹已不存在（可能被删除或移动过）',
+  ERR_NO_LIBRARY: '当前没有打开的素材库',
+  ERR_LIBRARY_TOO_NEW: '该库由更新版本的 Stash 创建，请先升级软件'
+}
+
+function importErrText(code: string): string {
+  return IMPORT_ERR_TEXT[code] ?? code
+}
+
 export function importFailedText(failed: ImportFailedItem[]): string | null {
   if (!failed.length) return null
 
@@ -99,7 +117,7 @@ export function importFailedText(failed: ImportFailedItem[]): string | null {
   if (batchFails.length) {
     // 批次数与文件总数都要如实给出：整批都没进索引，用户需要知道影响面有多大。
     const total = batchFails.reduce((s, f) => s + (f.count ?? 0), 0)
-    const reason = batchFails[0]?.error ?? '未知原因'
+    const reason = importErrText(batchFails[0]?.error ?? '未知原因')
     parts.push(
       `${batchFails.length} 批共 ${total} 个文件已拷入库目录，但索引未写入（库里看不到它们，磁盘文件仍在）。` +
         `请重新导入本批。原因：${reason}`
@@ -108,8 +126,17 @@ export function importFailedText(failed: ImportFailedItem[]): string | null {
 
   if (fileFails.length) {
     const first = fileFails[0]
-    const name = first.path.split(/[\\/]/).pop()
-    parts.push(`${fileFails.length} 个文件导入失败（首个：${name}：${first.error}）`)
+    /*
+     * `path === '*'` 是**整条管线在开始逐个处理文件之前**就抛错的哨兵（importer 的顶层 catch：
+     * 目标文件夹被删、库在导入途中被关等）。这种情况下没有"首个文件"可言，
+     * 写成「1 个文件导入失败（首个：*：…）」只会让人莫名其妙 —— 直接说整体失败与原因。
+     */
+    if (first.path === '*') {
+      parts.push(`导入失败：${importErrText(first.error)}`)
+    } else {
+      const name = first.path.split(/[\\/]/).pop()
+      parts.push(`${fileFails.length} 个文件导入失败（首个：${name}：${importErrText(first.error)}）`)
+    }
   }
 
   return parts.join('；')
