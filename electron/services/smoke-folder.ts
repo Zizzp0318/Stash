@@ -2003,6 +2003,19 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
             | undefined
         )?.h ?? ''
       }
+      // 等 watcher 把这一连串 rename 事件消化完，看它会不会"回头补刀"。
+      //
+      // `markMissing` 的注释写着：应用自己的重命名/移动在**同一个同步块**里就把 rel_path
+      // 改好了，chokidar 随后发来的 unlink/unlinkDir 按**旧** rel_path 查不到行 → 变化为 0。
+      // 那是推理；这条断言把它变成事实 —— 只要有一处漏改（或事务顺序被调换），
+      // 这里就会冒出重复行、或者那唯一一行被标成 missing=1（界面上一张灰卡 + 一次假刷新）。
+      await sleep(1200)
+      const qCount = (sql: string): number => (D().prepare(sql).get() as { c: number }).c
+      R.q_settle = {
+        rows: qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt'`),
+        missing: qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt' AND missing=1`),
+        folderRows: qCount(`SELECT count(*) AS c FROM folders WHERE path='移动源Q'`)
+      }
       step(`Q ${JSON.stringify(R.q_move)}`)
     }
 
@@ -2638,7 +2651,13 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         qUi?.childPrevented === false && qUi?.childOn === false &&
         qUi?.selfPrevented === false,
       // 拖到自己身上 drop 必须无害：`canDropInto` 拦掉 → 不发 IPC、路径与磁盘都不动
-      folderDropSelfIsNoop: qUiDrop?.relUnchanged === true && qUiDrop?.stillOnDisk === true
+      folderDropSelfIsNoop: qUiDrop?.relUnchanged === true && qUiDrop?.stillOnDisk === true,
+
+      // 移动之后 watcher 不许"回头补刀"：既不能补插一行重复素材，也不能把唯一那行标成失效。
+      // 这条盯的是 `markMissing` 注释里那句推理（按旧 rel_path 查不到 → changes=0）。
+      moveFolderSurvivesWatcher: (R.q_settle as { rows?: number; missing?: number; folderRows?: number } | undefined)?.rows === 1 &&
+        (R.q_settle as { missing?: number } | undefined)?.missing === 0 &&
+        (R.q_settle as { folderRows?: number } | undefined)?.folderRows === 1
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {
