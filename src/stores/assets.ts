@@ -33,6 +33,24 @@ export const CARD_FIELDS: Array<{ key: CardField; label: string }> = [
 // 视图缩放的上下限定义在 stores/settings.ts（滑块、设置面板、钳制同源），这里只做转出
 export { VIEW_ZOOM_MIN, VIEW_ZOOM_MAX }
 
+/**
+ * 测试缝（仅 `--smoke-search` 用）：把**下一次**列表查询延后 ms 毫秒再发出。
+ *
+ * 为什么必须有它：`refresh` 的世代令牌防的是「旧请求后到，把新筛选的结果覆盖掉」。
+ * 现实里哪个请求先到由 IPC 与磁盘速度决定 —— 冒烟从外部没法稳定构造那个交错，
+ * 只能靠"多跑几次碰运气"，那种断言迟早变成随机红。
+ * 让冒烟把**指定那一次**请求拖慢，「新请求先落地、旧请求后到」就变成了必然。
+ *
+ * 生产路径从不调用它；未设置时 `nextListDelayMs` 恒为 0，行为与没有这段代码完全一致。
+ * 与 `window.__vsDebug`（GalleryGrid）同一套做法：生产保留、纯测试用途、无副作用。
+ */
+let nextListDelayMs = 0
+if (typeof window !== 'undefined') {
+  window.__delayNextList = (ms: number): void => {
+    nextListDelayMs = Math.max(0, Math.min(5000, Math.round(ms) || 0))
+  }
+}
+
 export const useAssetStore = defineStore('assets', () => {
   const settings = useSettingsStore()
   const query = reactive({
@@ -303,6 +321,9 @@ export const useAssetStore = defineStore('assets', () => {
     const my = ++refreshGen
     // 查询条件快照：分页补齐要发多个 IPC，循环里再展开 `...query` 就会读到中途被改过的值
     const q = { ...query, ...deepOpt() }
+    // 测试缝：取走即清零，只影响这一次（见 nextListDelayMs 的说明）
+    const delayed = nextListDelayMs
+    nextListDelayMs = 0
     loading.value = true
     let rows: StashAssetRow[] | null = null
     let nextTotal = 0
@@ -310,6 +331,12 @@ export const useAssetStore = defineStore('assets', () => {
     try {
       // 目标深度：默认一页；keepDepth 时「至少一页，且不少于当前已加载的条数」
       const target = opts?.keepDepth ? Math.max(items.value.length, PAGE) : PAGE
+      /*
+       * 延迟放在**发请求之前**，而且延迟结束后**照样发**（不提前 return）——
+       * 这样这一次的响应必然晚于随后发起的下一次 refresh，交错才真的发生。
+       * 提前 return 就变成了"什么都没测到"。
+       */
+      if (delayed > 0) await new Promise<void>((r) => setTimeout(r, delayed))
       const first = await window.stash.asset.list({
         ...q,
         offset: 0,

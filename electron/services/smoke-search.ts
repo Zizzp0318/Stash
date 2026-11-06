@@ -11,7 +11,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import { unwatchLibrary } from './watcher'
-import { closeCurrent, createLibrary, forgetLibrary, requireCurrent } from './library'
+import { closeCurrent, createLibrary, forgetLibrary, mkdirChild, requireCurrent } from './library'
 import { createTag, listAssets, setTags, updateAsset } from './assets'
 import { importFiles } from './importer'
 
@@ -503,6 +503,105 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
 
     await capture('shot-search-done.png')
 
+    // ==================== I 交错回归：旧响应的 refresh 不能覆盖新筛选 ====================
+    // 修复前的真实缺陷（审计 P1）：`library:external` 触发的 refresh 还在飞时用户点了别的文件夹，
+    // 两个请求乱序返回，旧响应无条件 `items.value = rows` 把新结果盖掉 ——
+    // 侧栏高亮是 B、标题是 B，列表里却是 A 的卡片（深浏览时还会拼出「A 的前半 + B 的后半」）。
+    //
+    // 复现靠测试缝 `window.__delayNextList(ms)`：**只把第一次查询拖慢**，
+    // 于是第二次（新筛选）必然先落地、第一次（旧筛选）后到。交错是确定性的，不靠时序运气。
+    {
+      const folderA = mkdirChild('', '交错A')
+      const folderB = mkdirChild('', '交错B')
+      /*
+       * ⚠️ 必须用**内容全新**的图：上面那 11 个源文件已经入库，而 `dedupe` 默认开着 ——
+       * 再导一次会被当成重复直接跳过，A 就是空的，"旧响应盖回 A"这条断言随之变成空转
+       * （本轮踩到过：countA=0，bug 在也测不出来）。
+       */
+      const raceFiles: string[] = []
+      for (let i = 0; i < 3; i++) {
+        const p = join(dir, `interleave-${i}.png`)
+        await sharp({
+          create: {
+            width: 90 + i * 10,
+            height: 70 + i * 7,
+            channels: 3,
+            background: { r: 12 + i * 60, g: 200 - i * 50, b: 96 }
+          }
+        })
+          .png()
+          .toFile(p)
+        raceFiles.push(p)
+      }
+      // A 放 3 个、B 留空：两个筛选的结果集大小不同，"谁赢了"一眼可辨
+      await new Promise<void>((resolve) =>
+        importFiles({ paths: raceFiles, folderId: folderA.id, mode: 'copy', onDone: () => resolve() })
+      )
+      // 导入完成会触发 App.vue 的 import:done → `lib.loadMeta()`：侧栏要等它才认识这两个新文件夹。
+      // 同时必须等那一次 refresh 落地 —— 否则测试缝的"下一次"会被它抢走，延迟落到它身上、交错不成立。
+      const sidebarReady = await waitUntil(
+        `!!document.querySelector('.side-item[data-folder-id="${folderA.id}"]') && ` +
+          `!!document.querySelector('.side-item[data-folder-id="${folderB.id}"]')`,
+        10000
+      )
+      await new Promise((r) => setTimeout(r, 600))
+
+      // 同一个 tick 里连点两个文件夹：`pickFolder` 是 async，但 `query.folderId` 在 await 之前
+      // 就同步改好了 —— 所以两次 refresh 会各自带着自己的 query 快照跑起来，第一次被延迟 1200ms。
+      //
+      // ⚠️ 断言的是**采样轨迹**而不是最终态：最终态可能被随后一次合法刷新（导入触发的
+      // library:external、或 meta:done 的 keepDepth 刷新）覆盖成 B —— 那样即使旧响应已经
+      // 把列表盖回 A，也会在收尾时被抹平，断言假绿（本轮实测踩到过，所以改成盯"中途有没有出现 A"）。
+      const started = await js<boolean>(`(() => {
+        const a = document.querySelector('.side-item[data-folder-id="${folderA.id}"]')
+        const b = document.querySelector('.side-item[data-folder-id="${folderB.id}"]')
+        if (!a || !b) return false
+        window.__raceTrace = []
+        const t0 = performance.now()
+        const tick = () => {
+          const d = window.__vsDebug ? window.__vsDebug() : null
+          window.__raceTrace.push([Math.round(performance.now() - t0), d ? d.dataTotal : -1])
+          if (performance.now() - t0 < 2600) setTimeout(tick, 100)
+        }
+        tick()
+        window.__delayNextList(1200)
+        a.click()
+        b.click()
+        return true
+      })()`)
+      await new Promise((r) => setTimeout(r, 2800))
+      const trace = (await js<Array<[number, number]>>('window.__raceTrace ?? []')) ?? []
+      const st = await js<{
+        title: string | null
+        active: number | null
+        dataTotal: number
+        n: number
+        cards: number
+      }>(`(() => {
+        const dbg = window.__vsDebug ? window.__vsDebug() : null
+        const active = document.querySelector('.side-item.active')
+        return {
+          title: (document.querySelector('.toolbar h1')?.textContent || '').trim(),
+          active: active ? Number(active.getAttribute('data-folder-id')) : null,
+          dataTotal: dbg ? dbg.dataTotal : -1,
+          n: dbg ? dbg.n : -1,
+          cards: document.querySelectorAll('.masonry-card').length
+        }
+      })()`)
+      const countIn = (fid: number): number =>
+        (D().prepare('SELECT count(*) AS c FROM assets WHERE folder_id=?').get(fid) as { c: number }).c
+      R.i_race = {
+        sidebarReady,
+        clicked: started === true,
+        folderA: folderA.id,
+        folderB: folderB.id,
+        countA: countIn(folderA.id),
+        countB: countIn(folderB.id),
+        trace,
+        ...(st ?? {})
+      }
+    }
+
     // ==================== 断言汇总 ====================
     const nameSet = (v: { names: string[] }): string => v.names.slice().sort().join('|')
     const b = R.b_keyword as Record<string, { total: number; names: string[] }>
@@ -551,6 +650,20 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
     const hSf = R.h_sortFlip as { dirBefore: string | null; names: string[]; expected: string[]; orderAttr: string | null }
     const a = R.a_imported as { added: number; rows: number }
     const aS = R.a_setup as { total: number; rated3plus: number; fav: number }
+    const iRace = R.i_race as {
+      sidebarReady?: boolean
+      clicked?: boolean
+      folderA?: number
+      folderB?: number
+      countA?: number
+      countB?: number
+      trace?: Array<[number, number]>
+      title?: string | null
+      active?: number | null
+      dataTotal?: number
+      n?: number
+      cards?: number
+    } | undefined
 
     R.checks = {
       // A 素材就位（11 个：8 图 + 1 视频 + 1 音频 + 1 文本）
@@ -683,6 +796,25 @@ export async function runSmokeSearch(win: BrowserWindow): Promise<void> {
       sortMenuFlipsOnSameField: hSf?.orderAttr === 'desc' &&
         (hSf?.names ?? []).length === 11 &&
         (hSf?.names ?? []).join('|') === (hSf?.expected ?? []).join('|'),
+
+      /*
+       * I 交错：旧响应不许把列表盖回 A。
+       *
+       * 判据是**采样轨迹**里从不出现 A 的条数（点 B 之后 200ms 起算）——
+       * 而不是"最终 state 是 B"：最终态会被随后一次合法刷新抹平，那样 bug 在也测不出来。
+       * 前提（防空转）：两条记录条数必须不同且都 > 0 才有区分度，所以断言里带上 countA !== countB。
+       */
+      raceNeverRevertsToStale:
+        iRace?.sidebarReady === true &&
+        iRace?.clicked === true &&
+        (iRace?.countA ?? 0) > 0 &&
+        iRace?.countA !== iRace?.countB &&
+        (iRace?.trace?.length ?? 0) >= 10 &&
+        (iRace?.trace ?? []).every(([t, v]) => !(t >= 200 && v === iRace?.countA)),
+      // 收尾状态必须是最后点的那一个（B 空）
+      raceEndsOnLatestQuery:
+        iRace?.title === '交错B' && iRace?.active === iRace?.folderB &&
+        iRace?.dataTotal === iRace?.countB,
 
       // 渲染层不应有 JS 报错（v-html / 正则构造出错都会在这里露出来）
       noJsErrors: jsErrors.length === 0

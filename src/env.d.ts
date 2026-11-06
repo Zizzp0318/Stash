@@ -602,5 +602,12 @@ declare global {
     __vsDebug?: () => StashVsDebug | null
     /** 帧率采样探针（仅 `--smoke-vscroll` 用） */
     __vsProbe?: StashVsProbe
+    /**
+     * **仅供冒烟**：把下一次列表查询延后 ms 毫秒再发出（`stores/assets.ts` 设置）。
+     *
+     * 用途是确定性复现「旧请求后到、覆盖新筛选结果」这个交错 —— 现实里两个请求的先后
+     * 由 IPC 与磁盘速度决定，从外部无法稳定构造。生产路径从不调用；未调用时行为不变。
+     */
+    __delayNextList?: (ms: number) => void
   }
 }

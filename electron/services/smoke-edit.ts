@@ -391,6 +391,53 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
       D().prepare('INSERT OR IGNORE INTO asset_tags(asset_id,tag_id) VALUES(?,?)').run(imported2Id, tScenery.id)
     }
 
+    /*
+     * —— S8b 导入顶层异常：**必须**走完 done 通道 ——
+     *
+     * 修复前的缺陷（审计 P0）：`runImport` 的顶层 catch 只调 `opts.onDone`，而 IPC 侧根本不传
+     * 这个回调（main.ts 只传 paths/folderId/mode）→ 渲染层收不到 `import:done`：
+     *   · 抛错发生在首个 progress 之前 → 用户拖进文件后**一点反应都没有**（无进度、无报错、列表不刷新）；
+     *   · 发生在之后 → 全屏导入浮层（position:fixed; inset:0; z-index:100）永久挡住窗口，只能重启。
+     *
+     * 用「目标文件夹不存在」触发那条 catch：它是**确定性**的（不依赖时序），
+     * 也是现实里最常见的一种 —— 选好文件后目标文件夹被另一个窗口删掉了。
+     */
+    {
+      // 先关掉上一步可能还挂着的提示条，免得读到陈旧文案
+      await js(`(() => { document.querySelector('.notice-toast')?.click(); return true })()`)
+      // 渲染层另订一条 import:done（preload 支持多监听者；App.vue 那条也在跑）
+      await js('window.__impDone = []; window.stash.import.onDone((r) => window.__impDone.push(r)); true')
+      const before = (D().prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
+      const r = await new Promise<ImportResult>((resolve) =>
+        importFiles({ paths: [join(srcA, '同名.png')], folderId: 999999, mode: 'copy', onDone: resolve })
+      )
+      // 等渲染层真的收到广播（onDone 回调先于 IPC 广播返回，所以不能立刻读）
+      let doneEvents = 0
+      for (let i = 0; i < 40 && doneEvents === 0; i++) {
+        await new Promise((res) => setTimeout(res, 100))
+        doneEvents = Number(await js('window.__impDone.length')) || 0
+      }
+      const evt = (await js('window.__impDone[0] ?? null')) as
+        | { added?: number; skipped?: number; failed?: Array<{ path: string; error: string }> }
+        | null
+      const after = (D().prepare('SELECT count(*) AS c FROM assets').get() as { c: number }).c
+      /*
+       * ⚠️ 这里**不断言渲染层提示条**：本套冒烟的 S 段跑在页面还在欢迎页的时候
+       * （库是主进程直接建的，渲染层还没 openLibrary），GalleryGrid 未挂载 →
+       * `.notice-toast` 根本不存在，读它只会得到 null 恒真/恒假的空转断言。
+       * 「整条管线失败」那句人话由 `--smoke-m2` 的 F3 以**纯函数**口径断言
+       * （`importFailedText([{path:'*'}])`），渲染层的接线则由 `--smoke-watch` 的 E3 覆盖。
+       */
+      R.s8b_failDone = {
+        cbFailed: r.failed.map((f) => ({ path: f.path, error: f.error })),
+        added: r.added,
+        doneEvents,
+        evt,
+        before,
+        after
+      }
+    }
+
     // —— S7 老库迁移：把 note 列删掉再开库，migrate() 必须自动补回来且数据不丢 ——
     // 其余冒烟用的都是新建库（SCHEMA 里直接带 note），走不到这条迁移路径，所以单独造一次
     const colsOf = (): string[] =>
@@ -1413,6 +1460,16 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
     const s6 = R.s6_clipboard as Record<string, unknown>
     const s7 = R.s7_migrate as Record<string, unknown>
     const s8 = R.s8_import as Record<string, unknown>
+    const s8b = R.s8b_failDone as
+      | {
+          cbFailed?: Array<{ path: string; error: string }>
+          added?: number
+          doneEvents?: number
+          evt?: { added?: number; skipped?: number; failed?: Array<{ path: string; error: string }> } | null
+          before?: number
+          after?: number
+        }
+      | undefined
     const u2r = R.u2_dup as Record<string, unknown>
     const u2n = R.u2_done as Record<string, unknown>
     const u3 = R.u3_afterCards as string[]
@@ -1635,6 +1692,15 @@ export async function runSmokeEdit(win: BrowserWindow): Promise<void> {
         (s8?.imp as { renamed: number })?.renamed === 1,
       importNamesUnique: (s8?.names as string[])?.join('|') === '同名 (1).png|同名.png',
       importWritesBothFiles: ((s8?.disk as Array<[string, boolean]>) ?? []).every(([, ok]) => ok === true),
+
+      // —— S8b 导入顶层异常（目标文件夹不存在）——
+      // done 通道必须走完：修复前渲染层收不到任何事件，用户拖进文件后毫无反应；
+      // 若抛错发生在首个 progress 之后，全屏浮层还会永久挡住窗口。
+      // （提示文案本身由 --smoke-m2 的 F3 以纯函数口径断言，见上面 R.s8b_failDone 的说明）
+      importFailAlwaysSignalsDone: (s8b?.doneEvents ?? 0) >= 1 &&
+        s8b?.evt?.failed?.[0]?.path === '*' && s8b?.evt?.added === 0,
+      // 失败不能在库里留下半截行
+      importFailLeavesLibraryClean: s8b?.before === s8b?.after && s8b?.added === 0,
 
       // S3 标签重命名：只改文本，关联照旧
       tagRenameUpdatesRow: (s3?.ret as { name: string })?.name === '自然',
