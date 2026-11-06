@@ -570,6 +570,62 @@ export async function runSmokeCompress(win: BrowserWindow): Promise<void> {
       const strays2 = strayTmp()
       check('C7 收尾无自身残留', strays2.length === 0, strays2.join(' | ').replace(libPath(), '<lib>'))
     }
+
+    // ==================== C8 竖拍（EXIF 旋转）不能被尺寸校验误杀 ====================
+    // 背景（本轮审计实测复现）：写出管线是 `sharp(abs).rotate()`，会把 EXIF 方向烧进像素、
+    // 竖拍图宽高互换；而校验用的期望值取的是 `metadata()` 的**旋转前**宽高 —— 两者对
+    // orientation=6/8 的图恰好互补，于是每张竖拍照片都返回「尺寸校验不过」，原图一动不动。
+    // ⚠️ maxEdge 必须用 0（默认档）才是必现条件：一旦设了长边上限，resize 会把两个方向
+    //    都夹到上限内，反而把这条缺陷掩盖掉 —— 所以不能拿 C3 那条（maxEdge=800）代替。
+    // 没有这条回归，把 `orientedDims` 换回 `srcMeta.width/height` 是**不会变红**的。
+    {
+      writeFileSync(
+        join(src, 'portrait.jpg'),
+        await sharp(await makeBigPng(1600, 1200, 260))
+          .jpeg({ quality: 98 })
+          .withMetadata({ orientation: 6 })
+          .toBuffer()
+      )
+      const m0 = await sharp(join(src, 'portrait.jpg')).metadata()
+      check(
+        'C8 前置：夹具是「存储 1600×1200 + EXIF orientation=6」（显示应为 1200×1600）',
+        m0.width === 1600 && m0.height === 1200 && m0.orientation === 6,
+        `${m0.width}x${m0.height} o=${m0.orientation}`
+      )
+
+      await new Promise<void>((resolve) => {
+        importFiles({
+          paths: [join(src, 'portrait.jpg')],
+          folderId: folder.id,
+          mode: 'copy',
+          onDone: () => resolve()
+        })
+      })
+      const portrait = rowOf('portrait.jpg') as Row
+      check('C8 竖拍夹具已入库', !!portrait, String(portrait?.id))
+      // 夹具没入库就明确失败，别让后面的 `portrait.id` 抛成「套件执行未抛异常」把 C8 的
+      // 真正断言埋掉（那样会看成"整段跑崩"，分不清是夹具问题还是被测代码问题）
+      if (!portrait) throw new Error('C8 夹具未入库（导入被跳过？）')
+
+      const sm = await compressAssets([portrait.id], {
+        format: 'jpeg',
+        quality: 90,
+        maxEdge: 0,
+        alsoJpeg: true
+      })
+      const it = sm.items[0]
+      check(
+        'C8 竖拍图能压成功（不再被「尺寸校验不过」误杀）',
+        it?.status === 'done',
+        `${it?.status}: ${it?.reason}`
+      )
+      const m1 = await sharp(relAbs('素材/portrait.jpg')).metadata()
+      check(
+        'C8 输出是显示尺寸 1200×1600（方向已烧进像素、EXIF 已清除）',
+        m1.width === 1200 && m1.height === 1600 && (m1.orientation ?? 1) === 1,
+        `${m1.width}x${m1.height} o=${m1.orientation}`
+      )
+    }
   } catch (e) {
     check('套件执行未抛异常', false, String((e as Error)?.message ?? e))
   } finally {

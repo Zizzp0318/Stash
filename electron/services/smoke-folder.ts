@@ -153,6 +153,24 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     // ==================== B. 负例：非法名一律拦住 ====================
     step("B")
     const thumbsId = D().prepare('INSERT INTO folders(parent_id,path,name,created_at) VALUES(NULL,?,?,?)').run('.thumbs', '.thumbs', Date.now()).lastInsertRowid
+    /*
+     * 大小写探针：Windows 上 `CaseProbe` 与 `caseprobe` 是**同一个目录**。
+     * 修复前 `mkdirChild` 的 `path=?` 是二进制比较 → 新名字能过检，而 mkdirSync 因目录已存在
+     * 照样成功，`ensureFolderRows` 又插一条 folders 行：侧栏出现两个"同名"文件夹、
+     * 素材计数被劈成两半，同一个文件还能被两条不同大小写的 rel_path 各索引一次。
+     * 必须用 ASCII 名字 —— 中文没有大小写，这条验不出来。
+     */
+    const caseSeed = mkdirChild('', 'CaseProbe')
+    const caseRejected = nah(() => mkdirChild('', 'caseprobe'))
+    R.b_case = {
+      rejected: caseRejected,
+      rows: (D().prepare("SELECT count(*) AS c FROM folders WHERE LOWER(path)='caseprobe'").get() as { c: number }).c,
+      onDisk: onDisk('CaseProbe')
+    }
+    // 立刻收掉：G 段断言「删完 一级 后只剩 对照」，根上多一个目录会把那条判红
+    D().prepare('DELETE FROM folders WHERE id=?').run(caseSeed.id)
+    rmSync(abs('CaseProbe'), { recursive: true, force: true })
+
     R.b_negative = {
       slash: nah(() => mkdirChild('一级', 'a/b')),
       colon: nah(() => mkdirChild('一级', 'a:b')),
@@ -1852,6 +1870,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
 
     const a = R.a_create as { disk: boolean[]; parentChain: boolean[]; rows: string[] }
     const b = R.b_negative as Record<string, string>
+    const bCase = (R.b_case ?? {}) as { rejected?: string; rows?: number; onDisk?: boolean }
     const c = R.c_import as { added: number[]; relPaths: string[]; tagLinks: number }
     const d = R.d_thumbs as { assets: number; cacheDirs: number; gridOk: boolean; detailOk: boolean }
     const df = R.d_files as { grid: number; detail: number }
@@ -2056,6 +2075,9 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // B 负例全部被拦（返回的不是 NO_ERROR）
       negativesRejected: Object.values(b ?? {}).every((x) => x !== 'NO_ERROR'),
       protectedFolder: (b?.protectedDir ?? '').includes('ERR_PROTECTED_FOLDER'),
+      // 大小写变体（CaseProbe / caseprobe）必须被当成"已存在"拒掉，且库里只能留一条 folders 行 ——
+      // 否则同一个物理目录被登记成两个文件夹（侧栏两份、计数劈半、rel_path 两种大小写各索引一次）
+      caseInsensitiveDuplicate: bCase.rejected === 'ERR_FOLDER_EXISTS' && bCase.rows === 1 && bCase.onDisk === true,
       // C 导入与标签关联
       importedDeep: c?.added?.[0] === 2 && c?.added?.[1] === 2 && c.tagLinks === 1,
       // D 缩略图缓存真的落盘了（否则 G 的回收验证没有意义）；

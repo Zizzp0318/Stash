@@ -53,7 +53,7 @@
 //
 // ⚠️ 不写真实 userData（本套只建临时库），所以不需要快照/还原 config。
 import { app, BrowserWindow } from 'electron'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
@@ -790,6 +790,10 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
       {
         const rel = `${existing.path}/child.png`
         const id = rowByRel(rel)?.id ?? -1
+        // 留一份原文件：D3b 要用「同一个文件」验证"复活"，删掉就没了
+        const reviveDir = join(dir, 'seed', 'revive')
+        mkdirSync(reviveDir, { recursive: true })
+        copyFileSync(relAbs(rel), join(reviveDir, 'child.png'))
         rmSync(relAbs(rel), { force: true })
         const missingDb = await waitDb(() => rowByRel(rel)?.missing === 1, 20000)
         check('D3 前置：外部删除被同步（该行 missing=1）', missingDb, `missing=${rowByRel(rel)?.missing}`)
@@ -801,6 +805,66 @@ export async function runSmokeWatch(win: BrowserWindow): Promise<void> {
         )
         check('D3 不重开库，卡片被加上 .missing 失效样式（UI 按既有设计灰置，而非消失）',
           missCls, `data-id=${id}`)
+      }
+
+      // —— D3c 失效行占着 rel_path：同名不同内容的导入必须**自动改名**，不能撞 UNIQUE ——
+      // 状态正好是 D3 留下的：`已有/child.png` 这条记录还在（missing=1）而磁盘上没有文件。
+      // 修复前 `uniqueName` 只查磁盘（existsSync 恒 false）→ 算出同一个名字 →
+      // 文件已 copy 进库、INSERT 才抛 `UNIQUE constraint failed: assets.rel_path`：
+      // 用户看到裸英文报错，而且那个文件**永远不会被索引**（watcher 的 add 也会因 rel_path 已存在而 skip）。
+      // 刻意用"新内容 + 同名"而不是再删一次文件，避免多产生一条 removed 广播污染 D4 的 __ext 断言。
+      {
+        const rel = `${existing.path}/child.png`
+        const occId = rowByRel(rel)?.id ?? -1
+        const clashDir = join(dir, 'seed', 'clash')
+        mkdirSync(clashDir, { recursive: true })
+        writeFileSync(join(clashDir, 'child.png'), await makePng(260, 200, 70)) // 内容不同 → 不会被 dedupe 命中
+        await importSeeded([join(clashDir, 'child.png')], existing.id)
+
+        const renamedRel = `${existing.path}/child (1).png`
+        check(
+          'D3c 目标 rel_path 被 missing 行占着时，同名导入自动改名成 `child (1).png`（不再撞 UNIQUE）',
+          existsSync(relAbs(renamedRel)),
+          `存在=${existsSync(relAbs(renamedRel))}`
+        )
+        check(
+          'D3c 改名后的新行真的进了索引（不是"导进去了但看不见"）',
+          !!rowByRel(renamedRel),
+          JSON.stringify(rowByRel(renamedRel))
+        )
+        check(
+          'D3c 原来那条 missing 行原封不动（没被覆盖，也没被当成复活）',
+          rowByRel(rel)?.id === occId && rowByRel(rel)?.missing === 1,
+          `id=${rowByRel(rel)?.id} missing=${rowByRel(rel)?.missing}`
+        )
+      }
+
+      // —— D3b 重新导入被外部删掉的那张 → 应"复活"原行，而不是当重复内容跳过 ——
+      // 修复前：`dedupe` 只按 hash 全库查、不看 missing → 命中这条幽灵行就当"库里已有"跳过，
+      // 用户看到"跳过 1 个（重复）"却什么也没回来，而库体检又催他清理这条失效记录。
+      {
+        const rel = `${existing.path}/child.png`
+        const id = rowByRel(rel)?.id ?? -1
+        // 先挂上用户标注：复活的全部意义就是把这些一条不丢地带回来
+        requireCurrent().db.prepare('UPDATE assets SET rating=5, is_fav=1 WHERE id=?').run(id)
+        const keep = join(dir, 'seed', 'revive', 'child.png')
+        const hashBefore = contentHash(keep)
+        await importSeeded([keep], existing.id)
+
+        const row = rowByRel(rel)
+        check('D3b 被外部删掉的那条被"复活"（id 不变、missing 回到 0）',
+          row?.id === id && row?.missing === 0, `id=${row?.id} missing=${row?.missing}`)
+        const u = requireCurrent().db.prepare('SELECT rating, is_fav FROM assets WHERE id=?').get(id) as
+          | { rating: number; is_fav: number }
+          | undefined
+        check('D3b 复活保留了用户的评分/收藏（证明是复用旧行，不是新插一条）',
+          u?.rating === 5 && u?.is_fav === 1, `${u?.rating}/${u?.is_fav}`)
+        check('D3b 磁盘文件真的回到了原路径', existsSync(relAbs(rel)))
+        check('D3b 没有多插一行（该 rel_path 在库里只有一条）',
+          count(`SELECT count(*) AS c FROM assets WHERE LOWER(rel_path)=LOWER('${rel}')`) === 1,
+          String(count(`SELECT count(*) AS c FROM assets WHERE LOWER(rel_path)=LOWER('${rel}')`)))
+        check('D3b 复活后的 content_hash 与源文件一致',
+          row?.content_hash === hashBefore, `${row?.content_hash} vs ${hashBefore}`)
       }
 
       // —— D4 负向：应用自身的导入**不能**产生 library:external 假广播 ——
