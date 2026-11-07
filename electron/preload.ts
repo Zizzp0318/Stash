@@ -148,7 +148,8 @@ contextBridge.exposeInMainWorld('stash', {
     remove: (id: number) => ipcRenderer.invoke('tag:delete', { id })
   },
   dialog: {
-    pickFolder: () => ipcRenderer.invoke('dialog:pick-folder'),
+    /** 选目录。传 `'import'` = 导入文件夹（从上次导入位置开始，并记住本次选择）；其余（选库）不带默认路径 */
+    pickFolder: (purpose?: 'import' | 'library') => ipcRenderer.invoke('dialog:pick-folder', purpose),
     pickFiles: () => ipcRenderer.invoke('dialog:pick-files')
   },
   settings: {

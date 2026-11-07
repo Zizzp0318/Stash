@@ -28,6 +28,18 @@ export interface Settings {
    */
   sidebarWidth: number
   /**
+   * 上次「导入文件 / 导入文件夹」时所在的目录。
+   *
+   * 只用于给系统文件对话框当 `defaultPath` —— 不填的话 Windows 每次都回到
+   * 「下载」（Electron 的默认行为），用户每次导入都要重新翻一遍。
+   *
+   * ⚠️ 这里**只做类型校验，不校验存在性**：存在性放到真正要用的那一刻判断
+   * （`main.ts` 的 `importStartDir()`）。理由是 U 盘拔掉、网络盘断开、目录被改名
+   * 都会让 `existsSync` 变假；若在读配置时就清空，用户插回 U 盘后还得重新选一次，
+   * 而他要的恰恰是「记住上次那个位置」。
+   */
+  lastImportDir: string
+  /**
    * 主题。`dark` = 深黑（默认，与改造前一致）；`light` = 暖灰白；`system` = 跟随系统。
    * 三态**解析成 dark/light 的逻辑在渲染层**（`stores/settings.ts` 的 effectiveTheme，
    * 它会读 `prefers-color-scheme`）—— 主进程不重复判断一遍，
@@ -98,6 +110,8 @@ export const DEFAULT_SETTINGS: Settings = {
   detailCollapsed: false,
   closeToTray: true,
   sidebarWidth: 198,
+  /** 空串 = 还没记录过，交给系统默认位置 */
+  lastImportDir: '',
   theme: 'dark',
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
@@ -189,6 +203,8 @@ export function sanitizeSettings(raw: unknown): Settings {
     // 否则老配置缺键会被判成关 → 升级后行为悄悄变了
     closeToTray: r.closeToTray !== false,
     sidebarWidth,
+    // 只做类型校验（存在性在 `main.ts` 的 importStartDir 里判，理由见接口上的注释）
+    lastImportDir: typeof r.lastImportDir === 'string' ? r.lastImportDir : d.lastImportDir,
     // 主题走**白名单**：只认这两个字面量，其余（'Light' / 'auto' / 123 / undefined）一律回落 'dark'。
     // 回落成 dark 而不是 light 有两个理由：它是升级前的既有观感，也是 `:root` 的默认值 ——
     // 配置文件被手改坏时，界面应该退回「本来长什么样」，而不是突然变白。

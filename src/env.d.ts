@@ -307,7 +307,12 @@ export interface StashTagApi {
 }
 
 export interface StashDialogApi {
-  pickFolder: () => Promise<string | null>
+  /**
+   * 选目录。
+   * 传 `'import'` = 导入文件夹：对话框从**上次导入的位置**开始，选完把本次位置记下来；
+   * 不传（或 `'library'`）= 新建库 / 打开库：**不带**默认路径（选库与选导入目录是两件事）。
+   */
+  pickFolder: (purpose?: 'import' | 'library') => Promise<string | null>
   pickFiles: () => Promise<string[]>
 }
 

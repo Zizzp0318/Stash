@@ -706,13 +706,61 @@ function bootstrap(): void {
     )
 
     // 系统对话框
-    ipcMain.handle('dialog:pick-folder', async () => {
-      const r = await dialog.showOpenDialog(win, { properties: ['openDirectory', 'createDirectory'] })
-      return r.canceled ? null : r.filePaths[0]
+    //
+    // 「记住上次导入目录」：不传 `defaultPath` 时 Windows 每次都会把对话框开在「下载」，
+    // 用户每导一次就要重新翻一遍目录 —— 这是导入体验里最常被抱怨的一点。
+    /**
+     * 上次导入目录，用作 `defaultPath`。
+     * 没有记录、或该目录已经不在了（U 盘拔掉 / 被改名）→ 返回 undefined，交给系统默认位置。
+     */
+    function importStartDir(): string | undefined {
+      try {
+        const d = configSvc.getSettings().lastImportDir
+        return d && existsSync(d) ? d : undefined
+      } catch {
+        return undefined
+      }
+    }
+    /**
+     * 记住本次选择的位置。
+     *
+     * ⚠️ 存的是**父目录**（`dirname`）而不是选中的那一项：导入文件时拿到的本来就是文件全路径，
+     * 导入文件夹时拿到的是文件夹本身 —— 统一取父目录，下次打开就能看见刚选的那个以及它的同级，
+     * 而不是一进去就已经站在上一次选中的文件夹**内部**。
+     */
+    function rememberImportDir(picked: string): void {
+      try {
+        configSvc.patchSettings({ lastImportDir: dirname(picked) })
+      } catch {
+        /* 记不住不影响这次导入本身 */
+      }
+    }
+
+    /**
+     * 选目录。`purpose` 区分调用来源：
+     *  - `'import'`：导入文件夹 → 从上次导入位置开始，选完记住它
+     *  - 其余（新建库 / 打开库）：**不**带默认路径 —— 选库和选导入目录是两件事，
+     *    让「新建库」也从上次导入的地方开始会很怪。
+     */
+    ipcMain.handle('dialog:pick-folder', async (_e, purpose?: 'import' | 'library') => {
+      const start = purpose === 'import' ? importStartDir() : undefined
+      const r = await dialog.showOpenDialog(win, {
+        properties: ['openDirectory', 'createDirectory'],
+        ...(start ? { defaultPath: start } : {})
+      })
+      const picked = r.canceled ? null : r.filePaths[0]
+      if (picked && purpose === 'import') rememberImportDir(picked)
+      return picked
     })
     ipcMain.handle('dialog:pick-files', async () => {
-      const r = await dialog.showOpenDialog(win, { properties: ['openFile', 'multiSelections'] })
-      return r.canceled ? [] : r.filePaths
+      const start = importStartDir()
+      const r = await dialog.showOpenDialog(win, {
+        properties: ['openFile', 'multiSelections'],
+        ...(start ? { defaultPath: start } : {})
+      })
+      if (r.canceled || !r.filePaths.length) return []
+      rememberImportDir(r.filePaths[0])
+      return r.filePaths
     })
   }
 

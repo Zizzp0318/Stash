@@ -262,7 +262,7 @@ async function pickImportFiles(): Promise<void> {
  */
 async function pickImportFolder(): Promise<void> {
   importMenuOpen.value = false
-  const dir = await window.stash.dialog.pickFolder()
+  const dir = await window.stash.dialog.pickFolder('import')
   if (!dir) return
   await window.stash.import.folder({ rootPath: dir, folderId: assets.query.folderId })
 }
