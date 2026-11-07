@@ -19,6 +19,7 @@
 // 对 matroska 报 maybe 也真播成功），所以「能不能播」只按扩展名白名单 + 真播失败后回退，
 // 绝不用 canPlayType 猜。白名单内的文件一律直出原文件，省掉一次转码。
 import { spawn } from 'child_process'
+import { decodeHeifToJpeg, isHeifExt } from './heif'
 import {
   createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
   type ReadStream
@@ -68,22 +69,18 @@ export function textMaxBytes(): number {
 const IMG_NATIVE = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'bmp', 'svg', 'ico'])
 
 /**
- * **明确不支持**的图片格式：HEIC / HEIF。
+ * ⚠️ 这里**不再**有「明确不支持」的图片格式集合。
  *
- * 它们既不在 `IMG_NATIVE` 里，也**救不回来** —— 这份预编译 sharp 的 libheif 不带 HEVC 编解码器，
- * 决定性证据是 `sharp(...).heif({ compression: 'hevc' })` 直接抛 `heifsave: Unsupported compression`
- * （辅助证据：`libvips-42.dll` 里查不到 `libde265` / `dav1d` 这两个 HEVC 解码器符号），派生必然失败。
- * `EXT_TYPE` 已经不认这几个扩展名 —— 放开任意格式导入后，`.heic` 新导入会落成 `type='file'`
- * （不尝试解码，直接给「用系统默认应用打开」）；但**存量库里可能还有**
- * `type='image', ext='heic'` 的行，所以要在这里显式返回 unsupported 给出原因，
- * 而不是让它走 derived 撞 sharp 报错、卡片一片空白还看不出为什么。
+ * 曾经的 `IMG_UNSUPPORTED = {heic, heif, hif}`：预编译 sharp 的 libheif 不带 HEVC 解码器，
+ * 交给 sharp 只会静默失败（卡片空白、无报错），所以那时在 `analyze()` 里显式返回 unsupported
+ * 并给出原因。**现在改由 `heif.decodeHeifToJpeg`（heif2jpeg：libheif + libde265）解码**，
+ * 这三个扩展名走正常的 `derived` 路径即可，不需要特殊分支。
  *
  * ⚠️ **别拿扩展名列表当证据**：`sharp.format.heif.input.fileSuffix` 只有 `['.avif']`，
  * 但 sharp 解码按**魔数嗅探**，不看扩展名 —— 把一份 AVIF 改名成 `.heic` 照样读得出来
  * （`metadata().format` 仍是 `heif`）。所以「改名 .heic 也能解」不能证明支持 HEIC，
- * 只能证明那份文件本来就不是 HEIC。
+ * 只能证明那份文件本来就不是 HEIC。真正的判据永远是拿一份**真 HEIC** 跑一遍。
  */
-const IMG_UNSUPPORTED = new Set(['heic', 'heif', 'hif'])
 
 // ⚠️ **tif / tiff 不在白名单里**（`IMG_UNSUPPORTED` 里也没有它）—— 它才是图片派生路径要救的格式。
 // 这里记一段踩过的坑，免得下次又「发现」一遍：曾有一轮冒烟里「<img> 加载 tiff 成功」，
@@ -109,6 +106,8 @@ const MIME: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp',
   avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml', ico: 'image/x-icon',
   tif: 'image/tiff', tiff: 'image/tiff',
+  // heic / heif / hif 永远走派生（Chromium 不认），这几条只用于「原文件信息」展示与错误提示
+  heic: 'image/heic', heif: 'image/heif', hif: 'image/heif',
   mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
   mkv: 'video/x-matroska', ogv: 'video/ogg',
   mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', m4a: 'audio/mp4', aac: 'audio/aac',
@@ -266,14 +265,8 @@ export async function analyze(row: PreviewRow): Promise<PreviewInfo> {
       // 原图直出。尺寸交给 <img> 自己的 naturalWidth，这里不额外读盘
       return { ...base, kind: 'image', bytes: size }
     }
-    // 存量 HEIC/HEIF：走 derived 只会撞 sharp 的「不带 HEVC 解码器」并失败，
-    // 界面表现为空白卡片且没有原因 —— 这里显式说清楚，别让它静默空白。
-    if (IMG_UNSUPPORTED.has(ext)) {
-      return {
-        ...base, kind: 'image', strategy: 'unsupported', mime: null,
-        reason: 'HEIC/HEIF 不受支持：预编译 sharp 不带 HEVC 解码器'
-      }
-    }
+    // HEIC/HEIF 落到下面这条派生路径：由 `heif.decodeHeifToJpeg` 解成 JPEG 中间件再出 webp
+    // （Chromium 不认 HEIC，所以**不能**把它们加进 `IMG_NATIVE`）。
     const hash = row.content_hash ?? ''
     if (!hash) {
       return { ...base, kind: 'image', strategy: 'unsupported', mime: null, reason: '该素材没有内容哈希，无法生成预览' }
@@ -377,12 +370,16 @@ function runFfmpeg(args: string[], onProgress?: (ratio: number, totalMs: number)
 /**
  * 图片：sharp 出 2560px 的 webp。顺带 `rotate()` 按 EXIF 摆正、HDR 转 sRGB
  * （与缩略图管线同一套处理，保证同一张图在两处观感一致）。
+ *
+ * HEIC/HEIF 先经 `heif.decodeHeifToJpeg` 解成 JPEG 中间件再交给 sharp —— 预编译 sharp 的
+ * libheif 不带 HEVC 解码器（见 `heif.ts` 文件头的实测记录），直接喂给 sharp 只会失败。
  */
-async function deriveImage(abs: string, out: string): Promise<void> {
+async function deriveImage(abs: string, out: string, ext = ''): Promise<void> {
   mkdirSync(join(out, '..'), { recursive: true })
   const tmp = `${out}.tmp`
   try {
-    await sharp(abs)
+    const src = isHeifExt(ext) ? await decodeHeifToJpeg(abs) : abs
+    await sharp(src)
       .rotate()
       .toColourspace('srgb')
       .resize({ width: maxImagePx(), height: maxImagePx(), fit: 'inside', withoutEnlargement: true })
@@ -469,7 +466,7 @@ export async function deriveFor(id: number, onProgress?: (ratio: number) => void
   onProgress?.(0)
 
   if (info.derive === 'image') {
-    await deriveImage(abs, derivedPathFor('image', hash))
+    await deriveImage(abs, derivedPathFor('image', hash), row.ext)
   } else if (info.derive === 'audio') {
     // 探不到时长就只报不确定进度（0），不假装知道
     let totalMs = 0
@@ -480,6 +477,25 @@ export async function deriveFor(id: number, onProgress?: (ratio: number) => void
     await deriveVideo(abs, derivedPathFor(info.derive, hash), info.derive ?? 'transcode', probe, (r) => onProgress?.(r))
   }
   return info.derive
+}
+
+/**
+ * 派生失败的错误码 → 渲染层直接显示的人话。
+ *
+ * 为什么在这里翻：`preview:done` 的 `error` 会被 `PreviewImage/PreviewAudio` 原样渲染
+ * （`{{ error ?? '预览加载失败' }}`），不翻的话用户看到的是裸 `ERR_HEIF_DECODE`。
+ * 只翻「用户能据此动手」的几个，其余（含 ffmpeg 原始报错）原样透出便于排查 ——
+ * 与 `utils/format.ts` 的 `IMPORT_ERR_TEXT` 同一套取舍。
+ */
+function previewErrorText(e: unknown): string {
+  const code = String((e as Error)?.message ?? e)
+  const map: Record<string, string> = {
+    ERR_HEIF_DECODE: 'HEIC 解码失败：文件可能损坏，或不是 HEVC 编码的 HEIF（可试试系统默认应用打开）',
+    ERR_HEIF_EMPTY: 'HEIC 文件是空的（0 字节）',
+    ERR_HEIF_TOO_LARGE: 'HEIC 文件超过 200 MB，已跳过解码',
+    ERR_ASSET_MISSING: '库内找不到该文件（可能已被外部删除或移动）'
+  }
+  return map[code] ?? code
 }
 
 /**
@@ -498,7 +514,7 @@ export function ensureDerived(id: number): { previewId: number } {
       const derive = await deriveFor(id, (ratio) => send('preview:progress', { previewId, assetId: id, ratio }))
       send('preview:done', { previewId, assetId: id, ok: true, derive })
     } catch (e) {
-      send('preview:done', { previewId, assetId: id, ok: false, error: String((e as Error).message ?? e) })
+      send('preview:done', { previewId, assetId: id, ok: false, error: previewErrorText(e) })
     } finally {
       inFlight.delete(id)
     }

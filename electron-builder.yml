@@ -28,17 +28,24 @@ files:
   - '!开发文档.md'
   - '!electron/**'
   - '!src/**'
+  # 冒烟夹具（41 KB 的真 HEIC）：`--smoke-m2` / `--smoke-preview` 的 HEIC 断言要读它。
+  # ⚠️ 必须放在 `!electron/**` **之后**（electron-builder 里后匹配的规则生效），
+  # 否则会被上面那条排除吃掉 —— 打包版跑 HEIC 冒烟时会因为找不到夹具而红。
+  - electron/fixtures/sample.heic
   # 渲染层的 vue / pinia / markdown-it / @panzoom 已经被 vite 打进 out/renderer，
   # 再随包分发一遍纯属浪费（省十几 MB）。
-  # 保留的判断依据是主进程产物的 require 列表：chokidar / ffmpeg-static / sharp 三个必须留。
+  # 保留的判断依据是主进程产物的 require 列表：chokidar / ffmpeg-static / sharp / heif2jpeg 四个必须留。
   - '!node_modules/{vue,pinia,markdown-it,@panzoom}/**'
 
-# 原生模块必须解出 asar：sharp 的 .node 不能被 asar 里的 dlopen 加载，
+# 原生模块必须解出 asar：sharp 与 heif2jpeg 的 .node 不能被 asar 里的 dlopen 加载，
 # ffmpeg-static 的 exe 也必须落在真实磁盘上才能 spawn（见 electron/services/ffmpeg.ts）
 asarUnpack:
   - '**/node_modules/sharp/**'
   - '**/node_modules/@img/**'
   - '**/node_modules/ffmpeg-static/**'
+  # HEIC 解码器（Rust N-API）：主包是 JS 壳，真正干活的 .node 在平台子包里
+  - '**/node_modules/heif2jpeg/**'
+  - '**/node_modules/@heif2jpeg/**'
 
 win:
   icon: build/icon.ico

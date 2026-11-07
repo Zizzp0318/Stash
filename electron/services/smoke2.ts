@@ -3,14 +3,14 @@
 //       图片宽高/主色板回写、视频时长回写 → 二次调用全命中缓存
 import { app } from 'electron'
 import { spawn } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync, copyFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles } from './importer'
-import { ensureBatch, retestLegacyDims } from './thumbs'
+import { ensureBatch, ensureThumb, retestLegacyDims } from './thumbs'
 import { copyAssets } from './assets'
 import { DERIVED_FIELDS, derivedCopyCols } from './derived'
 
@@ -142,6 +142,53 @@ export async function runSmokeM2(): Promise<void> {
     await awaitBatch(assets as never, 'grid')
     await awaitBatch(assets as never, 'detail')
     result.cacheHitMs = Date.now() - t1
+
+    // 7. HEIC / HEIF：走 `heif.ts`（heif2jpeg = libheif + libde265）解码，**不经过 sharp 的 HEIF 通路**。
+    //
+    //    为什么必须有这条：预编译 sharp 里没有 HEVC 解码器，HEIC 一旦进 `EXT_TYPE` 却没人解，
+    //    表现就是「导入成功、卡片永远灰、还不报错」—— 这正是当初把这三个扩展名摘掉的原因。
+    //    所以这里断言的是**整条链路**（解码 → 缩略图 → 尺寸 → 色板 → 命中缓存），不是「文件存在」。
+    //    夹具是真 HEIC（41 KB / 1440×960），不是把 PNG 改名 —— 改名会被 sharp 的魔数嗅探蒙过去，
+    //    那条假绿曾经让一轮冒烟「证明」了 tiff 能直出（见 preview.ts 里那段教训）。
+    let heicOk = false
+    {
+      const heicSrc = join(srcDir, 'iphone.heic')
+      copyFileSync(join(app.getAppPath(), 'electron', 'fixtures', 'sample.heic'), heicSrc)
+      await new Promise<void>((resolve) => importFiles({ paths: [heicSrc], folderId: folder.id, mode: 'copy', onDone: () => resolve() }))
+      const heicRow = db.prepare("SELECT id, type, ext, content_hash, rel_path FROM assets WHERE name='iphone.heic'").get() as
+        | { id: number; type: string; ext: string; content_hash: string; rel_path: string }
+        | undefined
+      if (!heicRow) {
+        result.heic = { imported: false }
+      } else {
+        await awaitBatch([heicRow] as never, 'grid')
+        await awaitBatch([heicRow] as never, 'detail')
+        const gridOk = existsSync(join(libPath, '.thumbs', heicRow.content_hash, 'grid.webp'))
+        const detailOk = existsSync(join(libPath, '.thumbs', heicRow.content_hash, 'detail.webp'))
+        // 尺寸必须回写（走的是 openImageSource，不是 sharp 直读）
+        const dims = db.prepare('SELECT width, height, palette FROM assets WHERE id=?').get(heicRow.id) as
+          { width: number | null; height: number | null; palette: string | null }
+        // 再要一次 → 必须命中缓存（证明上面那份确实落在规范路径上）
+        const again = await ensureThumb(heicRow.id, 'grid')
+        result.heic = {
+          imported: true,
+          type: heicRow.type,
+          ext: heicRow.ext,
+          gridOk,
+          detailOk,
+          width: dims.width,
+          height: dims.height,
+          palette: dims.palette != null,
+          cacheHit: again?.generated === false
+        }
+        heicOk = heicRow.type === 'image' &&
+          heicRow.ext === 'heic' &&
+          gridOk && detailOk &&
+          dims.width === 1440 && dims.height === 960 &&
+          dims.palette != null &&
+          again?.generated === false
+      }
+    }
 
     // 8. 审计 §2.17：派生字段注册表的**跨源不变量**。
     //    为什么必须有：B2 是「复发型」—— 加一个「生成时顺手回写」的索引字段要同步好几处，
@@ -352,9 +399,12 @@ export async function runSmokeM2(): Promise<void> {
         importFiles({ paths: [o6, o1, vRot], folderId: oFolder.id, mode: 'copy', onDone: () => resolve() })
       })
       const odb = requireCurrent().db
+      // ⚠️ 查询必须带上 `ext`：`ensureBatch` 的 job.asset 契约是
+      // `{id,type,ext,content_hash,rel_path}`，少一列就会让「HEIC 走 heif 解码」那条分支
+      // 拿到 undefined（2026-11 实测：漏了 ext → 缩略图静默不生成 → 本段 readFile ENOENT）。
       const oRows = odb
-        .prepare('SELECT id, name, type, content_hash, rel_path FROM assets')
-        .all() as Array<{ id: number; name: string; type: string; content_hash: string; rel_path: string }>
+        .prepare('SELECT id, name, type, ext, content_hash, rel_path FROM assets')
+        .all() as Array<{ id: number; name: string; type: string; ext: string; content_hash: string; rel_path: string }>
       await awaitBatch(oRows as never, 'grid')
       const oById = new Map(oRows.map((r) => [r.name, r]))
       const idxDims = (name: string): { w: number; h: number } => {
@@ -432,7 +482,9 @@ export async function runSmokeM2(): Promise<void> {
       d17CopyDiff.length === 0 &&
       // 缺陷 2：方向（索引尺寸 = 显示尺寸且与缩略图同形）+ 存量迁移
       orientOk &&
-      migrateOk
+      migrateOk &&
+      // HEIC/HEIF 整条链路（解码 → 两级缩略图 → 尺寸/色板回写 → 命中缓存）
+      heicOk
 
     console.log('[SMOKE-M2] ' + JSON.stringify(result, null, 2))
   } catch (e) {

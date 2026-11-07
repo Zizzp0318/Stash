@@ -25,6 +25,7 @@
 
 **导入与整理**
 - 拖文件进窗口、粘贴、或从工具栏「导入」下拉选导入文件；按内容哈希跳过重复
+- **iPhone 的 HEIC 照片直接能看**：`.heic / .heif / .hif` 进库即出缩略图与高清预览（解码走 libheif + libde265，不依赖系统装了什么）；HEIC 单张解码比 JPEG 慢一截，批量导入时卡片是慢慢出图的，界面不会卡
 - 也可以**整文件夹导入**：选一个文件夹，它连同里面的子目录会被原样建进当前文件夹
   （选桌面 `6666` 导入到 `11111` → 得到 `11111/6666/...`；不支持的格式自动跳过，`.` 开头的隐藏目录和空目录不会进来）
 - 重名自动改成 `名字 (1).ext`，**绝不覆盖**；文件类型不支持则整体跳过
@@ -103,6 +104,7 @@
 - **Electron 44** + **Vue 3** + **electron-vite** + **Pinia**（TypeScript）
 - 索引：Node 内置 `node:sqlite`（零外部依赖）
 - 缩略图：`sharp`（libvips）
+- HEIC/HEIF 解码：`heif2jpeg`（Rust N-API，内含 libheif + libde265）
 - 视频探测与转码：`ffmpeg-static`
 - 文件监听：`chokidar`
 
@@ -128,7 +130,7 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 
 | 入口 | 覆盖 |
 |---|---|
-| `--smoke-m1/-m2/-m4` | 建库 / 导入 / 多选与批量操作 / 右键菜单 / 详情页 |
+| `--smoke-m1/-m2/-m4` | 建库 / 导入 / 多选与批量操作 / 右键菜单 / 详情页；`-m2` 另含 HEIC 解码链路（真 HEIC → 两级缩略图 → 尺寸/色板回写 → 命中缓存） |
 | `--smoke-forget` | 移除库：记录被移除，目录 / 索引 / 缓存原样保留 |
 | `--smoke-folder` | 文件夹多级新建、重命名、物理删除 |
 | `--smoke-search` | 关键词、标签、评分、类型、排序、分页、组合 |
@@ -151,9 +153,8 @@ env -u ELECTRON_RUN_AS_NODE npx electron . --no-sandbox --disable-gpu --smoke-m4
 - 跑冒烟测试前先 `npm run build`：`out/` 产物缺失时应用会挂死而不是报错
 - 仅支持 Windows（打包目标 x64）
 - 未做代码签名，首次运行安装包会被 SmartScreen 拦一下（「更多信息 → 仍要运行」）
-- **不支持 HEIC / HEIF**（iPhone 默认照片格式）：预编译的 `sharp` 里那套 libheif 不带 HEVC
-  编解码器，所以 `heic / heif / hif` 没有列入支持的格式 —— 拖进来会被当作「格式不支持」跳过。
-  要用请先转成 JPG / PNG / TIFF
+- **HEIC 解码靠软件解码器**：12MP 单张约 0.6–0.7 秒（JPEG 是几十毫秒），一次导入几千张 iPhone 照片时缩略图会排队慢慢出，界面不卡但别指望瞬间铺满
+- **Live Photo 不配对**：`IMG_1234.HEIC` 与 `IMG_1234.MOV` 会显示成两个素材（一张图 + 一段视频）
 - 「未知」来源的图不会被强行标记成 AI 生成
 - **虚拟滚动只窗口化 DOM，不卸载数据**：卡片节点数恒定（1 万条实测 ~24–36 个），
   但已浏览过的行对象仍留在内存里（1 万条约 29 MB 增量，实测 `--smoke-vscroll`）。

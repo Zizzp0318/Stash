@@ -40,7 +40,7 @@
 //     自动降级处理，不用再记参数；根因与实测数据见 main.ts 顶部那段注释。）
 import { app, type BrowserWindow } from 'electron'
 import { spawn } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync, unlinkSync, chmodSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync, unlinkSync, chmodSync, copyFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
@@ -174,7 +174,13 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     const vanishPath = join(srcDir, 'vanish.png')
     await sharp({ create: { width: 120, height: 90, channels: 3, background: '#205020' } }).png().toFile(vanishPath)
 
-    const allPaths = [pngPath, tiffPath, portraitPath, mp4Path, mkvPath, aviPath, wavPath, txtPath, gbkPath, vanishPath]
+    // HEIC/HEIF：真样本（41 KB，1440×960），不是「把 png 改名成 .heic」——
+    // 后者能被 sharp 的魔数嗅探蒙过去，测不到 HEVC 解码这条路（踩过这个假绿的坑）。
+    // 解不了 HEVC 的 sharp 在这里必然失败，所以这条同时也是「heif.ts 真的接上了」的接线断言。
+    const heicPath = join(srcDir, 'iphone.heic')
+    copyFileSync(join(app.getAppPath(), 'electron', 'fixtures', 'sample.heic'), heicPath)
+
+    const allPaths = [pngPath, tiffPath, portraitPath, mp4Path, mkvPath, aviPath, wavPath, txtPath, gbkPath, vanishPath, heicPath]
     result.samples = allPaths.length
 
     // ==================== 导入 ====================
@@ -200,11 +206,15 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
     const aviId = idOf('old.avi')
     const wavId = idOf('tone.wav')
     const txtId = idOf('note.txt')
+    const heicId = idOf('iphone.heic')
 
     // ==================== S1 策略判定 ====================
     const expectations: Array<[string, number, Partial<PreviewInfo>]> = [
       ['png 原图直出', pngId, { kind: 'image', strategy: 'original', mime: 'image/png' }],
       ['tiff 需派生', tiffId, { kind: 'image', strategy: 'derived', derive: 'image', mime: 'image/webp', ready: false }],
+      // HEIC 必须落 derived（Chromium 不认 HEIF），且**不能**是 unsupported ——
+      // 后者就是「导进来了但永远打不开」的旧行为，正是这次要消灭的形态。
+      ['heic 需派生（走 heif.ts 的 libheif 解码）', heicId, { kind: 'image', strategy: 'derived', derive: 'image', mime: 'image/webp', ready: false }],
       ['mp4 直出', mp4Id, { kind: 'video', strategy: 'original', mime: 'video/mp4' }],
       ['mkv 直出（反常识，实测能播）', mkvId, { kind: 'video', strategy: 'original', mime: 'video/x-matroska' }],
       ['avi 需转码', aviId, { kind: 'video', strategy: 'derived', derive: 'transcode', mime: 'video/mp4', ready: false }],
@@ -332,6 +342,38 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       const buf = Buffer.from(await res.arrayBuffer())
       const viaProtocol = await sharp(buf).metadata()
       check('S3 经 stash://media 取回的字节可直接解码',
+        res.status === 200 && res.headers.get('content-type') === 'image/webp' && viaProtocol.format === 'webp',
+        `status=${res.status} ct=${res.headers.get('content-type')} format=${viaProtocol.format}`)
+    }
+
+    // ==================== S3b HEIC 派生（heif.ts 解码 → webp）====================
+    //
+    // 这条覆盖的是「预编译 sharp 解不了 HEVC」这个曾把 HEIC 挡在门外的硬约束：
+    // 只要 `heif.ts` 没接上（或哪天有人把 heif2jpeg 从依赖里删了），`deriveFor` 会在这里抛错。
+    {
+      const derive = await deriveFor(heicId)
+      check('S3b heic 派生方式为 image', derive === 'image', String(derive))
+
+      const heicRow = rowOf(heicId)
+      const out = derivedPathFor(derive, heicRow.content_hash ?? '')
+      check('S3b heic 派生文件已落盘', existsSync(out), out.replace(lib.path, '<lib>'))
+
+      // 真解一遍：样本是 1440×960，上限 2560 不会放大 → 派生图应当正好 1440×960
+      const meta = await sharp(out).metadata()
+      check('S3b heic 派生图可解码且尺寸正确',
+        meta.format === 'webp' && meta.width === 1440 && meta.height === 960,
+        `format=${meta.format} ${meta.width}x${meta.height}`)
+
+      const after = await previewInfo(heicId)
+      check('S3b heic 派生后 ready=true 且 MIME 为 webp',
+        after.ready === true && after.mime === 'image/webp' && after.bytes > 0,
+        `ready=${after.ready} mime=${after.mime} bytes=${after.bytes}`)
+
+      // 走协议取回来再解一次 —— 证明出口给的是真能解码的图，而不是一个空壳文件
+      const res = await serveMedia(mkReq(heicId), String(heicId))
+      const buf = Buffer.from(await res.arrayBuffer())
+      const viaProtocol = await sharp(buf).metadata()
+      check('S3b heic 经 stash://media 取回的字节可直接解码',
         res.status === 200 && res.headers.get('content-type') === 'image/webp' && viaProtocol.format === 'webp',
         `status=${res.status} ct=${res.headers.get('content-type')} format=${viaProtocol.format}`)
     }

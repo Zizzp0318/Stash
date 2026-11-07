@@ -11,6 +11,7 @@ import { requireCurrent, getLibrary } from './library'
 import { getSettings } from './config'
 import { isThumbHash, relFromLib } from './paths'
 import { thumbSinkWhere } from './derived'
+import { decodeHeifToJpeg, isHeifExt } from './heif'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
@@ -39,6 +40,18 @@ function openSource(abs: string): Sharp {
     /* stat 失败就退回按路径打开，让 sharp 自己去报错 */
   }
   return sharp(abs)
+}
+
+/**
+ * 图片的**统一入口**：HEIC/HEIF 先用 heif2jpeg 解成 JPEG 中间件，其余按原路交给 sharp。
+ *
+ * 为什么三处（缩略图 / 尺寸回写 / 色板）必须共用这一个函数：这三处都要「真的解一次图」，
+ * 漏掉任意一处，那个格式就会出现「卡片有图但尺寸为空」「有图但色板永远 NULL」这类半残状态 ——
+ * 而且 `writeIndexFields` 是幂等的（算过就不再算），一旦写错会**永久**留着错值。
+ */
+async function openImageSource(abs: string, ext: string): Promise<Sharp> {
+  if (isHeifExt(ext)) return sharp(await decodeHeifToJpeg(abs))
+  return openSource(abs)
 }
 
 /**
@@ -259,7 +272,9 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
 
   try {
     if (asset.type === 'image') {
-      await openSource(abs)
+      // HEIC/HEIF 走 `openImageSource`（先解码成 JPEG 中间件）；`.rotate()` 对中间件是空操作，
+      // 但留在这里是无害的：解码器已经应用过容器旋转，而别的格式仍旧依赖它摆正 EXIF 方向。
+      await (await openImageSource(abs, asset.ext))
         .rotate() // 按 EXIF 方向摆正
         .toColourspace('srgb') // HDR 广色域照片转 sRGB，避免缩略图偏灰
         // 注意：`animated` 是 sharp 的**输入选项**（`sharp(input, { animated })`），
@@ -480,13 +495,14 @@ export function orientedDims(m: Metadata): { width: number; height: number } {
   return swap ? { width: h, height: w } : { width: w, height: h }
 }
 
-async function writeImageMeta(asset: { id: number; rel_path: string }): Promise<void> {
+async function writeImageMeta(asset: { id: number; rel_path: string; ext: string }): Promise<void> {
   const { db } = requireCurrent()
   const row = db.prepare('SELECT width FROM assets WHERE id=?').get(asset.id) as { width: number | null } | undefined
   if (!row || row.width != null) return // 已写过
   const abs = join(requireCurrent().path, ...asset.rel_path.split('/'))
   try {
-    const { width, height } = orientedDims(await openSource(abs).metadata())
+    // HEIC 也走这里（`openImageSource` 先解码）：否则这三个扩展名的卡片永远按 0×0 排版
+    const { width, height } = orientedDims(await (await openImageSource(abs, asset.ext)).metadata())
     db.prepare('UPDATE assets SET width=?, height=? WHERE id=?').run(width, height, asset.id)
   } catch { /* 解析失败忽略 */ }
 }
@@ -502,7 +518,7 @@ async function writeImageMeta(asset: { id: number; rel_path: string }): Promise<
  * 算不出来只可能是解码失败，而那时 sharp 会立刻抛错，重试成本极低。
  * （对比 `genmeta` 那边必须用状态位：那里「本来就没元数据」是**常态**，会无限重扫。）
  */
-async function writeIndexFields(asset: { id: number; rel_path: string }): Promise<void> {
+async function writeIndexFields(asset: { id: number; rel_path: string; ext: string }): Promise<void> {
   await writeImageMeta(asset)
   if (!getSettings().importing.palette) return
   const { db } = requireCurrent()
@@ -511,7 +527,7 @@ async function writeIndexFields(asset: { id: number; rel_path: string }): Promis
     | undefined
   if (!row || row.palette != null) return
   const abs = join(requireCurrent().path, ...asset.rel_path.split('/'))
-  const pal = await computePalette(abs)
+  const pal = await computePalette(abs, asset.ext)
   if (pal) db.prepare('UPDATE assets SET palette=? WHERE id=?').run(pal, asset.id)
 }
 
@@ -558,9 +574,9 @@ async function writeVideoMetaIfPending(asset: { id: number; rel_path: string }):
 }
 
 /** 图片主色板：取 50px 缩图原始像素，粗量化后取出现最多的 5 个颜色 */
-export async function computePalette(abs: string): Promise<string | null> {
+export async function computePalette(abs: string, ext = ''): Promise<string | null> {
   try {
-    const { data, info } = await openSource(abs)
+    const { data, info } = await (await openImageSource(abs, ext))
       .rotate()
       .toColourspace('srgb')
       .resize(50, 50, { fit: 'inside' })

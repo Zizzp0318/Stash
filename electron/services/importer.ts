@@ -27,11 +27,13 @@ export type AssetType = 'image' | 'video' | 'audio' | 'text' | 'file'
  * ⚠️ 不在这张表里的扩展名**不再等于"不导入"**，而是 `typeOfExt` 判成 `'file'`。
  * 想在导入阶段真正拒掉某个格式，请加到 `BLOCKED_EXT` / `JUNK_NAMES`，别在这里"省略"。
  *
- * ⚠️ **HEIC / HEIF 不支持，别好心加回来**：这份预编译 sharp 的 libheif 不带 HEVC 编解码器 ——
- * 决定性证据是 `sharp(...).heif({ compression: 'hevc' })` 直接抛 `heifsave: Unsupported compression`
- * （辅助证据：`libvips-42.dll` 里查不到 `libde265` / `dav1d` 这两个 HEVC 解码器符号）。
- * 加回来只会导入成功、却永远出不了缩略图和预览 —— 空白卡片还不报错，比直接不认更糟。
- * 要支持得换自编译 libheif+HEVC 的 sharp，或接系统解码器（WIC）。
+ * ⚠️ **HEIC / HEIF 现在支持了（2026-11 决策反转，别再往回改）**：预编译 sharp 的 libheif
+ * 确实不带 HEVC 解码器（`heifsave: Unsupported compression`；DLL 里查不到 `libde265`/`dav1d`），
+ * 所以这三个扩展名**不能**交给 sharp 解 —— 但它们走的是 `services/heif.ts` 的 heif2jpeg
+ * （libheif + libde265，Rust N-API），解出 JPEG 中间件再交回 sharp 缩放/取色/派生。
+ * 实测（本机 4 个真样本，含 iPhone 12MP 的 5 格 tile-grid）：单张 139–734 ms，
+ * 4 张 12MP 并发 1828 ms。**加回这三个键的前提是 `heif.ts` 在位**，否则就是
+ * 「导入成功、卡片永远空白、还不报错」——比不支持更糟。
  *
  * ⚠️ **别拿扩展名列表当证据**：`sharp.format.heif.input.fileSuffix` 只有 `['.avif']`，
  * 但 sharp 解码按**魔数嗅探**，不看扩展名 —— 把一份 AVIF 改名成 `.heic` 照样读得出来
@@ -41,6 +43,8 @@ export type AssetType = 'image' | 'video' | 'audio' | 'text' | 'file'
 export const EXT_TYPE: Record<string, AssetType> = {
   jpg: 'image', jpeg: 'image', png: 'image', webp: 'image', gif: 'image',
   bmp: 'image', tiff: 'image', tif: 'image', svg: 'image',
+  // Apple / 索尼 / 哈苏的 HEIF 系（走 heif.ts 解码，见上面的说明）
+  heic: 'image', heif: 'image', hif: 'image',
   mp4: 'video', mov: 'video', mkv: 'video', webm: 'video', avi: 'video',
   mp3: 'audio', wav: 'audio', flac: 'audio', aac: 'audio', ogg: 'audio', m4a: 'audio',
   txt: 'text', md: 'text'
