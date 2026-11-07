@@ -119,7 +119,35 @@ async function save(force = false): Promise<void> {
     conflict.value = true
     return
   }
-  assets.notify('error', `保存失败：${r.error}`)
+  assets.notify('error', `保存失败：${saveErrText(r.error)}`)
+}
+
+/**
+ * 保存失败的原因 → 人话。
+ *
+ * 背景（2026-11-07 用户反馈，远程机器）：他保存一个 txt 时看到的是
+ * `保存失败：EPERM: operation not permitted, open 'E:\我的资料库\...\胸部描述.txt'`
+ * —— 一句英文加一整条路径，完全不知道该怎么办。后来查明是那个文件带**只读属性**
+ * （同一时刻用记事本保存也只能「另存为」）。
+ *
+ * 下面这几类都是「用户照着做就能解决」的，必须说人话；其余（含 SQLite 原始报错）
+ * 原样透出，保留排查线索。
+ *
+ * ⚠️ `ERR_MTIME_CONFLICT` 不在这里 —— 它走上面的冲突选择条，不是错误弹窗。
+ */
+const SAVE_ERR_TEXT: Record<string, string> = {
+  ERR_TEXT_READONLY: '这个文件是「只读」的 —— 右键文件 → 属性 → 取消勾选「只读」，再保存一次',
+  ERR_TEXT_LOCKED:
+    '文件正被其它程序占用（或正在被同步盘 / 杀毒软件扫描）。关掉正在打开它的程序，或等两秒再试',
+  ERR_TEXT_DENIED: '没有写入这个文件的权限 —— 右键文件 → 属性 → 安全，看当前用户是否允许「写入」',
+  ERR_TEXT_READONLY_DISK: '所在磁盘是只读的（光盘 / 写保护的 U 盘 / 只读挂载的网络盘），无法保存',
+  ERR_TOO_LARGE: '内容超过了设置里的「文本预览上限」，请调大上限后再保存',
+  ERR_NOT_TEXT: '这个素材不是文本文件',
+  ERR_ASSET_MISSING: '文件已经不在磁盘上了（可能被外部删除或移动）'
+}
+
+function saveErrText(code: string | undefined): string {
+  return SAVE_ERR_TEXT[code ?? ''] ?? String(code ?? '未知错误')
 }
 
 /** 放弃我的改动，回到磁盘上的内容 */

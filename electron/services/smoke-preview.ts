@@ -40,7 +40,7 @@
 //     自动降级处理，不用再记参数；根因与实测数据见 main.ts 顶部那段注释。）
 import { app, type BrowserWindow } from 'electron'
 import { spawn } from 'child_process'
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync, unlinkSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, utimesSync, writeFileSync, unlinkSync, chmodSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import sharp from 'sharp'
@@ -48,6 +48,7 @@ import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles, contentHash } from './importer'
 import { DEFAULT_SETTINGS, getSettings, patchSettings } from './config'
+import { writeFileWithRetry } from './fsutil'
 import {
   analyze, previewInfo, deriveFor, serveMedia, derivedPathFor, rowOf, readText, writeText,
   textMaxBytes, type PreviewInfo
@@ -395,7 +396,7 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       const before = readText(noteId)
       const hashBefore = (requireCurrent().db.prepare('SELECT content_hash FROM assets WHERE id=?')
         .get(noteId) as { content_hash: string }).content_hash
-      const w = writeText(noteId, '改写后的内容\n', before.mtime)
+      const w = await writeText(noteId, '改写后的内容\n', before.mtime)
       const disk = readFileSync(noteAbs).toString('utf8')
       const row = requireCurrent().db.prepare('SELECT size, content_hash FROM assets WHERE id=?')
         .get(noteId) as { size: number; content_hash: string }
@@ -421,18 +422,91 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
       const future = new Date(Date.now() + 60000)
       utimesSync(noteAbs, future, future) // 模拟「文件在软件外被改过」
       let code = ''
-      try { writeText(noteId, '不该写进去的内容', stale.mtime) } catch (e) { code = String((e as Error).message) }
+      try { await writeText(noteId, '不该写进去的内容', stale.mtime) } catch (e) { code = String((e as Error).message) }
       check('S5 陈旧 mtime → ERR_MTIME_CONFLICT 且不覆盖',
         code === 'ERR_MTIME_CONFLICT' && readFileSync(noteAbs).toString('utf8') === '改写后的内容\n',
         `code=${code} disk=${JSON.stringify(readFileSync(noteAbs).toString('utf8'))}`)
     }
 
+    // 写：只读文件必须给出**精确**错误，而不是等重试耗尽再甩一个裸 EPERM
+    //
+    // 这是 2026-11-07 用户反馈的原形：他保存某个 txt 时看到
+    // 「保存失败：EPERM: operation not permitted, open 'E:\...'」，后来查明那个文件带
+    // 只读属性（同一时刻用记事本保存也只能「另存为」）。
+    // 只读是**确定失败**，重试毫无意义 —— 必须先判掉，直接给一句能照着做的提示。
+    {
+      chmodSync(noteAbs, 0o444)
+      let code = ''
+      try {
+        await writeText(noteId, '不该写进去的内容')
+      } catch (e) {
+        code = String((e as Error).message)
+      } finally {
+        // 必须恢复：Windows 上删只读文件会 EPERM，后面的清理会失败
+        chmodSync(noteAbs, 0o666)
+      }
+      check(
+        'S5 只读文件 → ERR_TEXT_READONLY（不等重试、不甩裸 EPERM）',
+        code === 'ERR_TEXT_READONLY',
+        `code=${code}`
+      )
+    }
+
+    // 写：瞬时占用重试（注入「3 次尝试里前两次 EPERM」）
+    //
+    // 现实来源：杀毒软件正在扫这个文件、同步盘锁着它、系统索引服务正在读它 ——
+    // 窗口通常几十到几百毫秒。这条断言证明「等一下再试」这条路**真的在走**，
+    // 不是写完就再也不执行的死代码。
+    {
+      const probe = join(tmpdir(), `stash-retry-probe-${Date.now()}.txt`)
+      const mkErr = (c: string): Error => Object.assign(new Error(`${c}: mock`), { code: c })
+      let calls = 0
+      await writeFileWithRetry(probe, 'attempt-payload', {
+        // 前两次抛 EPERM，第三次**真的写**（注入的 writeFn 不会自动落盘，必须自己调用）
+        writeFn: (f, d) => {
+          calls++
+          if (calls < 3) throw mkErr('EPERM')
+          writeFileSync(f, d)
+        }
+      })
+      const landed = existsSync(probe) ? readFileSync(probe, 'utf8') : null
+      rmSync(probe, { force: true })
+      check(
+        'S5 瞬时 EPERM 重试两次后写成功（用户不会看到报错）',
+        calls === 3 && landed === 'attempt-payload',
+        `calls=${calls} landed=${JSON.stringify(landed)}`
+      )
+    }
+
+    // 写：非瞬时错误**不许**重试 —— ENOSPC / EROFS 重试只会让用户干等
+    {
+      const probe = join(tmpdir(), `stash-noretry-probe-${Date.now()}.txt`)
+      const mkErr = (c: string): Error => Object.assign(new Error(`${c}: mock`), { code: c })
+      let calls = 0
+      let caught = ''
+      try {
+        await writeFileWithRetry(probe, 'x', {
+          writeFn: () => {
+            calls++
+            throw mkErr('ENOSPC')
+          }
+        })
+      } catch (e) {
+        caught = String((e as Error).message)
+      }
+      check(
+        'S5 非瞬时错误立即抛出（calls=1，不白等）',
+        calls === 1 && caught.startsWith('ENOSPC'),
+        `calls=${calls} caught=${caught}`
+      )
+    }
+
     // 写：非文本 / 超限
     {
       let notText = ''
-      try { writeText(pngId, 'x') } catch (e) { notText = String((e as Error).message) }
+      try { await writeText(pngId, 'x') } catch (e) { notText = String((e as Error).message) }
       let tooLarge = ''
-      try { writeText(noteId, 'x'.repeat(textMaxBytes() + 1)) } catch (e) { tooLarge = String((e as Error).message) }
+      try { await writeText(noteId, 'x'.repeat(textMaxBytes() + 1)) } catch (e) { tooLarge = String((e as Error).message) }
       check('S5 非文本写入被拒 / 超限被拒',
         notText === 'ERR_NOT_TEXT' && tooLarge === 'ERR_TOO_LARGE', `${notText} | ${tooLarge}`)
     }

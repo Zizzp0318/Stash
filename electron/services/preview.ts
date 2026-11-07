@@ -29,6 +29,7 @@ import { isAbsolute, join, relative, resolve } from 'path'
 import { BrowserWindow } from 'electron'
 import sharp from 'sharp'
 import { FFMPEG } from './ffmpeg'
+import { writeFileWithRetry } from './fsutil'
 import { getSettings } from './config'
 import { contentHash } from './importer'
 import { requireCurrent } from './library'
@@ -583,7 +584,7 @@ export interface TextWriteResult {
  * 文本的缩略图是占位图（按内容哈希命名），哈希一变旧图就失效，
  * 所以要为新哈希补一张，并清理旧哈希目录（确认没人再引用时）。
  */
-export function writeText(id: number, text: string, baseMtime?: number): TextWriteResult {
+export async function writeText(id: number, text: string, baseMtime?: number): Promise<TextWriteResult> {
   const { db } = requireCurrent()
   const row = rowOf(id)
   if (row.type !== 'text') throw new Error('ERR_NOT_TEXT')
@@ -598,7 +599,31 @@ export function writeText(id: number, text: string, baseMtime?: number): TextWri
     throw new Error('ERR_MTIME_CONFLICT')
   }
 
-  writeFileSync(abs, buf)
+  /**
+   * 只读属性：Windows 上 `writeFileSync` 报的是 `EPERM`（与"被占用"同一个码），
+   * 但重试多少次都没用。所以**先判掉**，用户拿到的是一句能照着做的提示，
+   * 而不是等 420ms 换一个 `EPERM: operation not permitted, open 'E:\...'`。
+   *
+   * `0o200` = owner write bit。Node 在 Windows 上把只读文件报成 `0o444`、可写报 `0o666`。
+   * 网络盘/某些虚拟文件系统可能不反映只读属性 —— 那种情况会走到下面的重试路径，
+   * 最终按 `EPERM` 归类成 `ERR_TEXT_LOCKED`（文案覆盖了"被占用**或**只读"两种可能）。
+   */
+  if ((stBefore.mode & 0o200) === 0) throw new Error('ERR_TEXT_READONLY')
+
+  try {
+    await writeFileWithRetry(abs, buf)
+  } catch (e) {
+    /**
+     * 走到这里说明「等一下再试」也没成功 —— 把底层错误码翻成用户能动手的三类。
+     * 其余（ENOSPC 磁盘满、ENOENT 文件刚被外部删…）原样抛出，由渲染层兜底显示，
+     * 这类需要的是具体系统信息而不是提炼过的文案。
+     */
+    const code = (e as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'EROFS') throw new Error('ERR_TEXT_READONLY_DISK')
+    if (code === 'EACCES') throw new Error('ERR_TEXT_DENIED')
+    if (code === 'EPERM' || code === 'EBUSY') throw new Error('ERR_TEXT_LOCKED')
+    throw e
+  }
   const st = statSync(abs)
   const hash = contentHash(abs)
   const oldHash = row.content_hash

@@ -9,7 +9,7 @@
  * ⚠️ 本文件**只依赖 `node:fs`，不得 import 任何 service**（避免 import 成环，见 MEMORY.md I3）。
  */
 
-import { copyFileSync, renameSync, unlinkSync } from 'fs'
+import { copyFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 
 /**
  * 「瞬时」的文件系统错误码 —— 值得重试的那些。
@@ -75,6 +75,16 @@ export interface RenameRetryOptions {
 const RENAME_RETRY_DELAYS = [60, 120, 250, 500, 900, 1500]
 
 /**
+ * 写文件的默认预算：3 次尝试（首发 + 2 次重试）、等待 0/120/300ms，最坏多花约 420ms。
+ *
+ * 为什么比改名预算小得多：改名失败常是「我们自己刚生成的缩略图还持着句柄」，可能要等几秒；
+ * 而写文件撞上的多是**别人的短动作** —— 杀软实时扫描单文件通常 100~500ms、索引服务更短。
+ * 另一方面，保存是**用户正在等**的操作，不能让界面看起来像卡住：420ms 是"几乎察觉不到"
+ * 与"覆盖大多数瞬时占用"之间的平衡点。再长就该报错让用户自己决定，而不是替他干等。
+ */
+const WRITE_RETRY_DELAYS = [0, 120, 300]
+
+/**
  * 重试耗尽的收尾：抛**裸码** `ERR_FOLDER_BUSY`。
  *
  * 为什么消息必须**恰好**是裸码（QA 在渲染层实测否证过一版带后缀的写法）：`main.ts` 的 `wrap`
@@ -135,6 +145,48 @@ export async function renameWithRetry(
     }
   }
   throw busyRenameError(from, to, attempts, last)
+}
+
+/**
+ * 有界重试的「写文件」（异步）。
+ *
+ * 判据与 `renameWithRetry` 共用同一套瞬时错误码：Windows 上写文件报 `EPERM` / `EBUSY` 时，
+ * **多数不是"没有权限"，而是"这一刻不让写"** —— 杀毒软件正在扫这个文件、同步盘正锁着它、
+ * 系统索引服务正在读它。这些窗口通常只有几十到几百毫秒，等一拍再写往往就成功了。
+ *
+ * 触发这次补丁的真实案例（2026-11-07，用户反馈的远程机器）：同一个库、同一台机器，
+ * 只有个别 txt 保存时报 `EPERM: operation not permitted, open 'E:\...'`，而**同一时刻
+ * 用记事本保存那个文件也只能「另存为」** —— 说明底层确实被占用或只读，不是我们写错了路径。
+ * 对"瞬时占用"这一类，重试就能救回来，用户根本不会看到报错。
+ *
+ * ⚠️ **只读文件别指望这里**：重试多少次都会失败，只会白等 420ms 再报错。调用方应先判
+ * 只读位（`(statSync(abs).mode & 0o200) === 0`）直接给出精确提示 —— 见
+ * `preview.writeText`。本函数只负责「等一会儿再试」这一件事。
+ *
+ * 耗尽后抛**原始错误**而不包装成 `ERR_XXX`：调用方要靠 `code` 区分 EPERM（被占用）、
+ * EACCES（权限）、EROFS（只读盘），包成统一的裸码就分不出来了。
+ */
+export async function writeFileWithRetry(
+  file: string,
+  data: Buffer | string,
+  opts: { attempts?: number; delays?: number[]; writeFn?: (f: string, d: Buffer | string) => void } = {}
+): Promise<void> {
+  const attempts = Math.max(1, opts.attempts ?? WRITE_RETRY_DELAYS.length + 1)
+  const delays = opts.delays ?? WRITE_RETRY_DELAYS
+  const doWrite = opts.writeFn ?? writeFileSync
+  let last: unknown
+  for (let i = 0; i < attempts; i++) {
+    try {
+      doWrite(file, data)
+      return
+    } catch (e) {
+      last = e
+      // 非瞬时错误（ENOENT / ENOSPC / EROFS…）立即抛出，绝不白等
+      if (!isTransientRenameError(e)) throw e
+      if (i < attempts - 1) await sleep(delays[i] ?? delays[delays.length - 1] ?? 0)
+    }
+  }
+  throw last
 }
 
 /**
