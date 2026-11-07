@@ -539,7 +539,41 @@ function bootstrap(): void {
     ipcMain.handle('asset:get', (_e, id) => wrap(() => assetsSvc.getAsset(id)))
     ipcMain.handle('asset:update', (_e, { id, patch }) => wrap(() => assetsSvc.updateAsset(id, patch)))
     ipcMain.handle('asset:bulk-update', (_e, { ids, patch }) => wrap(() => assetsSvc.bulkUpdate(ids, patch)))
-    ipcMain.handle('asset:move', (_e, { ids, folderId }) => wrap(() => assetsSvc.moveAssets(ids, folderId)))
+    /**
+     * 移动素材前**先停一下后台泵**。
+     *
+     * 起因（2026-11-07 用户反馈，现象很具体）：几十 MB 的视频拖动移动没事，**几百 MB 的**
+     * 就会出现「文件被复制过去 + 报 EBUSY ... unlink」。
+     *
+     * 大小分界来自 `thumbs.openSource` 的 `READ_INTO_MEMORY_MAX_BYTES = 64MB`：
+     * 不超过阈值的会 `readFileSync` 读进内存、源文件句柄立刻释放；超过的只能 `sharp(abs)`
+     * 按路径打开，**整个解码过程一直握着源文件**。此刻 `rename` 被系统拒绝 →
+     * `moveFileSync` 退化成「拷贝 + 删源」→ 删源也被那个句柄挡住 → 半截状态。
+     *
+     * 这个坑在「重命名文件夹」上早就踩过，`library.renameFolder` 甚至有一套分级隔离 + trail；
+     * 但**移动文件这条路一直没接**。这里补上最小够用的一档：只停泵，不停 watcher
+     * （移动单个文件不影响索引一致性，watcher 自己会跟着更新）。
+     *
+     * 预算 2.5s：`pausePumpAsync` 到点就返回 `timedOut`，绝不把移动卡死 ——
+     * 用户主动操作优先于后台缩略图。没任务在跑时它立即返回，等于零开销。
+     * `resumePumps` 必须在 finally：否则一次失败会把队列永久停掉（卡片一直灰）。
+     */
+    const withPumpsPaused = async <T>(fn: () => T): Promise<T> => {
+      try {
+        await Promise.all([pausePumpAsync(2500), pauseMetaPumpAsync(2500)])
+        return fn()
+      } finally {
+        // 两个泵互不依赖、各自幂等；任一抛错不能挡住另一个
+        try {
+          resumePump()
+        } finally {
+          resumeMetaPump()
+        }
+      }
+    }
+
+    ipcMain.handle('asset:move', (_e, { ids, folderId }) =>
+      wrap(() => withPumpsPaused(() => assetsSvc.moveAssets(ids, folderId))))
     ipcMain.handle('asset:delete', (_e, { ids }) => wrap(() => assetsSvc.deleteAssets(ids)))
     ipcMain.handle('asset:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameAsset(id, name)))
     /** 库内复制：在目标文件夹生成一份保留评分/喜欢/备注/标签的副本 */
