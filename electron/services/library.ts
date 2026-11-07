@@ -14,6 +14,7 @@ import {
   restartWatcherAfterRename,
   resumeIsolatedPumps,
   suppressMediaUnder,
+  suppressWatcherTree,
   suspendWatcherForRename
 } from './handles'
 
@@ -352,6 +353,23 @@ async function relocateUnlocked(
     if (existsSync(newAbs)) throw new Error('ERR_FOLDER_EXISTS')
   }
   if (!existsSync(oldAbs)) throw new Error('ERR_FOLDER_MISSING')
+
+  // 搬迁期间把**旧路径与目标路径**两棵子树登记进 watcher 的抑制窗口（前缀 + 按时间过期）。
+  //
+  // 为什么必须在 rename 之前：索引事务只改 `rel_path`、**不碰 `missing`**，而 watcher 只在
+  // 「rename 撞占用」时才被停掉 —— 直改成功时它全程在线。只要有一个 unlink/unlinkDir 回调
+  // 落在「物理已搬、事务未提交」的 await 窗口里，`markDirMissing` 就会按**旧前缀**把整棵
+  // 子树刷成 `missing=1`，事务提交后没人复位 → 用户看到「拖完文件夹，里面的素材全变灰卡」。
+  // 另一种更隐蔽的命中：同一路径在事件排空前被**搬走又搬回**（Q 段正是这种），延迟到达的
+  // unlink 会正好砸回搬回来的那一行。
+  //
+  // 为什么新路径也要抑制：chokidar 会把「目标目录出现 + 里面每个文件」报成 add，索引里本
+  // 就有这些行（`ON CONFLICT DO NOTHING` 兜着），抑制掉可以省一串无意义的 stat/哈希。
+  //
+  // ⚠️ 只抑制 unlink / unlinkDir（见 watcher 的 `underSuppressedTree`），**不抑制 add**：
+  // 真外部新增必须照常入库，这条窗口只有 5s。
+  suppressWatcherTree(row.path)
+  suppressWatcherTree(newRel)
 
   // 物理改名：有界重试（占用常见且多为瞬时），事务外
   //

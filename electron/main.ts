@@ -9,7 +9,7 @@ import * as importerSvc from './services/importer'
 import * as clipboardSvc from './services/clipboard'
 import * as previewSvc from './services/preview'
 import {
-  unwatchLibrary, watchLibrary, isWatching, suspendWatchingAsync, reconcileWhenReady
+  unwatchLibrary, watchLibrary, isWatching, suspendWatchingAsync, reconcileWhenReady, suppressSubtree
 } from './services/watcher'
 import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
@@ -97,6 +97,12 @@ registerRenameIsolationGuard({
   },
   watcherActive() {
     return isWatching()
+  },
+  suppressTree(rel: string, ms?: number) {
+    // 搬迁前登记：旧路径的 unlink/unlinkDir（以及搬到新路径后 chokidar 补发的事件）
+    // 都不该再改索引 —— 索引事务只改 rel_path、不碰 missing，漏进来就是一片灰卡。
+    // 前缀 + 按时间过期（不消费）：一次目录搬迁会来 unlinkDir + N 个 unlink，消费式挡不住。
+    suppressSubtree(rel, ms)
   },
   reconcileAfterWindow(libPath, db) {
     // 停监听 → 重挂到 ready 之间写进库的文件会被 ignoreInitial 吞掉（窗口随库规模线性增长），

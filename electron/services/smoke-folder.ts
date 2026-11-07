@@ -17,8 +17,8 @@ import { importFiles, importFolder } from './importer'
 import { ensureBatch, ensureThumb, pumpState } from './thumbs'
 import { renameWithRetry } from './fsutil'
 import {
-  __testForceNullFolderId, isWatching, reconcileLibrary, suspendWatchingAsync, unwatchLibrary, watchLibrary,
-  watchedDirCount, whenWatcherReady
+  __testForceNullFolderId, isWatching, markDirMissingRel, markMissingRel, reconcileLibrary, suspendWatchingAsync,
+  unwatchLibrary, watchLibrary, watchedDirCount, whenWatcherReady
 } from './watcher'
 import {
   __testAddUnclosableStream, activeMediaStreamCount, clearMediaSuppression, mediaSuppressionActivations,
@@ -2011,10 +2011,35 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // 这里就会冒出重复行、或者那唯一一行被标成 missing=1（界面上一张灰卡 + 一次假刷新）。
       await sleep(1200)
       const qCount = (sql: string): number => (D().prepare(sql).get() as { c: number }).c
+      // 先取**真实终态**（这一份不能被后面的注射器污染，否则 moveFolderSurvivesWatcher 就变成空转）
+      const settleRows = qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt'`)
+      const settleMissing = qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt' AND missing=1`)
+      const settleFolderRows = qCount(`SELECT count(*) AS c FROM folders WHERE path='移动源Q'`)
+      // ==================== Q-STALE：模拟「unlink/unlinkDir 事件晚到」====================
+      //
+      // 上面那条只能证明「这一轮的时序恰好没出事」，而真实事故正是**时序**问题：
+      // `relocateUnlocked` 只在 rename 撞占用时才停监听器，直改成功时 watcher 全程在线；
+      // 索引事务只改 `rel_path`、**不碰 `missing`**。于是晚到的事件有两种致命命中方式：
+      //   ① `unlinkDir(旧目录)` 落在「物理已搬、事务未提交」的 await 窗口里 →
+      //      按旧前缀把整棵子树刷成 missing=1，事务提交后没人复位；
+      //   ② 同一路径在事件排空前被**搬走又搬回**（本段正是如此）→ 晚到的 `unlink` 正好
+      //      砸回搬回来的那一行。
+      // ⚠️ 这条断言是**确定性**的：真实事件是否落在那个窗口里全看机器负载
+      // （实测关掉抑制：3 次跑只红了 2 次），靠碰运气抓不住回归 —— 所以这里手工喂一次事件。
+      //
+      // 前置：把那一行复位成「健康」，这样返回值只反映**抑制窗口有没有生效**，
+      // 不会被前面真实事件已经标过的 missing=1 吃掉（`UPDATE ... AND missing=0` 会返回 0 —— 踩过）。
+      D().prepare("UPDATE assets SET missing=0 WHERE rel_path LIKE '%move-q.txt'").run()
+      // 为什么用 watcher 里那份内核（`markMissingRel` / `markDirMissingRel`）而不是自己写 UPDATE：
+      // 那正是 `unlink` / `unlinkDir` 回调本身，另写一份等于没测。
+      const staleFile = markMissingRel(D(), '移动源Q/子层Q/move-q.txt')
+      const staleDir = markDirMissingRel(D(), '移动目标Q/移动源Q')
       R.q_settle = {
-        rows: qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt'`),
-        missing: qCount(`SELECT count(*) AS c FROM assets WHERE rel_path LIKE '%move-q.txt' AND missing=1`),
-        folderRows: qCount(`SELECT count(*) AS c FROM folders WHERE path='移动源Q'`)
+        rows: settleRows,
+        missing: settleMissing,
+        folderRows: settleFolderRows,
+        staleFile,
+        staleDir
       }
       step(`Q ${JSON.stringify(R.q_move)}`)
     }
@@ -2654,10 +2679,16 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       folderDropSelfIsNoop: qUiDrop?.relUnchanged === true && qUiDrop?.stillOnDisk === true,
 
       // 移动之后 watcher 不许"回头补刀"：既不能补插一行重复素材，也不能把唯一那行标成失效。
-      // 这条盯的是 `markMissing` 注释里那句推理（按旧 rel_path 查不到 → changes=0）。
+      // ⚠️ 这条只是**终态**断言，正常时序下即使没有抑制窗口也常常是绿的（本段实测：原始缺陷
+      // 是间歇性的，连跑多次才红一次）—— 真正可证伪的是下面的 Q-STALE。
       moveFolderSurvivesWatcher: (R.q_settle as { rows?: number; missing?: number; folderRows?: number } | undefined)?.rows === 1 &&
         (R.q_settle as { missing?: number } | undefined)?.missing === 0 &&
-        (R.q_settle as { folderRows?: number } | undefined)?.folderRows === 1
+        (R.q_settle as { folderRows?: number } | undefined)?.folderRows === 1,
+      // Q-STALE：把握手从「碰运气」变成「确定性」—— 手工喂一次晚到的事件，
+      // 搬迁抑制窗口必须把它吃掉（两个返回值都得是 0）。
+      // 判别力：`underSuppressedTree` 恒 false → staleFile/staleDir 变 1，本条立刻红。
+      moveFolderIgnoresStaleEvents: (R.q_settle as { staleFile?: number; staleDir?: number } | undefined)?.staleFile === 0 &&
+        (R.q_settle as { staleFile?: number; staleDir?: number } | undefined)?.staleDir === 0
     }
     R.ok = Object.values(R.checks as Record<string, boolean>).every(Boolean)
   } catch (e) {

@@ -86,6 +86,98 @@ function consumeSuppressed(rel: string): boolean {
 }
 
 /**
+ * **子树级**抑制：`rel` 本身及其下所有后代，在窗口内到达的 unlink / unlinkDir 一律忽略。
+ *
+ * 为什么需要它（`--smoke-folder` 的 `moveFolderSurvivesWatcher` 抓出来的真 bug）：
+ *   `renameFolder` / `moveFolder` 只在「rename 撞占用」时才停监听器，直改成功时 watcher 全程在线。
+ *   而索引事务**只改 `rel_path`、不碰 `missing`**，于是只要有一次 unlink/unlinkDir 回调落在
+ *   「物理已搬、事务尚未提交」的那个 await 窗口里，`markDirMissing` 就会按**旧前缀**
+ *   把整棵子树刷成 `missing=1`；事务提交后没有任何人把它复位 —— 用户看到的是
+ *   「拖完文件夹，里面的素材全变成失效灰卡」，得跑一次库体检才救得回来。
+ *   还有一种更隐蔽的命中方式：同一路径在事件排空前**搬走又搬回**（Q 段正是如此），
+ *   延迟到达的 unlink 会正好命中搬回来的那一行。
+ *
+ * 与 `suppressRel` 的两个刻意的差别：
+ *   1. 按**前缀**匹配（一次覆盖整棵树，不必逐行登记）；
+ *   2. **不消费**（窗口内一直有效）：chokidar 对一次目录搬迁会发 unlinkDir + N 个 unlink，
+ *      「消费一次」的语义挡不住后面那些。
+ */
+const suppressedTrees = new Map<string, number>()
+
+/** 让该目录（含全部子孙）在窗口内的 unlink / unlinkDir 事件被忽略（默认 5s） */
+export function suppressSubtree(rel: string, ms = 5_000): void {
+  const key = rel.replace(/\/+$/, '')
+  if (!key) return // 库根不能整体抑制：那等于把整个监听器关掉
+  suppressedTrees.set(key, Date.now() + ms)
+}
+
+/** 该 rel 是否落在某个未过期的抑制子树里（`a/b` 命中 `a`，但不命中 `ab`） */
+function underSuppressedTree(rel: string): boolean {
+  if (suppressedTrees.size === 0) return false
+  const now = Date.now()
+  for (const [prefix, until] of suppressedTrees) {
+    if (until < now) {
+      suppressedTrees.delete(prefix)
+      continue
+    }
+    if (rel === prefix || rel.startsWith(prefix + '/')) return true
+  }
+  return false
+}
+
+/**
+ * 把**一条**素材标成失效（`chokidar` 的 `unlink` 回调的内核）。
+ *
+ * 抽成模块级函数是为了让冒烟能用**同一份实现**模拟「事件晚到」（`--smoke-folder` 的
+ * Q 段：搬迁后手工喂一次旧路径的 unlink，断言抑制窗口把它吃掉）。
+ * 另起一份测试专用的标记逻辑就等于没测 —— 两次实现迟早分叉。
+ *
+ * @returns 实际标到多少行（0 = 被抑制、或索引里本来就没有这个 rel）
+ */
+export function markMissingRel(db: DB, rel: string): number {
+  // 整个子树刚被我们自己搬走（renameFolder / moveFolder）→ 这条 unlink 是搬迁的副产物。
+  // 必须挡在 missing 判定之前：索引事务只改 rel_path、不碰 missing，漏进来就留下灰卡
+  //（`--smoke-folder` 的 moveFolderSurvivesWatcher 曾长期红着，就是这条）。
+  if (underSuppressedTree(rel)) return 0
+  // 旧文件是我们自己删的（压缩替换完成），别把已经改好的那行标成 missing
+  if (consumeSuppressed(rel)) return 0
+  // `AND missing=0` 让「标失效」幂等：整目录被删时 chokidar 会**同时**发 unlinkDir（目录）
+  // 与逐文件 unlink，两条线都会命中同一批素材行。加上这个条件后，无论谁先到：
+  //   · 先 unlinkDir → 整子树刷成 missing=1，随后逐文件命中 0 行 → changes=0；
+  //   · 先逐文件   → 各自命中 1 行、共 N，随后 unlinkDir 命中 0 行。
+  // 两种到达顺序的 removed 合计都恰好 = N（实测：以前是 2N，提示条会说「删除 6 个」而实际只删 3 个）。
+  // 终态（missing=1）完全不变。
+  const info = db.prepare('UPDATE assets SET missing=1 WHERE rel_path=? AND missing=0').run(rel)
+  // 只有真的标到了行才广播。应用自身的重命名/移动/压缩在同一同步块内已经把那条行的
+  // rel_path 改好了 —— 回调触发时按**旧** rel_path 查不到，changes 天然为 0 → 不会假广播。
+  // Number(...)：node:sqlite 的 changes 类型是 number | bigint，统一成 number。
+  const n = Number(info.changes)
+  if (n > 0) bumpExternal('removed', n)
+  return n
+}
+
+/**
+ * 把某目录下**整棵子树**标成失效（`chokidar` 的 `unlinkDir` 回调的内核）。
+ *
+ * 前缀抑制必须在这里也生效：一次目录搬迁 chokidar 会同时发 `unlinkDir` 与 N 个 `unlink`，
+ * 只挡逐文件那条的话，目录这条仍会把整棵子树刷成 `missing=1`。
+ *
+ * @returns 实际标到多少行（0 = 被抑制、或索引里已无此前缀）
+ */
+export function markDirMissingRel(db: DB, rel: string): number {
+  if (underSuppressedTree(rel)) return 0
+  // ⚠️ `escapeLike` 不能省：目录名含 `_`/`%` 时（`报告_2024`），未转义的 LIKE 会把
+  // `报告X2024/` 下的素材一并标成 missing（审计 §2.18；与「子树比较不用 LIKE 通配」的约定同源）。
+  const info = db
+    .prepare("UPDATE assets SET missing=1 WHERE rel_path LIKE ? ESCAPE '\\' AND missing=0")
+    .run(escapeLike(rel) + '/%')
+  // 整目录被删会一次标到 N 行 → removed 计 N（提示条上的「删除 N 个」才说得通）
+  const n = Number(info.changes)
+  if (n > 0) bumpExternal('removed', n)
+  return n
+}
+
+/**
  * 外部变更的**界面刷新广播**（去抖合并）。
  *
  * 背景：watcher 的三条线（add / change / unlink）以前只改索引，没有任何通道告诉渲染层
@@ -619,34 +711,14 @@ export function watchLibrary(libPath: string, db: DB): void {
 
   const markMissing = (abs: string) => {
     try {
-      const rel = relFromLib(libPath, abs)
-      // 旧文件是我们自己删的（压缩替换完成），别把已经改好的那行标成 missing
-      if (consumeSuppressed(rel)) return
-      // `AND missing=0` 让「标失效」幂等：整目录被删时 chokidar 会**同时**发 unlinkDir（目录）
-      // 与逐文件 unlink，两条线都会命中同一批素材行。加上这个条件后，无论谁先到：
-      //   · 先 unlinkDir → 整子树刷成 missing=1，随后逐文件命中 0 行 → changes=0；
-      //   · 先逐文件   → 各自命中 1 行、共 N，随后 unlinkDir 命中 0 行。
-      // 两种到达顺序的 removed 合计都恰好 = N（实测：以前是 2N，提示条会说「删除 6 个」而实际只删 3 个）。
-      // 终态（missing=1）完全不变。
-      const info = db.prepare('UPDATE assets SET missing=1 WHERE rel_path=? AND missing=0').run(rel)
-      // 只有真的标到了行才广播。应用自身的重命名/移动/压缩在同一同步块内已经把那条行的
-      // rel_path 改好了 —— 回调触发时按**旧** rel_path 查不到，changes 天然为 0 → 不会假广播。
-      // Number(...)：node:sqlite 的 changes 类型是 number | bigint，统一成 number。
-      if (Number(info.changes) > 0) bumpExternal('removed', Number(info.changes))
+      markMissingRel(db, relFromLib(libPath, abs))
     } catch {
       /* ignore */
     }
   }
   const markDirMissing = (abs: string) => {
     try {
-      // 同样 `AND missing=0`：与 markMissing 一起保证「unlinkDir + 逐文件 unlink」不会被双计（详见 markMissing）
-      // ⚠️ `escapeLike` 不能省：目录名含 `_`/`%` 时（`报告_2024`），未转义的 LIKE 会把
-      // `报告X2024/` 下的素材一并标成 missing（审计 §2.18；与「子树比较不用 LIKE 通配」的约定同源）。
-      const info = db
-        .prepare("UPDATE assets SET missing=1 WHERE rel_path LIKE ? ESCAPE '\\' AND missing=0")
-        .run(escapeLike(relFromLib(libPath, abs)) + '/%')
-      // 整目录被删会一次标到 N 行 → removed 计 N（提示条上的「删除 N 个」才说得通）
-      if (Number(info.changes) > 0) bumpExternal('removed', Number(info.changes))
+      markDirMissingRel(db, relFromLib(libPath, abs))
     } catch {
       /* ignore */
     }

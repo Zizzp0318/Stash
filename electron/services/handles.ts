@@ -110,6 +110,16 @@ export interface RenameIsolationGuard {
   /** 当前是否在监听（用于自证与断言） */
   watcherActive(): boolean
   /**
+   * 让该目录（含全部子孙）在窗口内的 `unlink` / `unlinkDir` 事件被忽略。
+   *
+   * 为什么改名/移动**必须**调它：索引事务只改 `rel_path`、**不碰 `missing`**，
+   * 而 watcher 只在「rename 撞占用」时才被停掉 —— 直改成功时它全程在线。只要有一次
+   * unlink/unlinkDir 回调落在「物理已搬、事务未提交」的 await 窗口里，`markDirMissing`
+   * 就按旧前缀把整棵子树刷成 `missing=1`，事务提交后没人复位，界面上一片灰卡。
+   * （`--smoke-folder` 的 `moveFolderSurvivesWatcher` 长期红着，就是这条。）
+   */
+  suppressTree(rel: string, ms?: number): void
+  /**
    * 隔离窗口结束后**等 watcher ready 再做一次「磁盘 → 索引」对账**（不阻塞调用方）。
    *
    * 为什么必须挂在隔离生命周期上：停监听 → 重挂到 `ready` 之间的文件会被
@@ -252,6 +262,17 @@ export function restartWatcherAfterRename(libPath: string, db: DB): boolean {
 /** 当前是否在监听（未接入时按「没有」处理） */
 export function watcherActive(): boolean {
   return iso ? iso.watcherActive() : false
+}
+
+/**
+ * 抑制「该目录及其子孙」在窗口内到达的 unlink / unlinkDir（未接入时是空实现）。
+ *
+ * 调用时机：`relocateUnlocked` 里**物理 rename 之前**，对旧路径与新路径各登记一次。
+ * 未接入时静默跳过（同 `reconcileAfterWindow` 的可选调用约定）：那样最坏情况只是回到
+ * 改造前的行为（可能出现灰卡），绝不会让「移动/改名」本身失败。
+ */
+export function suppressWatcherTree(rel: string, ms?: number): void {
+  iso?.suppressTree?.(rel, ms)
 }
 
 /**
