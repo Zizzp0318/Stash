@@ -1,8 +1,13 @@
 // 从项目 LOGO 生成 Windows 图标（build/icon.ico）+ 一张 512 的 PNG。
 //
 // 零新依赖：sharp 负责栅格化，ICO 容器自己拼（Vista 起 ICO 允许直接放 PNG 数据）。
-// LOGO 与 TitleBar 的 `.brand-mark` / 欢迎页的 `.w-logo` 同源：
-// 金黄底（--accent #E8B04B）+ 圆角 + 深色中心圆与四向短线（viewBox 12 单位）。
+// LOGO 与 TitleBar 的 `.brand-mark` / 欢迎页的 `.w-logo` 同源：圆角方块 + 中心圆与四向短线
+// （viewBox 12 单位，圆角 3.6/12 = 30%，与 `.brand-mark` 的 20px/圆角 6px 一致）。
+//
+// ⚠️ 配色取**深色主题的 `--accent`**（#4795FF）+ `--on-accent`（#0D0D0E），与侧栏那个
+// 20px 标记逐像素一致。图标文件不跟随主题，所以只能固定一套；选深色那套是因为它是默认主题，
+// 也是绝大多数用户看到的形态。图形用近黑而不是白色：蓝底近黑 6.49:1，比白字的 2.99:1
+// 更清楚，且和侧栏里的观感一致（见 main.css 里 `--on-accent` 的注释）。
 import sharp from 'sharp'
 import { mkdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
@@ -18,9 +23,9 @@ function logoSvg(size) {
   const stroke = size <= 32 ? 1.8 : 1.3
   return Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 12 12" width="${size}" height="${size}">` +
-      `<rect width="12" height="12" rx="3.6" fill="#E8B04B"/>` +
-      `<circle cx="6" cy="6" r="2.2" fill="#242629"/>` +
-      `<path d="M6 0.5v2.4M6 9.1v2.4M0.5 6h2.4M9.1 6h2.4" stroke="#242629" stroke-width="${stroke}" stroke-linecap="round"/>` +
+      `<rect width="12" height="12" rx="3.6" fill="#4795FF"/>` +
+      `<circle cx="6" cy="6" r="2.2" fill="#0D0D0E"/>` +
+      `<path d="M6 0.5v2.4M6 9.1v2.4M0.5 6h2.4M9.1 6h2.4" stroke="#0D0D0E" stroke-width="${stroke}" stroke-linecap="round"/>` +
       `</svg>`
   )
 }
