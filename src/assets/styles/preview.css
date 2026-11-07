@@ -337,7 +337,9 @@
   right: 0;
   height: 4px;
   border-radius: 2px;
-  background: rgba(255, 255, 255, 0.14);
+  /* 轨道压在 .pp-bar 上，而 .pp-bar 的底色是 color-mix(--bg-raised) → 跟着主题变，
+     所以轨道也必须跟着变（写死的 0.14 白在浅色条子上等于隐形） */
+  background: var(--track);
   transform: translateY(-50%);
 }
 .pp-track-fill {
@@ -373,7 +375,8 @@
 .pp-volume::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 2px;
-  background: rgba(255, 255, 255, 0.14);
+  /* 与 .pp-track::before 同一个理由：轨道底是主题化的条子 */
+  background: var(--track);
 }
 .pp-volume::-webkit-slider-thumb {
   appearance: none;
@@ -417,7 +420,10 @@
 }
 .ptext-toggle:hover { color: var(--text-1); border-color: var(--accent-border); }
 .ptext-dirty { color: var(--text-3); }
-.ptext-dirty.on { color: var(--accent); }
+/* 「已修改」用小字表达，所以用 --text-1 而不是 --accent（accent 当小字在浅色下只有 4.09:1）：
+   未修改是 --text-3、已修改是 --text-1，靠**亮度差**表达状态，与项目里
+   「状态由底色/亮度承载、不必再染一遍强调色」的约定一致。 */
+.ptext-dirty.on { color: var(--text-1); }
 
 .ptext-conflict {
   flex-shrink: 0;
@@ -489,6 +495,10 @@
   border-left: 3px solid var(--border);
   color: var(--text-2);
 }
+/* ⚠️ 全项目**唯一**刻意用 accent 当小字的地方：超链接。
+   浅色下对 --bg-panel 只有 4.09:1（低于 AA 4.5），但蓝色是这个元素「可点」的**唯一线索**
+   —— 正文里没有下划线，改成 --text-1 就等于把一个链接变成普通文字，语义损失大于对比度收益。
+   其它「accent 当小字」的地方都已改用 --text-1（见 main.css 的注释）。 */
 .ptext-md a { color: var(--accent); }
 .ptext-md hr { border: 0; border-top: 1px solid var(--border-soft); margin: 14px 0; }
 .ptext-md table { border-collapse: collapse; margin: 10px 0; }

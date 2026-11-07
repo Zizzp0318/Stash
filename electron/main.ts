@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, dialog, protocol, shell, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, protocol, shell, Tray, Menu, nativeImage, nativeTheme } from 'electron'
 import { spawn } from 'child_process'
 import { join, dirname } from 'path'
 import { existsSync, readFileSync, rmSync, mkdirSync, mkdtempSync, writeFileSync, unlinkSync } from 'fs'
@@ -305,6 +305,37 @@ if (!gotLock) {
 function bootstrap(): void {
   let win: BrowserWindow
 
+  /**
+   * 窗口底色 = 主题的「外壳色」（与渲染层的 `--bg-app` 同值）。
+   *
+   * 它什么时候会被看见：
+   *   ① 启动首帧（窗口 show:false + ready-to-show，正常路径看不到）；
+   *   ② **拖拽改变窗口大小时新暴露出来的那块区域** —— 这块由 OS 直接填窗口背景色，
+   *      CSS 还没重绘到那儿。写死 #0D0D0E 的话，浅色用户一拉窗口就闪出一道深色边。
+   *
+   * ⚠️ 必须用**外壳色**（`--bg-app`）而不是面板色（`--bg-panel`）：窗口最外圈就是外壳，
+   * 面板是从外壳「长」出来的。用面板色会让拉伸时新暴露的那条边比紧邻的顶栏/侧栏亮一档，
+   * 看起来像边缘漏光；首帧也应该是「先外壳、再长出面板」这个由外向内的顺序。
+   *
+   * 只在**创建时**取一次，刻意不做实时同步：主题变了重开窗口即可，为此在主进程与渲染层之间
+   * 架一条实时同步通道属于过度设计（这条底色只影响上面那两个瞬间）。
+   *
+   * `system` 用 `nativeTheme.shouldUseDarkColors` 解析 —— 与渲染层
+   * `matchMedia('(prefers-color-scheme: light)')` 是同一个事实源，不会分叉。
+   * 配置读不出来（首启 / 文件损坏）就回落深色：那是 `:root` 的默认，也是既有观感。
+   */
+  function windowBgColor(): string {
+    let theme: 'dark' | 'light' | 'system' = 'dark'
+    try {
+      theme = configSvc.getSettings().theme
+    } catch {
+      /* 配置还没就绪：回落深色（注释见上） */
+    }
+    if (theme === 'light') return '#E8E4DC' // --bg-app（外壳色）：窗口最外圈就是它
+    if (theme === 'system') return nativeTheme.shouldUseDarkColors ? '#0D0D0E' : '#E8E4DC'
+    return '#0D0D0E'
+  }
+
   function createWindow(): BrowserWindow {
     const w = new BrowserWindow({
       width: 1280,
@@ -312,9 +343,10 @@ function bootstrap(): void {
       minWidth: 960,
       minHeight: 600,
       frame: false,
-      // 与 --bg-app 同值：无边框窗口首帧/透明处露出的就是它，
-      // 漏改会在启动瞬间闪一下旧的画布灰（#242629），深黑主题里格外刺眼
-      backgroundColor: '#0D0D0E',
+      // 与 --bg-app / --bg-panel 同值（见 windowBgColor 的注释）：
+      // 无边框窗口首帧/透明处/拉伸时新暴露的区域露出的就是它。
+      // ⚠️ 之前这里写死 #0D0D0E，浅色主题下拉伸窗口会露出一道深色边。
+      backgroundColor: windowBgColor(),
       show: false,
       webPreferences: {
         preload: join(__dirname, '../preload/preload.js'),

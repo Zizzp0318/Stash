@@ -377,6 +377,13 @@ export interface StashCompressSettings {
   alsoJpeg: boolean
 }
 
+/**
+ * 主题模式。
+ * `dark` = 深黑（默认，也是老用户的既有观感）；`light` = 暖灰白；
+ * `system` = 跟随系统的 `prefers-color-scheme`（三态里只有它会随 Windows 设置变）。
+ */
+export type StashTheme = 'dark' | 'light' | 'system'
+
 /** 全局偏好（存在 userData/config.json，跨库一份） */
 export interface StashSettings {
   defaultView: 'masonry' | 'list'
@@ -392,6 +399,11 @@ export interface StashSettings {
    * 合法区间见 `stores/settings.ts` 的 `SIDEBAR_W_MIN/MAX/DEFAULT`。
    */
   sidebarWidth: number
+  /**
+   * 主题。默认 `dark` —— 升级后的默认观感与改造前完全一致（不会有人被动「变白」）。
+   * `system` 在渲染层由 `stores/settings.ts` 的 `effectiveTheme` 解析成 dark/light 再落到 `<html data-theme>`。
+   */
+  theme: StashTheme
   thumbs: StashThumbSettings
   preview: StashPreviewSettings
   importing: StashImportSettings

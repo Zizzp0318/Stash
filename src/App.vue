@@ -12,10 +12,30 @@ import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
 import { useSettingsStore } from './stores/settings'
 import { importFailedText } from './utils/format'
+import { PREFERS_LIGHT_QUERY } from './utils/theme'
 
 const lib = useLibraryStore()
 const assets = useAssetStore()
 const settings = useSettingsStore()
+
+// ==================== 主题（深色 / 浅色 / 跟随系统）====================
+//
+// 顺序很重要，分三段：
+//  ① main.ts 在挂载前按「上一次的有效主题」铺了首帧（那时代码还拿不到配置，只有缓存）；
+//  ② 这里 `await settings.init()` 之后立刻 applyTheme() —— **以配置为准**把它纠正过来
+//     （缓存可能过期：用户在另一个窗口改过；也可能是第一次跑，压根没有缓存）；
+//  ③ 之后所有变化都由 store 里的 watch(effectiveTheme) 自动落 DOM，这里不用再管。
+//
+// 第 ② 步不能省：hint 写的是 light、配置是 dark 时，effectiveTheme 从 'dark' 到 'dark'
+// 根本没变，watch 不会触发 —— 那一下界面就会停在缓存里的浅色上。
+//
+// matchMedia 监听由**本组件**持有而不是 store：store 是单例、永不卸载，
+// 监听挂在那里就没有「摘掉」的时机；放这里才能跟着组件生命周期收尾。
+const prefersLight = window.matchMedia(PREFERS_LIGHT_QUERY)
+function onSystemThemeChange(): void {
+  // 只有 `theme === 'system'` 时它才真的改变渲染（其它两态 effectiveTheme 不看 systemLight）
+  settings.refreshSystemTheme()
+}
 
 /**
  * 缩略图生成进度（`thumb:progress` 的载荷）。`null` = 不显示。
@@ -47,6 +67,9 @@ function clearThumbHideTimer(): void {
 onMounted(async () => {
   // 偏好先读：网格首帧就该是用户选的视图与卡片大小，否则会先按默认排一遍再跳一下
   await settings.init()
+  // 主题以配置为准再铺一次（首帧那一下是 main.ts 用缓存铺的，可能已过期）
+  settings.applyTheme()
+  prefersLight.addEventListener('change', onSystemThemeChange)
   await assets.loadAiLabels()
   await lib.bootstrap()
   if (lib.info) {
@@ -159,7 +182,10 @@ onMounted(async () => {
 })
 
 // 组件卸载时清掉「完成后延迟隐藏」的定时器（App 不会卸载，但别留悬挂 timer）
-onBeforeUnmount(clearThumbHideTimer)
+onBeforeUnmount(() => {
+  clearThumbHideTimer()
+  prefersLight.removeEventListener('change', onSystemThemeChange)
+})
 </script>
 
 <template>

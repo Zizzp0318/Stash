@@ -27,6 +27,13 @@ export interface Settings {
    * 合法区间见 SIDEBAR_WIDTH_MIN/MAX 的注释（唯一定义在渲染层，这里只做落盘前的兜底）。
    */
   sidebarWidth: number
+  /**
+   * 主题。`dark` = 深黑（默认，与改造前一致）；`light` = 暖灰白；`system` = 跟随系统。
+   * 三态**解析成 dark/light 的逻辑在渲染层**（`stores/settings.ts` 的 effectiveTheme，
+   * 它会读 `prefers-color-scheme`）—— 主进程不重复判断一遍，
+   * 否则「主进程说 system、渲染层说 dark」这种分叉迟早出现。
+   */
+  theme: 'dark' | 'light' | 'system'
   /** 缩略图管线 */
   thumbs: {
     /** 并发生成数（队列同时跑几个 job）。机器弱就调小，SSD 快可以调大 */
@@ -91,6 +98,7 @@ export const DEFAULT_SETTINGS: Settings = {
   detailCollapsed: false,
   closeToTray: true,
   sidebarWidth: 198,
+  theme: 'dark',
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
   importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
@@ -181,6 +189,10 @@ export function sanitizeSettings(raw: unknown): Settings {
     // 否则老配置缺键会被判成关 → 升级后行为悄悄变了
     closeToTray: r.closeToTray !== false,
     sidebarWidth,
+    // 主题走**白名单**：只认这两个字面量，其余（'Light' / 'auto' / 123 / undefined）一律回落 'dark'。
+    // 回落成 dark 而不是 light 有两个理由：它是升级前的既有观感，也是 `:root` 的默认值 ——
+    // 配置文件被手改坏时，界面应该退回「本来长什么样」，而不是突然变白。
+    theme: r.theme === 'light' || r.theme === 'system' ? r.theme : d.theme,
     thumbs: {
       concurrency: Number.isFinite(conc)
         ? Math.min(THUMB_CONCURRENCY_MAX, Math.max(THUMB_CONCURRENCY_MIN, Math.round(conc)))

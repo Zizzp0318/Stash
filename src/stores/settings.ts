@@ -6,7 +6,12 @@
 //    表现为「设置莫名其妙被重置」。老的三个键由 init() 一次性迁进 config 再删掉
 //    （键没了，迁移自然只跑一次，不需要额外记标记）。
 import { defineStore } from 'pinia'
-import { ref } from 'vue'
+import { computed, ref, watch } from 'vue'
+import {
+  applyThemeToDocument,
+  systemPrefersLight,
+  type EffectiveTheme
+} from '../utils/theme'
 import type {
   StashCardFields,
   StashCompressSettings,
@@ -54,6 +59,9 @@ const FALLBACK: StashSettings = {
   detailCollapsed: false,
   closeToTray: true,
   sidebarWidth: SIDEBAR_W_DEFAULT,
+  // 默认深色：与改造前一模一样。**不要**因为「浅色更好看」把它改成 light ——
+  // 那等于让所有老用户升级后被动换了一套观感。
+  theme: 'dark',
   thumbs: { concurrency: 4, quality: 82 },
   preview: { idleHideMs: 2600, maxImagePx: 2560, textMaxBytes: 2 * 1024 * 1024, volume: 1, autoPlay: false },
   importing: { mode: 'copy', dedupe: true, palette: true, extractMeta: true, detectAi: true },
@@ -114,6 +122,10 @@ function normalize(raw: SettingsPatch | null | undefined): StashSettings {
     detailCollapsed: src.detailCollapsed === true,
     closeToTray: src.closeToTray !== false,
     sidebarWidth,
+    // 主题走白名单，非法值回落 'dark'（= 既有观感、也是 :root 的默认）。
+    // 这里与主进程 sanitizeSettings 的判据**必须一致**：广播过来的值可能来自另一个窗口，
+    // 两边判据一旦不同，同一个 config.json 会被两个进程解读成两种主题。
+    theme: src.theme === 'light' || src.theme === 'system' ? src.theme : 'dark',
     thumbs: {
       concurrency: Number.isFinite(conc) ? Math.round(conc) : FALLBACK.thumbs.concurrency,
       quality: Number.isFinite(qual) ? Math.round(qual) : FALLBACK.thumbs.quality
@@ -192,6 +204,48 @@ export const useSettingsStore = defineStore('settings', () => {
   /** 最近一次落盘失败的原因（面板上提示用） */
   const lastError = ref<string | null>(null)
 
+  // ==================== 主题 ====================
+  /** 系统当前是不是浅色。只有 `theme === 'system'` 时它才影响渲染 */
+  const systemLight = ref(systemPrefersLight())
+
+  /**
+   * 真正生效的主题：把三态里的 `system` 解析成两态。
+   *
+   * **界面与 CSS 只认这个值** —— `settings.theme` 是「用户选了什么」，
+   * 这个是「现在该画成什么样」，两者的区别只在 system 模式下出现。
+   * 解析放在这里而不是 CSS 里（例如 `@media (prefers-color-scheme)` 覆盖变量）：
+   * 那样用户选了「浅色」而系统是深色时就会被媒体查询反过来盖掉，选择权就丢了。
+   */
+  const effectiveTheme = computed<EffectiveTheme>(() => {
+    const mode = settings.value.theme
+    if (mode === 'light') return 'light'
+    if (mode === 'dark') return 'dark'
+    return systemLight.value ? 'light' : 'dark'
+  })
+
+  /** 把当前有效主题落到 `<html data-theme>`（并顺手更新首帧提示，见 utils/theme.ts） */
+  function applyTheme(): void {
+    applyThemeToDocument(effectiveTheme.value)
+  }
+
+  /**
+   * 重读系统深浅色。App.vue 挂的 `matchMedia('(prefers-color-scheme: light)')`
+   * change 监听会调它 —— 监听器由 App 持有（要能在卸载时摘掉），
+   * 这里只管「把读到的事实写进 systemLight」，解析与落 DOM 交给上面的 computed + watch。
+   */
+  function refreshSystemTheme(): void {
+    systemLight.value = systemPrefersLight()
+  }
+
+  /*
+   * 主题变化 → 立刻落 DOM。
+   *
+   * 挂 watch 而不是让每个调用点都记得调 applyTheme()：主题有四个来源
+   * （设置面板、别处广播来的 config、老配置迁移、系统深浅色切换），
+   * 少接一处就是「改了没反应」。flush:'sync' 是为了同一帧内就生效，不留一帧旧主题。
+   */
+  watch(effectiveTheme, () => applyTheme(), { flush: 'sync' })
+
   function apply(next: SettingsPatch): void {
     settings.value = normalize({
       ...settings.value,
@@ -263,6 +317,10 @@ export const useSettingsStore = defineStore('settings', () => {
    *
    * `sidebarWidth` 也算外观：用户点「恢复默认」期望的是**三栏比例回到原样**，
    * 只回一半（视图、卡片大小、详情栏都回来了，左栏还停在拖宽后的 420）比不提供更让人困惑。
+   *
+   * ⚠️ **不含 theme**（刻意）：主题是「你现在想怎么看」的即时选择，不是布局偏好。
+   * 用户白天切到浅色、点一下「恢复默认外观」就被打回深色，那一下的意外感比「重置得不彻底」更糟；
+   * 而且从浅色切回深色是会**整屏闪**的动作，不该被一个按钮顺带触发。
    */
   async function resetAppearance(): Promise<void> {
     await patch({
@@ -274,5 +332,18 @@ export const useSettingsStore = defineStore('settings', () => {
     })
   }
 
-  return { settings, loaded, panelOpen, lastError, init, patch, openPanel, closePanel, resetAppearance }
+  return {
+    settings,
+    loaded,
+    panelOpen,
+    lastError,
+    effectiveTheme,
+    init,
+    patch,
+    applyTheme,
+    refreshSystemTheme,
+    openPanel,
+    closePanel,
+    resetAppearance
+  }
 })

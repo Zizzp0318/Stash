@@ -19,7 +19,8 @@ import type {
   StashCacheStats,
   StashLibraryStats,
   StashScanResult,
-  StashSettingsChoices
+  StashSettingsChoices,
+  StashTheme
 } from '../env'
 
 const settings = useSettingsStore()
@@ -305,6 +306,21 @@ function edgeText(px: number): string {
 function pickView(v: 'masonry' | 'list'): void {
   void settings.patch({ defaultView: v })
 }
+/**
+ * 主题三选。
+ *
+ * 为什么不做成开关（浅色 / 深色两态）：`system` 是**第三种意图**（「别管我，跟系统走」），
+ * 用开关表达它只能靠「点了以后不知道自己是哪一档」，而 Windows 的深浅色是会自己变的。
+ * 三个按钮的 label 用「深色 / 浅色 / 跟随系统」：先给结果，再说条件。
+ */
+const THEMES: Array<{ v: StashTheme; label: string }> = [
+  { v: 'dark', label: '深色' },
+  { v: 'light', label: '浅色' },
+  { v: 'system', label: '跟随系统' }
+]
+function pickTheme(v: StashTheme): void {
+  void settings.patch({ theme: v })
+}
 function onZoom(e: Event): void {
   void settings.patch({ viewZoom: Number((e.target as HTMLInputElement).value) })
 }
@@ -461,6 +477,25 @@ async function checkUpdate(): Promise<void> {
           <template v-if="active === 'appearance'">
             <h3 class="sp-h">外观与浏览</h3>
             <p class="sp-sub">改动立即生效，不需要重启</p>
+
+            <div class="sp-row">
+              <div class="sp-label">
+                <div class="sp-name">主题</div>
+                <div class="sp-tip">浅色是暖灰白，适合白天与投屏；「跟随系统」由 Windows 的深浅色设置决定</div>
+              </div>
+              <div class="sp-seg" data-sp-theme>
+                <button
+                  v-for="t in THEMES"
+                  :key="t.v"
+                  type="button"
+                  :class="{ on: s.theme === t.v }"
+                  :data-sp-theme-opt="t.v"
+                  @click="pickTheme(t.v)"
+                >
+                  {{ t.label }}
+                </button>
+              </div>
+            </div>
 
             <div class="sp-row">
               <div class="sp-label">

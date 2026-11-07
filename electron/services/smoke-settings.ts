@@ -21,6 +21,11 @@
 //   S11 快捷键    —— 只读清单：有内容、不留空行、且**里面不该有任何可点控件**（防「假设置」）
 //   S12 切换库     —— 两个临时库（X: 400×200 的图；Y: txt 占位图 1:1）来回切，
 //                    断言图片卡片的宽高比不被上一个库的实测值带偏（用户报过「切库后都变成 1:1」）
+//   S13 主题      —— 深色 / 浅色切换的**整条链路**：点分段控件 → config.json 落盘 →
+//                    `<html data-theme>` 变化 → 计算出来的外壳色/面板色真的换了一套；
+//                    切回深色后逐字比对改造前的 #0D0D0E / #181818（守住「深色零变化」）；
+//                    外加 AI 角标的双主题取值、以及**悬停态的实测像素**（截按钮、逐像素取样再算对比 ——
+//                    filter:brightness 会连文字一起改，只算底色会把 4.45 误判成 5.07）
 //   UF 检查更新    —— 关于页的 GitHub 入口 + 检查更新（QA 增补，编号 UF-1…UF-8）：
 //                    版本比较逐段按数字比、302 Location 解析、白名单（含前缀骗术 / 段边界）、
 //                    checkLatest 三态与「异常收敛成值」、IPC 白名单拒绝、版本行 DOM 结构、
@@ -2338,6 +2343,256 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
       await waitFor("!document.querySelector('.thumb-progress')", 6000)
       const opReopened = await openPanel()
       check('OP 收尾：设置面板已重新打开（否则 S1 尾巴的 Esc 断言会变成空转）', opPanelClosed && opReopened)
+    }
+
+    // ==================== S13 主题（深色 / 浅色 / 跟随系统）====================
+    /*
+     * 这一段验的是**整条链路**，不是「按钮能点」：
+     *   点分段控件 → config.json 落盘 → <html data-theme> 变了 → 计算出来的底色真的换了。
+     * 只验 DOM 会放过「只改内存没落盘」；只验 config 会放过「store 的 watch 没接到 / 没落到 DOM」。
+     * 最后一定要**切回深色并逐字比对改造前那两个值**（#0D0D0E / #181818）——
+     * 这是「暗色主题零变化」这条硬约束唯一能自动守住的地方。
+     */
+    {
+      type ThemeProbe = { attr: string | null; bg: string; panel: string }
+      const themeProbe = (): Promise<ThemeProbe | null> =>
+        js<ThemeProbe>(`(() => {
+          const panel = document.querySelector('.settings-panel')
+          return {
+            attr: document.documentElement.getAttribute('data-theme'),
+            bg: getComputedStyle(document.body).backgroundColor,
+            panel: panel ? getComputedStyle(panel).backgroundColor : ''
+          }
+        })()`)
+      /*
+       * 悬停态**实测像素**（不是算出来的）。
+       *
+       * 为什么值得费这个劲：`filter: brightness()` 作用在**整个元素**上，连里面的字一起改。
+       * 上一版浅色用 brightness(.94) 想「压暗底色让白字更清楚」，结果字 255→240，
+       * 实测对比从 4.57 **掉到 4.45**（QA 用离屏像素抓到了这一条，光算背景色是看不出来的）。
+       * 现在浅色改成「显式背景色 + filter:none」，所以这里要证明三件事：
+       *   ① 浅色悬停时 filter 真的是 none —— 文字不可能被改色；
+       *   ② 悬停时**实际渲染出来的背景像素**等于 --accent-hover #2A6DCC；
+       *   ③ 拿「实测背景像素 + 实测文字像素」算对比 ≥4.5（不是拿令牌值算）。
+       * 暗色也测一遍：filter 仍在（这是**故意**保留的），且提亮让近黑字的对比变好。
+       */
+      const lumOf = (c: number[]): number => {
+        const f = (v: number): number => {
+          const s = v / 255
+          return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2])
+      }
+      const contrastOf = (a: number[], b: number[]): number => {
+        const la = lumOf(a)
+        const lb = lumOf(b)
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05)
+      }
+      type HoverProbe = {
+        filter: string
+        color: string
+        bg: number[]
+        brightest: number[]
+        darkest: number[]
+        size: { width: number; height: number }
+      }
+      /** 插一个真按钮 → 真鼠标移上去 → 截它的矩形 → 逐像素取样 → 摘掉 */
+      const hoverProbe = async (): Promise<HoverProbe | null> => {
+        const rect = await js<{ x: number; y: number; w: number; h: number } | null>(`(() => {
+          const b = document.createElement('button')
+          b.id = 'smoke-hover-probe'
+          b.className = 'import-btn'
+          b.textContent = '导入'
+          b.style.position = 'fixed'
+          b.style.left = '40px'
+          b.style.top = '40px'
+          b.style.width = '132px'
+          b.style.height = '26px'
+          b.style.zIndex = '9999'
+          document.body.appendChild(b)
+          const r = b.getBoundingClientRect()
+          return { x: r.left, y: r.top, w: r.width, h: r.height }
+        })()`)
+        if (!rect) return null
+        // :hover 是伪类，只能靠**真实输入事件**触发（改 class 不算，那样验不到 filter 的实际效果）
+        win.webContents.sendInputEvent({
+          type: 'mouseMove',
+          x: Math.round(rect.x + rect.w - 10),
+          y: Math.round(rect.y + rect.h / 2)
+        })
+        await new Promise((r) => setTimeout(r, 250))
+        const cs = await js<{ filter: string; color: string } | null>(`(() => {
+          const b = document.getElementById('smoke-hover-probe')
+          if (!b) return null
+          const s = getComputedStyle(b)
+          return { filter: s.filter, color: s.color }
+        })()`)
+        const img = await win.webContents.capturePage({
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+          width: Math.round(rect.w),
+          height: Math.round(rect.h)
+        })
+        const size = img.getSize()
+        const bmp = img.toBitmap() // BGRA
+        // capturePage 的矩形是 DIP，位图是物理像素 → DPI 缩放要自己换
+        const sx = size.width / rect.w
+        const sy = size.height / rect.h
+        const at = (px: number, py: number): number[] => {
+          const x = Math.min(size.width - 1, Math.max(0, Math.round(px * sx)))
+          const y = Math.min(size.height - 1, Math.max(0, Math.round(py * sy)))
+          const i = (y * size.width + x) * 4
+          return [bmp[i + 2], bmp[i + 1], bmp[i]]
+        }
+        // 背景取样点：文字右侧的空白（按钮 132 宽，两个 12px 汉字只占左侧 ~34px）
+        const bg = at(rect.w - 8, rect.h / 2)
+        // 文字取样：在文字区域里找亮/暗两个极端（浅色取最亮＝白字，暗色取最暗＝近黑字）。
+        // 抗锯齿会让极值略偏「接近底色」的方向，所以算出来的对比是**保守偏低**的估计。
+        let brightest = bg
+        let darkest = bg
+        for (let x = 6; x <= 60; x++) {
+          for (let y = 4; y <= rect.h - 4; y++) {
+            const c = at(x, y)
+            if (c[0] + c[1] + c[2] > brightest[0] + brightest[1] + brightest[2]) brightest = c
+            if (c[0] + c[1] + c[2] < darkest[0] + darkest[1] + darkest[2]) darkest = c
+          }
+        }
+        // 用完立刻摘掉：下面还要截图，别让它出现在 shot-theme-*.png 里
+        await js("(() => { const b = document.getElementById('smoke-hover-probe'); if (b) b.remove(); return true })()")
+        if (!cs) return null
+        return { filter: cs.filter, color: cs.color, bg, brightest, darkest, size }
+      }
+
+      // 主题那一行在「外观与浏览」组里（前面的分组可能停在快捷键/关于）
+      await clickEl('[data-sp-group="appearance"]')
+      await waitFor("!!document.querySelector('[data-sp-theme]')")
+      const themeDark0 = await themeProbe()
+
+      /*
+       * AI 角标（列表视图那行 10px 小字）的探针。
+       *
+       * 为什么要单独探：它的卡片版 `.thumb-ai` **自带**深底所以用固定色，
+       * 而列表版 `.list-ai` 没有底、直接压在 --bg-canvas 上 —— 同一个青色
+       * 深色 11.06:1 成立、浅色 1.40:1 隐形（QA 抓到的硬 bug）。
+       * 这里挂一个临时元素取 computedStyle，断言**两套主题各自的最终值**：
+       * 深色必须还是 rgb(159,225,203)（零变化），浅色必须是压深后的 rgb(35,118,94)。
+       */
+      type AiProbe = { color: string; border: string }
+      const aiProbe = (): Promise<AiProbe | null> =>
+        js<AiProbe>(`(() => {
+          const el = document.createElement('span')
+          el.className = 'list-ai'
+          el.textContent = 'AI'
+          el.style.position = 'fixed'
+          el.style.left = '-9999px'
+          document.body.appendChild(el)
+          const cs = getComputedStyle(el)
+          const out = { color: cs.color, border: cs.borderTopColor }
+          el.remove()
+          return out
+        })()`)
+      const aiDark = await aiProbe()
+      /*
+       * 描边是 color-mix 派生的，computed 值序列化成 `color(srgb 0.62 0.88 0.80 / 0.4)`
+       * 而不是 `rgba(159, 225, 203, 0.4)` —— 两者**渲染完全等价**，只是序列化形式不同。
+       * 所以这里按**数值**比（容差 0.01），不按字符串比：Electron 哪天换了序列化也不会假红。
+       */
+      const isAiBorder = (s: string | null | undefined, rgb: [number, number, number]): boolean => {
+        const nums = (s ?? '').match(/[\d.]+/g)?.map(Number) ?? []
+        return (
+          nums.length === 4 &&
+          Math.abs(nums[0] - rgb[0] / 255) < 0.01 &&
+          Math.abs(nums[1] - rgb[1] / 255) < 0.01 &&
+          Math.abs(nums[2] - rgb[2] / 255) < 0.01 &&
+          Math.abs(nums[3] - 0.4) < 0.01
+        )
+      }
+
+      const hoverDark = await hoverProbe() // 深色侧先测（此时还是深色）
+
+      await clickEl('[data-sp-theme-opt="light"]')
+      await new Promise((r) => setTimeout(r, 450))
+      const themeLight = await themeProbe()
+      const aiLight = await aiProbe()
+      // 留两张图给人看（浅色这一版没有设计稿，只能靠眼睛过一遍）
+      await capture('shot-theme-light.png')
+      check(
+        'S13 切浅色：config.json 落盘 theme=light',
+        diskSettings().theme === 'light',
+        String(diskSettings().theme)
+      )
+      check(
+        'S13 切浅色：<html data-theme> 变 light，且外壳色与面板色真的换了一套',
+        themeLight?.attr === 'light' &&
+          themeDark0 != null &&
+          themeLight.bg !== themeDark0.bg &&
+          themeLight.panel !== themeDark0.panel,
+        JSON.stringify({ before: themeDark0, after: themeLight })
+      )
+      check(
+        'S13 浅色：AI 角标小字用压深后的 --ai-mark #23765E（原 #9FE1CB 只有 1.40:1 会隐形）',
+        aiLight?.color === 'rgb(35, 118, 94)' && isAiBorder(aiLight?.border, [35, 118, 94]),
+        JSON.stringify(aiLight)
+      )
+
+      // ---- 浅色悬停：实测像素 ----
+      const hoverLight = await hoverProbe()
+      const lightHoverContrast = hoverLight ? contrastOf(hoverLight.brightest, hoverLight.bg) : 0
+      check(
+        'S13 浅色悬停：filter 必须为 none（filter 会把白字一起压暗，这正是上一版 4.45 的成因）',
+        hoverLight?.filter === 'none' && hoverLight?.color === 'rgb(255, 255, 255)',
+        JSON.stringify({ filter: hoverLight?.filter, color: hoverLight?.color })
+      )
+      check(
+        'S13 浅色悬停：实测背景像素 = --accent-hover #2A6DCC（确实换了实色，不是靠 filter 压暗）',
+        hoverLight != null &&
+          Math.abs(hoverLight.bg[0] - 42) <= 3 &&
+          Math.abs(hoverLight.bg[1] - 109) <= 3 &&
+          Math.abs(hoverLight.bg[2] - 204) <= 3,
+        JSON.stringify({ bg: hoverLight?.bg, size: hoverLight?.size })
+      )
+      check(
+        'S13 浅色悬停：实测「白字像素 / 背景像素」对比 ≥4.5（抗锯齿只会让这个读数偏低）',
+        lightHoverContrast >= 4.5,
+        `实测 ${lightHoverContrast.toFixed(2)}｜字 ${JSON.stringify(hoverLight?.brightest)} on 底 ${JSON.stringify(hoverLight?.bg)}`
+      )
+
+      await clickEl('[data-sp-theme-opt="dark"]')
+      await new Promise((r) => setTimeout(r, 450))
+      const themeBack = await themeProbe()
+      const aiDarkBack = await aiProbe()
+      await capture('shot-theme-dark.png')
+      check(
+        'S13 切回深色：外壳 #0D0D0E / 面板 #181818 逐字回到改造前',
+        themeBack?.attr === 'dark' &&
+          themeBack.bg === 'rgb(13, 13, 14)' &&
+          themeBack.panel === 'rgb(24, 24, 24)',
+        JSON.stringify(themeBack)
+      )
+      check(
+        'S13 深色：AI 角标仍是 rgb(159,225,203) 且描边仍是同色 40%（零变化）',
+        aiDarkBack?.color === 'rgb(159, 225, 203)' &&
+          isAiBorder(aiDarkBack?.border, [159, 225, 203]) &&
+          aiDark?.color === 'rgb(159, 225, 203)',
+        JSON.stringify({ before: aiDark, after: aiDarkBack })
+      )
+      // ---- 深色悬停：同一套实测，确认 filter 保留且是**净收益** ----
+      const darkHoverContrast = hoverDark ? contrastOf(hoverDark.darkest, hoverDark.bg) : 0
+      check(
+        'S13 深色悬停：filter 仍是 brightness(1.06)（暗色靠整体提亮，近黑字跟着变亮也无妨）',
+        (hoverDark?.filter ?? '').startsWith('brightness(1.06)'),
+        JSON.stringify({ filter: hoverDark?.filter })
+      )
+      check(
+        'S13 深色悬停：实测「近黑字像素 / 背景像素」对比 ≥6.4（原 6.49，提亮后更好）',
+        darkHoverContrast >= 6.4,
+        `实测 ${darkHoverContrast.toFixed(2)}｜字 ${JSON.stringify(hoverDark?.darkest)} on 底 ${JSON.stringify(hoverDark?.bg)}`
+      )
+      check(
+        'S13 切回深色：config.json 也回到 dark（不是只改了 DOM）',
+        diskSettings().theme === 'dark',
+        String(diskSettings().theme)
+      )
     }
 
     // ==================== S1 尾巴：Esc 关闭 + 无运行期错误 ====================

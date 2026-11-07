@@ -1,9 +1,17 @@
 /*
- * 深黑配色（唯一主题）：三层亮度阶梯
+ * 两套主题：深黑（默认，:root）+ 暖灰白（[data-theme="light"]）
+ *
+ * 深黑的三层亮度阶梯（浅色下是同一套**语义**的反向阶梯）：
  *   外壳 #0D0D0E < 媒体衬底 #0F0F10 < 侧栏 #181818 < 中间板 #1F1F20 < 浮层 #262628
  * 所以「放在较亮的中间板上的一块暗托盘」是设计意图，不是没对齐。
- * ⚠️ 本文件不新增任何写死的色值：需要半透明派生色时一律用 color-mix(... var(--token) ...)，
- *    这样改一个 token 就够，不会又留下一批「改了主色没改派生色」的死值。
+ * 浅色对应：外壳 #E8E4DC < 媒体衬底 #EDE9E1 < 侧栏 #F6F2EA < 中间板 #FBF8F2 < 浮层 #FFFDF8
+ * —— **顺序一模一样，只是方向反过来**（外壳最沉、浮层最亮），所以任何
+ * 「用 --bg-app 做凹槽 / 用 --bg-raised 做托盘」的写法在两个主题下都自动成立。
+ *
+ * 切换机制：`<html data-theme="dark|light">` 由 stores/settings.ts 的 applyTheme() 设置，
+ * 未设置时命中 `:root`（= 深色），所以「首帧还没读到配置」的那一下永远是深色，
+ * 不会先闪一层白。变量块之外**不许写死颜色**：
+ * 需要半透明派生色时一律用 color-mix(... var(--token) ...)，这样改一个 token 就够。
  */
 :root {
   /* ① 软件外壳：顶栏 + 页面背景 + 三块面板之间的缝 */
@@ -49,9 +57,163 @@
   --star: #E8B04B;
   --fav:  #FF5C6E;
 
+  /*
+   * AI 来源的**语义标识色**（列表视图那行 10px 小字角标用）。
+   *
+   * 为什么必须单独一个令牌、而不能直接给 .list-ai 写死：同一个青色在两种场合的底完全不同 ——
+   *   · `.thumb-ai`（卡片角标）**自带** rgba(24,26,28,0.8) 深底，压在任意用户图片上都成立 → 固定色；
+   *   · `.list-ai`（列表视图）**没有底**，直接压在 --bg-canvas 上 → 深色下 11.06:1 没问题，
+   *     浅色下同一个 #9FE1CB 只有 1.40:1，等于隐形（QA 抓到的就是这一条）。
+   * 所以它是「随主题该变」的语义色，与 --star / --fav 同类；`.thumb-ai` 的底与内描边仍然固定不动。
+   * ⚠️ 不要用 --text-2 取代它：AI 标识靠青色与普通文字区分，去掉色相就丢了语义。
+   */
+  --ai-mark: #9FE1CB;
+  /*
+   * 危险色分两档用途：
+   *   · `--danger`      实底（按钮底 / 描边 / 淡染），它的对比度由上面的 --on-danger 负责；
+   *   · `--danger-text` **文字**（8 处 11~12px 小字：错误提示、危险菜单项、危险描边按钮的字）。
+   * 深色下两者同值（#F0705E 压深底有 6.07:1），所以这里零变化；
+   * 浅色下实底已经压到 #C94A38（白字 4.65），但**同一个值当文字**只有 4.16 —— 不达标，
+   * 于是文字档再压一档到 #B23B2A（on --bg-panel 5.29）。分开命名是为了不让一次改动同时影响两件事。
+   */
+  --danger-text: #F0705E;
+  /*
+   * 实底按钮的悬停。
+   *
+   * ⚠️ 这里有个**踩过的坑**：`filter: brightness(…)` 作用在**整个元素**上，里面的字也一起被改 ——
+   *    浅色下想「压暗背景让白字更清楚」用 brightness(.94) 是错的：
+   *    底 44,116,216 → 41,109,203，字 255 → 240，实测对比 4.57 **掉到 4.45**（比不改还差）。
+   *    改成「显式背景色 + 只让暗色用 filter」：
+   *      · 暗色：背景不变（--accent-hover = --accent）+ 提亮，近黑字 6.49 → 7.01 ✓
+   *      · 浅色：背景换成压深一档的实色（--accent-hover #2A6DCC），**不加 filter**，白字 5.05 ✓
+   * 分开两个变量命名（accent / danger）是因为暗色原本就是 1.06 / 1.07，合成一个会动深色。
+   */
+  --accent-hover: var(--accent);
+  --danger-hover: var(--danger);
+  --hover-lift: brightness(1.06);
+  --hover-lift-danger: brightness(1.07);
+
+  /*
+   * 以下 9 个是「原先散落在各条规则里写死的值」，为了让浅色能换一套而提上来的令牌。
+   * ⚠️ 深色下的值**必须与改造前逐字相等**（这是重构，不是重设计）。
+   */
+  /* 三档阴影：小浮层（回到顶部）/ 弹层菜单 / 模态框。浅色下阴影要变浅且偏暖，
+     否则同一套 rgba(0,0,0,.5) 压在白底上就是一圈脏灰。 */
+  --shadow-sm:    0 5px 16px rgba(0,0,0,0.34);
+  --shadow-pop:   0 10px 26px rgba(0,0,0,0.5);
+  --shadow-modal: 0 20px 48px rgba(0,0,0,0.55);
+  /* 模态遮罩（弹窗 / 导入进度）。浅色下不能用纯黑：会把整个界面压成水泥色 */
+  --scrim:    rgba(0,0,0,0.42);
+  /*
+   * 非交互遮罩（导入进度浮层）。与 --scrim 只差 7% alpha，但那一档是**量出来的**：
+   * 模态框要「压住底下、断开操作」，而进度条只是「别让用户以为界面卡住了」，
+   * 压到 0.42 会把正在被导入的那一屏压得看不见（用户反馈过「导入时像死机」）。
+   * 任务书让两处都收敛到 --scrim；为了死守「深色像素零变化」，这里保留原值单独命名。
+   * 想合并就把这一行删掉、引用改成 var(--scrim)。
+   */
+  --scrim-soft: rgba(0,0,0,0.35);
+  /* 1px 内描边：色块边缘、色板对勾这类「深色实底需要一条亮边才不糊成一坨」的场合 */
+  --hairline: rgba(255,255,255,0.18);
+  /* 立在任意素材上的控件边框（回到顶部浮标）：比 --border-soft 更明显一档 */
+  --edge:     rgba(255,255,255,0.1);
+  /*
+   * 实底按钮上的字色。
+   * 深色：强调色 #4795FF 上用**近黑字**（白字只有 2.99:1，近黑字 6.49:1），
+   *       值即 --bg-app 的 #0D0D0E —— 所以这一项在深色下与改造前完全等价。
+   * 浅色：强调色压到 #2C74D8 之后换成**白字**（详见 [data-theme="light"] 里的说明）。
+   */
+  --on-accent: #0D0D0E;
+  --on-danger: #0D0D0E;
+  /*
+   * 开启态开关（.sp-sw）的圆钮。深色下它就是 --text-1（#F2F4F6，浅灰钮压在蓝底上），
+   * 浅色下必须换成纯白 —— 直接用 --text-1 的话浅色的 text-1 是 #2A251E，
+   * 结果就是「蓝底上一个黑钮」，像坏掉了一样（截图里一眼就能看出来）。
+   * 它不能用 --on-accent：那一档在深色下是**近黑**（给实底按钮的文字用的），语义相反。
+   */
+  --knob: #F2F4F6;
+  /* 播放条进度轨道：它压在 --bg-raised 派生出来的条子上，必须跟着主题换 */
+  --track:     rgba(255,255,255,0.14);
+
+  /* 原生控件（滚动条 / 输入框光标 / 时间选择器）跟着主题走，否则浅色下滚条还是黑的 */
+  color-scheme: dark;
+
   --radius: 8px;
   --radius-panel: 10px;
   --font: "MiSans", "HarmonyOS Sans SC", "Source Han Sans SC", "Microsoft YaHei UI", "PingFang SC", sans-serif;
+}
+
+/*
+ * ============ 浅色主题（暖灰白）============
+ * 只覆盖变量，**不新增任何规则级颜色** —— 所以浅色不需要第二份样式表。
+ *
+ * ① 为什么不是纯白：纯白底 + 深色字在桌面软件里会发光（尤其夜里），
+ *    暖灰白（带一点米黄）与「素材/图片」这件事更合，也不会把缩略图的白色背景吃掉。
+ * ② 为什么 --star / --fav / --danger 必须**加深**：这不是审美偏好，是可用性下限。
+ *    金色 #E8B04B 压在白底上只有 1.9:1，10px 的星星会糊成一片黄斑；
+ *    红 #FF5C6E 1.9:1、危险色 #F0705E 2.3:1 —— 同样是「看不见」。
+ *    这是继「深色重构时星和心被染成蓝」之后的另一类坑：**语义色换底就得换值**，
+ *    否则字面意义上消失了。深色那套值是给深底调的，不能直接搬到浅底。
+ * ③ 强调色从 #4795FF 压到 #2C74D8：亮蓝在米白底上会「跳出来」并显得发灰；
+ *    而压深的首要目的是**让实底按钮上的白字达标**：白 on #4795FF 只有 2.99:1、
+ *    on #2F7BE0 是 4.17:1（仍差一点），on #2C74D8 才到 4.57:1（过 AA 4.5）。
+ *    ⚠️ 派生色（--accent-soft / --accent-border）必须同步改 rgba 的三个分量，
+ *    否则「主色变了、描边还是旧蓝」—— 这类漂移肉眼一眼能看出，却很难在代码里 locate。
+ *    （同一底色上近黑字是 4.25:1，比白字差，所以浅色主按钮用白字；深色那侧相反，见 :root 的 --on-accent。）
+ */
+[data-theme="light"] {
+  --bg-app:     #E8E4DC;
+  --bg-panel:   #F6F2EA;
+  --bg-canvas:  #FBF8F2;
+  --bg-raised:  #FFFDF8;
+  --bg-media:   #EDE9E1;
+  --bg-input:   rgba(0,0,0,0.045);
+
+  --bg-hover:    rgba(0,0,0,0.05);
+  --border:      #E2DCD1;
+  --border-soft: rgba(0,0,0,0.07);
+
+  --text-1: #2A251E;
+  --text-2: #6B655C;
+  /* 10~11px 的提示字靠它，必须 ≥4.5：#7D7669 on --bg-panel 只有 4.03，压深后 4.65 */
+  --text-3: #736C60;
+
+  --accent:        #2C74D8;
+  --accent-soft:   rgba(44,116,216,0.14);
+  --accent-border: rgba(44,116,216,0.45);
+
+  --danger: #C94A38;
+  /* 星星是 10~15px 的图标，要过 3:1（#C4851B 只有 2.80，压深后 3.27） */
+  --star:   #B57A16;
+  --fav:    #E2404F;
+
+  /* AI 小字角标：同一色相压深到能在 --bg-canvas 上读（5.18:1；#9FE1CB 只有 1.40） */
+  --ai-mark: #23765E;
+  /* 危险色当文字：#C94A38 只有 4.16，压到 5.29（--bg-panel）/4.66（--bg-app）全surface 达标 */
+  --danger-text: #B23B2A;
+  /*
+   * 实底按钮 hover：**显式换成压深一档的实色，不加 filter**。
+   * 用 filter 会把白字一起压暗（255→240），实测对比反而从 4.57 掉到 4.45。
+   * 现在：accent 白字 4.57 → 5.05、danger 白字 4.65 → 5.13，文字完全不受影响。
+   */
+  --accent-hover: #2A6DCC;
+  --danger-hover: #BD4635;
+  --hover-lift: none;
+  --hover-lift-danger: none;
+
+  /* 阴影换成低透明度的暖黑：纯黑阴影在米白底上会发脏灰（暖色底 + 中性阴影 = 色偏） */
+  --shadow-sm:    0 2px 8px rgba(74,60,40,0.10);
+  --shadow-pop:   0 6px 18px rgba(74,60,40,0.14);
+  --shadow-modal: 0 12px 32px rgba(74,60,40,0.18);
+  --scrim:    rgba(46,38,26,0.38);
+  --scrim-soft: rgba(46,38,26,0.30);
+  --hairline: rgba(0,0,0,0.06);
+  --edge:     rgba(0,0,0,0.08);
+  --on-accent: #FFFFFF;
+  --on-danger: #FFFFFF;
+  --knob:      #FFFFFF;
+  --track:     rgba(0,0,0,0.12);
+
+  color-scheme: light;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body, #app { height: 100%; }
@@ -92,7 +254,7 @@ body {
 .brand-mark {
   width: 20px; height: 20px; border-radius: 6px;
   background: var(--accent);
-  color: var(--bg-app);
+  color: var(--on-accent);
   display: grid; place-items: center;
 }
 .brand-mark svg { width: 12px; height: 12px; }
@@ -724,7 +886,10 @@ mark {
   line-height: 1.55;
   color: var(--text-2);
 }
-.ai-note-head { display: flex; align-items: center; gap: 5px; color: var(--accent); font-size: 10.5px; margin-bottom: 4px; }
+/* 「AI 生成信息」栏目标题：小字，所以用 --text-1 而不是 --accent
+   （accent 当小字在浅色下只有 4.09:1，10.5px 撑不住）。
+   层级由「图标 + 字号 10.5px + 分组间距」表达，不需要再染一次强调色。 */
+.ai-note-head { display: flex; align-items: center; gap: 5px; color: var(--text-1); font-size: 10.5px; margin-bottom: 4px; }
 .ai-note-head svg { width: 10px; height: 10px; }
 .kv { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; font-size: 12px; }
 .kv .k { color: var(--text-3); }
@@ -857,7 +1022,7 @@ mark {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-raised);
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
 }
 .tag-menu-item {
   display: flex;
@@ -915,9 +1080,14 @@ mark {
 /* 工具栏右侧操作区 */
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 /*
- * 导入 = 全场唯一的主操作：强调色实底 + **近黑字**（--bg-app，值即 #0D0D0E，与外壳同源）。
+ * 导入 = 全场唯一的主操作：强调色实底 + **近黑字**（--on-accent，深色下值即 #0D0D0E，与外壳同源）。
  * 白字 #FFFFFF on #4795FF 只有 2.99:1，不合格；近黑字 6.49:1。
  * ⚠️ 不要为了这个按钮去压暗 --accent：它还要给选中描边与焦点环用。
+ * ⚠️ 字色必须走 --on-accent 而**不是** --bg-app：浅色主题下 --bg-app 变成米色，
+ *    压在 #2C74D8 上等于没有对比；--on-accent 在浅色下切到白字。
+ * ⚠️ 注意两个主题的**方向相反**：深色是「亮蓝 + 近黑字」（近黑 6.49:1 / 白 2.99:1），
+ *    浅色是「压深的蓝 + 白字」（白 4.57:1 / 近黑 4.25:1）—— 换底色就得换字色，别只改一半。
+ * ⚠️ 同理，悬停也要分主题处理（--accent-hover / --hover-lift）：深色提亮，浅色换成压深的实色、不加 filter。
  */
 .import-btn {
   display: flex; align-items: center; gap: 5px;
@@ -925,13 +1095,18 @@ mark {
   border-radius: 7px;
   border: 1px solid var(--accent);
   background: var(--accent);
-  color: var(--bg-app);
+  color: var(--on-accent);
   font-size: 12px; font-family: var(--font);
   font-weight: 600;
   cursor: pointer;
   transition: box-shadow 0.12s ease, filter 0.12s ease;
 }
-.import-btn:hover { box-shadow: 0 0 0 2px var(--accent-soft); filter: brightness(1.06); }
+.import-btn:hover {
+  /* 底色显式换（浅色是压深的实色，暗色等于不变）+ 亮度（暗色提亮 / 浅色 none）*/
+  background: var(--accent-hover);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+  filter: var(--hover-lift);
+}
 .import-btn svg { width: 11px; height: 11px; }
 /* 右侧下三角：暗示「点了会展开」，比只写文案更容易看懂 */
 .import-btn svg.caret { width: 9px; height: 9px; opacity: 0.8; margin-left: -1px; }
@@ -953,7 +1128,7 @@ mark {
   border-radius: 9px;
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   z-index: 111;
   display: flex;
   flex-direction: column;
@@ -1118,12 +1293,12 @@ mark {
   border: 1px solid var(--border);
   text-align: center;
 }
-/* logo 的圆点/线条取外壳色（CSS 里给 color，SVG 用 currentColor 取用） */
+/* logo 的圆点/线条取实底按钮的字色（CSS 里给 color，SVG 用 currentColor 取用） */
 .w-logo {
   width: 44px; height: 44px; margin: 0 auto 14px;
   border-radius: 12px;
   background: var(--accent);
-  color: var(--bg-app);
+  color: var(--on-accent);
   display: flex; align-items: center; justify-content: center;
 }
 .w-logo svg { width: 24px; height: 24px; }
@@ -1141,12 +1316,14 @@ mark {
 }
 .w-btn:hover { background: var(--bg-hover); }
 /*
- * 主操作 = 强调色实底 + **近黑字**（用 --bg-app，与外壳同源，不引入新色值）。
+ * 主操作 = 强调色实底 + **近黑字**（用 --on-accent，深色下与外壳同源，不引入新色值）。
  * 白字在 #4795FF 上只有 2.99:1，不合格；近黑字是 6.49:1。
- * 悬停不再换一个蓝色，改成提亮 + 一圈 accent-soft 光环。
+ * 悬停不再换一个蓝色，改成「一档亮度 + 一圈 accent-soft 光环」——
+ * 但**换色还是提亮随主题变**（--accent-hover / --hover-lift）：深色只提亮（近黑字 6.49→7.01），
+ * 浅色必须换成压深的实色且**不加 filter**（filter 会把白字一起压暗，反而更差）。
  */
-.w-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--bg-app); font-weight: 600; }
-.w-btn.primary:hover:not(:disabled) { background: var(--accent); filter: brightness(1.06); box-shadow: 0 0 0 2px var(--accent-soft); }
+.w-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.w-btn.primary:hover:not(:disabled) { background: var(--accent-hover); filter: var(--hover-lift); box-shadow: 0 0 0 2px var(--accent-soft); }
 .w-btn.small { height: 28px; padding: 0 12px; font-size: 11px; }
 .w-new { margin-top: 16px; text-align: left; display: flex; flex-direction: column; gap: 8px; }
 .w-new label { font-size: 11px; color: var(--text-3); }
@@ -1160,7 +1337,7 @@ mark {
   outline: none;
 }
 .w-new input:focus { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-soft); }
-.w-err { margin-top: 10px; color: var(--danger); font-size: 11px; }
+.w-err { margin-top: 10px; color: var(--danger-text); font-size: 11px; }
 .w-recent { margin-top: 20px; text-align: left; }
 .w-label { font-size: 11px; color: var(--text-3); margin-bottom: 6px; }
 .w-recent-item {
@@ -1178,10 +1355,10 @@ mark {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* 导入进度浮层（底层 scrim 是遮罩，保留半透明黑） */
+/* 导入进度浮层（底层 scrim 是遮罩，深色下是半透明黑，浅色下换成暖灰） */
 .import-overlay {
   position: fixed; inset: 0;
-  background: rgba(0,0,0,0.35);
+  background: var(--scrim-soft);
   display: flex; align-items: center; justify-content: center;
   z-index: 100;
 }
@@ -1218,7 +1395,7 @@ mark {
   font-family: var(--font);
   z-index: 120;
   cursor: pointer;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  box-shadow: var(--shadow-sm);
 }
 /* 提示条只有两种语气：中性（浮层色）与危险（危险色淡染 + 危险色描边）。
    半透明淡染用 color-mix 从 --danger 派生，不另写死一份红。 */
@@ -1244,7 +1421,7 @@ mark {
   border-radius: 10px;
   background: var(--bg-raised);
   border: 1px solid var(--border-soft);
-  box-shadow: 0 10px 32px rgba(0,0,0,0.45);
+  box-shadow: var(--shadow-pop);
   z-index: 95;
 }
 .tabs { position: relative; }
@@ -1283,7 +1460,7 @@ mark {
   outline: none;
 }
 .lib-menu-new input:focus { border-color: var(--accent-border); }
-.lib-menu-err { padding: 4px 9px 2px; color: var(--danger); font-size: 11px; }
+.lib-menu-err { padding: 4px 9px 2px; color: var(--danger-text); font-size: 11px; }
 
 /* 管理库视图 */
 .lib-manage-item {
@@ -1330,15 +1507,17 @@ mark {
 .lc-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
 /*
  * 危险动作三档（全项目统一）：
- *   ① 实底（danger）  ：--danger 底 + 近黑字 --bg-app。白字在 #F0705E 上只有 2.92:1，近黑字 6.65:1。
+ *   ① 实底（danger）  ：--danger 底 + --on-danger 字。深色下是近黑字（#0D0D0E）：白字在 #F0705E 上
+ *                       只有 2.92:1，近黑字 6.65:1；浅色下 --danger 压到 #C94A38，--on-danger 换成白字。
  *   ② 淡染（hover）   ：从 --danger 用 color-mix 派生 14% 底，不另写一份暗红。
- *   ③ 描边（strong）  ：透明底 + 40% 危险色描边 + 危险色文字。
+ *   ③ 描边（strong）  ：透明底 + 40% 危险色描边 + **危险文字色**（--danger-text）。
+ *                       描边用 --danger（4.16 对文字偏低但做线够），字必须用 --danger-text。
  */
-.w-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--bg-app); }
-.w-btn.danger:hover:not(:disabled) { filter: brightness(1.07); }
+.w-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+.w-btn.danger:hover:not(:disabled) { background: var(--danger-hover); filter: var(--hover-lift-danger); }
 .w-btn.danger-strong {
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 .w-btn.danger-strong:hover:not(:disabled) {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
@@ -1379,7 +1558,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 9px;
   background: var(--bg-raised);
   border: 1px solid var(--accent);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-pop);
   pointer-events: none;
   /* 让光标落在浮层右下角，不遮住鼠标所指的文件夹行 */
   transform: translate(12px, 10px);
@@ -1437,14 +1616,17 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   /* 浮层色（--bg-raised）：它是压在网格上的一块托盘，不能是半透明黑——那会随底下的图变色 */
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
   backdrop-filter: blur(10px);
   z-index: 40;
   /* 单个按钮内部的文字仍不许折行；换行只发生在"整件"之间 */
   white-space: nowrap;
 }
 .bb-count { font-size: 12px; color: var(--text-2); }
-.bb-count b { color: var(--accent); font-size: 13px; }
+/* 计数数字用 --text-1 而不是 --accent：这是**数字**不是状态，而 accent 在小字上的对比度
+   浅色下只有 4.09:1（深色 5.9:1）。与 .sp-chip.on / .list-row.selected 同一约定 ——
+   状态由底色（accent-soft）承载，文字再染一遍是重复编码，且会踩对比度的坑。 */
+.bb-count b { color: var(--text-1); font-size: 13px; }
 .bb-div { width: 1px; height: 20px; background: var(--border-soft); }
 .bb-mini { font-size: 11px; color: var(--text-3); margin-right: 1px; }
 .bb-rate { display: flex; align-items: center; gap: 6px; }
@@ -1471,11 +1653,13 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* 「喜欢」已开启：走强调色（本项目里「已开启 / 已选中」统一由 accent 表达） */
 .bb-btn.on { color: var(--text-1); background: var(--accent-soft); }
 /* 但「喜欢」是**语义色**，不跟 accent 走：图标红、底色淡红，**文字仍用 text-1**
-   —— 红字读起来像报错，而这里表达的是「已喜欢」。 */
-.bb-btn.bb-fav.on { color: var(--text-1); background: rgba(255, 92, 110, 0.14); }
+   —— 红字读起来像报错，而这里表达的是「已喜欢」。
+   ⚠️ 淡红底必须从 --fav 派生（color-mix 14%）：浅色下 --fav 压深成 #E2404F，
+   写死的 rgba(255,92,110,.14) 会变成一层「浅色底上的淡粉」，与图标本体脱节。 */
+.bb-btn.bb-fav.on { color: var(--text-1); background: color-mix(in srgb, var(--fav) 14%, transparent); }
 .bb-btn.bb-fav.on svg { color: var(--fav); }
-/* 批量删除：悬停变成危险实底 + 近黑字（与 .w-btn.danger 同一档） */
-.bb-btn.danger:hover { background: var(--danger); color: var(--bg-app); }
+/* 批量删除：悬停变成危险实底 + 危险色上的字（与 .w-btn.danger 同一档） */
+.bb-btn.danger:hover { background: var(--danger); color: var(--on-danger); }
 .bb-btn.ghost { color: var(--text-3); font-size: 11px; }
 .bb-btn.ghost:hover { color: var(--text-1); }
 
@@ -1500,7 +1684,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-raised);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
   white-space: normal;
 }
 .bb-tag-input-row { padding: 0 1px 5px; }
@@ -1546,7 +1730,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 9px;
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--shadow-pop);
   z-index: 110;
   display: flex;
   flex-direction: column;
@@ -1585,7 +1769,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 10px;
   background: var(--bg-raised);
   border: 1px solid var(--border);
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
+  box-shadow: var(--shadow-pop);
   z-index: 110;
 }
 .ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
@@ -1601,7 +1785,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border: none;
   padding: 0;
   cursor: pointer;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  /* 一圈内描边把色块从同色的底上勾出来；浅色下必须是**暗**描边（--hairline 会切） */
+  box-shadow: inset 0 0 0 1px var(--hairline);
   transition: transform 0.1s ease;
 }
 .ctx-color-swatch:hover { transform: scale(1.16); }
@@ -1628,7 +1813,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .ctx-item svg { width: 13px; height: 13px; flex-shrink: 0; }
 .ctx-item:hover { background: var(--bg-hover); color: var(--text-1); }
-.ctx-item.danger { color: var(--danger); }
+.ctx-item.danger { color: var(--danger-text); }
 .ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--text-1); }
 .ctx-sep { height: 1px; background: var(--border-soft); margin: 5px 2px; }
 .ctx-confirm { padding: 4px 4px 2px; display: flex; flex-direction: column; gap: 6px; }
@@ -1644,12 +1829,12 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   cursor: pointer;
 }
 .ctx-confirm-btn:hover { background: var(--bg-hover); }
-.ctx-confirm-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--bg-app); }
-.ctx-confirm-btn.danger:hover { filter: brightness(1.07); }
+.ctx-confirm-btn.danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
+.ctx-confirm-btn.danger:hover { background: var(--danger-hover); filter: var(--hover-lift-danger); }
 .ctx-confirm-btn.danger-strong {
   background: transparent;
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  color: var(--danger);
+  color: var(--danger-text);
 }
 .ctx-confirm-btn.danger-strong:hover {
   background: color-mix(in srgb, var(--danger) 14%, transparent);
@@ -1659,7 +1844,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* ============ 通用弹窗（移动 / 删除确认） ============ */
 .modal-mask {
   position: fixed; inset: 0;
-  background: rgba(0, 0, 0, 0.42);
+  background: var(--scrim);
   display: flex; align-items: center; justify-content: center;
   z-index: 130;
 }
@@ -1670,7 +1855,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 12px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-modal);
 }
 .modal-title { font-size: 13.5px; font-weight: 600; color: var(--text-1); }
 .modal-body { margin: 12px 0 4px; max-height: 46vh; overflow-y: auto; }
@@ -1707,13 +1892,14 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   width: 38px; height: 38px;
   display: grid; place-items: center;
   border-radius: 50%;
-  /* 边框比常规表面略亮一档：这个钮会浮在任意素材上（亮的暗的都有），
-     只靠 --border-soft 的 0.07 白在浅色图上几乎看不见轮廓 */
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  /* 边框比常规表面略微明显一档：这个钮会浮在任意素材上（亮的暗的都有），
+     只靠 --border-soft 的 0.07 在亮图上几乎看不见轮廓。--edge 在深色下是 0.1 白、
+     浅色下是 0.08 黑 —— 两种底上都是「比 --border-soft 更实一档」的意思。 */
+  border: 1px solid var(--edge);
   background: var(--bg-raised);
   color: var(--text-2);
   cursor: pointer;
-  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.34);
+  box-shadow: var(--shadow-sm);
   transition: background 0.15s ease, color 0.15s ease, bottom 0.16s ease;
 }
 .to-top svg { width: 17px; height: 17px; }
@@ -1789,7 +1975,14 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .note-copy svg { width: 12px; height: 12px; }
 .note-copy:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-1); }
 .note-copy:disabled { opacity: 0.35; cursor: default; }
-/* 复制成功的短暂反馈：走强调色（同一套「正向确认」语言） */
+/*
+ * 复制成功的短暂反馈：走强调色（同一套「正向确认」语言）。
+ *
+ * ⚠️ 这里**刻意保留 accent**（浅色下对面板只有 4.09:1，低于 AA 4.5）：这是**状态色**，
+ * 颜色本身就在说「复制成功了」；改成 --text-1 会把这条信息抹平（和旁边的普通文字长得一样）。
+ * 而且它是 11px、只在点完的一瞬间出现、旁边还有图标与文案兜底，实际阅读不吃力。
+ * 同类保留：`.sp-ver-result.is-new`（「有新版本」）。
+ */
 .note-copy.ok { color: var(--accent); }
 /* 只读预览：文字可选可复制，但双击才进编辑（避免误触改内容） */
 .note-view {
@@ -1857,7 +2050,7 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   border-radius: 13px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
-  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
+  box-shadow: var(--shadow-modal);
   overflow: hidden;
 }
 /*
@@ -1992,8 +2185,9 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   background: var(--text-3);
   transition: transform 0.16s ease, background 0.16s ease;
 }
+/* 开启态：轨道是 accent 实底 → 圆钮必须是「亮钮」（见 --knob 的注释，深色下等于 --text-1） */
 .sp-sw.on { background: var(--accent); }
-.sp-sw.on i { transform: translateX(16px); background: var(--text-1); }
+.sp-sw.on i { transform: translateX(16px); background: var(--knob); }
 
 .sp-danger {
   display: flex;
@@ -2019,7 +2213,8 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 }
 .sp-btn:hover { background: var(--bg-hover); color: var(--text-1); }
 .sp-btn.danger {
-  color: var(--danger);
+  /* 文字档（--danger-text）；描边仍是 --danger（线只需 3:1） */
+  color: var(--danger-text);
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
 }
 .sp-btn.danger.armed {
@@ -2091,9 +2286,14 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 /* 检测结果：只在点过之后出现，比版本号低一级、比正文更轻 */
 .sp-ver-result { font-size: 11px; line-height: 1.5; }
 .sp-ver-result.is-ok { color: var(--text-3); }
+/* ⚠️ 保留 accent（浅色下 4.09:1，低于 AA）：与 `.note-copy.ok` 同理 ——
+   「有新版本」是**状态**，蓝色本身就是这条信息的一部分（换成 text-1 就和「已是最新」读不出区别了）。
+   12px + 独占一行 + 后面跟着「去下载」按钮，可读性由版式兜底，不是靠颜色。 */
 .sp-ver-result.is-new { color: var(--accent); }
-.sp-ver-result.is-err { color: var(--danger); }
-/* 「去下载」是行内链接样式的按钮：不是主操作，别做得像 .sp-btn 那么重 */
+.sp-ver-result.is-err { color: var(--danger-text); }
+/* 「去下载」是行内链接样式的按钮：不是主操作，别做得像 .sp-btn 那么重。
+   与 `.ptext-md a` 同一条豁免：**链接**才用 accent 当小字（浅色 4.09:1），
+   因为这里还有下划线兜底可点性；纯状态文字（.ai-note-head 等）一律走 --text-1。 */
 .sp-ver-link {
   padding: 0;
   border: 0;
@@ -2183,13 +2383,19 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   pointer-events: none;
 }
 /* 列表视图里没有缩略图，角标无处可放，退化成一行小字。
-   ⚠️ #9FE1CB 是「AI 来源」的**语义标识色**（与卡片角标上那圈青色描边同源），刻意不通主题化：
-      按本项目的语义，accent 只表示「选中 / 主操作」，把 AI 也染成蓝会把这个信号冲淡。 */
+   ⚠️ 这里**必须**用 --ai-mark（随主题变），不能用写死的 #9FE1CB：
+      卡片角标 `.thumb-ai` 自带深底所以固定色成立，这一行是**直接压在 --bg-canvas 上**的，
+      浅色下同一个青色只有 1.40:1 = 隐形。
+   ⚠️ 仍然不用 accent：「AI 来源」是语义标识，按本项目的语义 accent 只表示「选中 / 主操作」，
+      把 AI 也染成蓝会把这个信号冲淡。描边沿用「同色 40%」的关系（color-mix 派生）。
+   ⚠️ **已知边界（刻意不修）**：选中行叠了 14% 的 accent-soft 当底，浅色下这行字在那里是 4.36:1
+      （正常底 5.18、hover 4.65）。为这 0.14 的差额再压深 AI 色，会把**正常态**一起拖暗到 4 以下 ——
+      而选中状态本来就有一层强提示（整行底色），这行 10px 小字不是唯一的可读性来源。 */
 .list-ai {
   flex: 0 0 auto;
   font-size: 10px; line-height: 1;
-  color: #9FE1CB;
-  border: 1px solid rgba(159, 225, 203, 0.4);
+  color: var(--ai-mark);
+  border: 1px solid color-mix(in srgb, var(--ai-mark) 40%, transparent);
   border-radius: 3px;
   padding: 1px 4px;
   margin-right: 8px;
@@ -2214,16 +2420,23 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   font-size: 12.5px; color: var(--text-1);
 }
 .cp-sub { font-size: 11px; color: var(--text-3); }
-/* 后果说明用危险色淡染底：这是本项目唯一「改掉用户原文件内容」的操作（淡染由 --danger 派生） */
+/*
+ * 后果说明用危险色淡染底：这是本项目唯一「改掉用户原文件内容」的操作（淡染由 --danger 派生）。
+ *
+ * ⚠️ 正文必须用 --text-2 而不是 --text-3：这行字**压在自己那层 10% 危险淡染上**，
+ * 那层底比面板更暗一档，所以「对面板 4.65 的 --text-3」到这里只剩 4.09（11.5px 不达标）。
+ * 换成 --text-2：浅色 4.54 / 深色 7.08。（更高一档的 --text-1 也可，但那会和 .cp-label 同级，
+ * 反而看不出「这是说明、不是选项」。）
+ */
 .cp-warn {
   margin-top: 12px;
   padding: 9px 11px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--danger) 10%, transparent);
   font-size: 11.5px; line-height: 1.72;
-  color: var(--text-3);
+  color: var(--text-2);
 }
-.cp-warn strong { color: var(--danger); font-weight: 500; }
+.cp-warn strong { color: var(--danger-text); font-weight: 500; }
 .cp-prog-name {
   margin-bottom: 8px;
   font-size: 12.5px; color: var(--text-1);
