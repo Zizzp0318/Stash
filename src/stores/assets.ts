@@ -544,6 +544,22 @@ export const useAssetStore = defineStore('assets', () => {
   }
 
   /**
+   * 移动失败的原因 → 人话。
+   *
+   * `ERR_MOVE_BUSY` 来自 `fsutil.moveFileSync` 的「删源」那一步：拷贝已经成功、源文件却因为
+   * 被别的进程占着删不掉。2026-11-07 用户反馈里看到的是裸的
+   * `EBUSY: resource busy or locked, unlink 'E:\我的资料库\...\IMG_7260.MOV'` ——
+   * 用户既不知道发生了什么，也不知道"其实目标文件夹里已经多了一份"。
+   */
+  const MOVE_ERR_TEXT: Record<string, string> = {
+    ERR_MOVE_BUSY:
+      '文件正被其它程序占用（可能在播放 / 预览，或被同步盘、杀毒软件扫描），关掉它或稍等几秒再试',
+    ERR_FOLDER_NOT_FOUND: '目标文件夹已不存在（可能被删除或移动过）',
+    ERR_NO_LIBRARY: '当前没有打开的素材库'
+  }
+  const moveErrText = (code?: string): string => MOVE_ERR_TEXT[code ?? ''] ?? String(code ?? '未知原因')
+
+  /**
    * 批量移动到库内文件夹：文件真的搬走，列表与侧栏计数同步刷新。
    * `explicitIds` 供拖拽移动使用 —— 那种场景下「要拖的东西」不一定等于当前选中集合。
    */
@@ -552,7 +568,7 @@ export const useAssetStore = defineStore('assets', () => {
     if (!ids.length) return
     const r = await window.stash.asset.move(ids, folderId)
     if (!r.ok) {
-      notify('error', `移动失败：${r.error}`)
+      notify('error', `移动失败：${moveErrText(r.error)}`)
       return
     }
     const moved = r.data?.moved ?? 0
@@ -566,7 +582,7 @@ export const useAssetStore = defineStore('assets', () => {
     await refresh({ keepDepth: true })
     // 目标文件夹里已有同名文件时会被自动改成 `名字 (1).ext`，得说清楚，否则用户会以为文件被覆盖了
     const note = renamed ? `（${renamed} 个因重名已自动改名）` : ''
-    if (failed.length) notify('error', `${moved} 项已移动，${failed.length} 项失败（${failed[0].name}：${failed[0].error}）`)
+    if (failed.length) notify('error', `${moved} 项已移动，${failed.length} 项失败（${failed[0].name}：${moveErrText(failed[0].error)}）`)
     else notify('info', `${target ? `已移动 ${moved} 项到「${target}」` : `已移动 ${moved} 项`}${note}`)
   }
 

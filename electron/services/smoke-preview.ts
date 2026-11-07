@@ -48,7 +48,7 @@ import { FFMPEG } from './ffmpeg'
 import { createLibrary, mkdirRel, closeCurrent, requireCurrent } from './library'
 import { importFiles, contentHash } from './importer'
 import { DEFAULT_SETTINGS, getSettings, patchSettings } from './config'
-import { writeFileWithRetry } from './fsutil'
+import { moveFileSync, writeFileWithRetry } from './fsutil'
 import {
   analyze, previewInfo, deriveFor, serveMedia, derivedPathFor, rowOf, readText, writeText,
   textMaxBytes, type PreviewInfo
@@ -499,6 +499,69 @@ export async function runSmokePreview(win: BrowserWindow): Promise<void> {
         calls === 1 && caught.startsWith('ENOSPC'),
         `calls=${calls} caught=${caught}`
       )
+    }
+
+    // ==================== S-move 退化路径：删源失败必须回滚副本 ====================
+    // 2026-11-07 用户反馈：拖拽移动视频偶发
+    //   「0 项已移动，1 项失败（IMG_7260.MOV：EBUSY: resource busy or locked, unlink 'E:////…'）」
+    // 而**目标文件夹里已经多了一份副本** —— 拷贝成功、删源失败，留下半截状态。
+    //
+    // 根因：`moveFileSync` 的 rename 侧有重试，unlink 侧原来**没有**。
+    // 这里注入「rename 必失败（模拟跨盘）+ unlink 被占用」把退化路径逼出来，
+    // 盯住两件事：① 瞬时占用重试后能成功；② 重试耗尽时必须把副本撤掉、并抛语义码。
+    {
+      const base = join(tmpdir(), `stash-movebusy-${Date.now()}`)
+      mkdirSync(base, { recursive: true })
+      const mkErr = (c: string): Error => Object.assign(new Error(`${c}: mock`), { code: c })
+      const forceDegrade = (): void => {
+        throw mkErr('EXDEV') // 跨盘：确定走「拷贝 + 删源」
+      }
+
+      // ① 瞬时占用：前两次 EBUSY、第三次成功 → 移动成立
+      {
+        const src = join(base, 'retry-src.txt')
+        const dest = join(base, 'retry-dest.txt')
+        writeFileSync(src, 'payload')
+        let calls = 0
+        moveFileSync(src, dest, {
+          renameFn: forceDegrade,
+          unlinkFn: () => {
+            calls++
+            if (calls < 3) throw mkErr('EBUSY')
+            unlinkSync(src)
+          }
+        })
+        check(
+          'S-move 删源遇瞬时占用重试后成功（源已删、目标在）',
+          calls === 3 && !existsSync(src) && existsSync(dest),
+          `calls=${calls} src=${existsSync(src)} dest=${existsSync(dest)}`
+        )
+      }
+
+      // ② 占用持续存在：必须回滚副本，且抛 ERR_MOVE_BUSY（不是裸 EBUSY）
+      {
+        const src = join(base, 'locked-src.txt')
+        const dest = join(base, 'locked-dest.txt')
+        writeFileSync(src, 'payload')
+        let code = ''
+        try {
+          moveFileSync(src, dest, {
+            renameFn: forceDegrade,
+            unlinkFn: () => {
+              throw mkErr('EBUSY')
+            }
+          })
+        } catch (e) {
+          code = String((e as Error).message)
+        }
+        check(
+          'S-move 删源始终失败 → ERR_MOVE_BUSY 且副本已回滚（不留半截状态）',
+          code === 'ERR_MOVE_BUSY' && existsSync(src) && !existsSync(dest),
+          `code=${code} src=${existsSync(src)} dest=${existsSync(dest)}`
+        )
+      }
+
+      rmSync(base, { recursive: true, force: true })
     }
 
     // 写：非文本 / 超限

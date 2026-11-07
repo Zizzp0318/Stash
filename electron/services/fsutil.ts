@@ -228,22 +228,78 @@ export function renameWithShortRetrySync(
 }
 
 /**
+ * **同步**短重试的 `unlink`：专给 `moveFileSync` 的「拷贝 + 删源」那一步用。
+ *
+ * 为什么它必须存在：`rename` 有重试、`unlink` 原来没有，于是出现过这种**半截状态**——
+ * 拷贝已经成功（副本落到目标文件夹了）、删源撞上瞬时占用直接抛出，用户看到
+ * 「0 项已移动，1 项失败（EBUSY: resource busy or locked, unlink '…'）」，
+ * 但目标文件夹里明明多了一份副本。（2026-11-07 用户反馈：拖拽移动视频偶发。）
+ *
+ * ⚠️ 不能拿「我们自己的读流」当依据认为 unlink 一定成功：`moveAssets` 的注释里写着
+ * 探针实测「打开中 unlink 也 OK」—— 那测的是 **Chromium 打开文件时用了 FILE_SHARE_DELETE**。
+ * 而外部进程（某些播放器、同步盘、杀软）常常**不允许**删除共享，这才是 EBUSY 的来源。
+ *
+ * 预算刻意比 rename 小（[0, 120]，最多再等 120ms）：本函数跑在**批量循环的同步事务**里，
+ * 每个失败项都要等，批量几十个就会把界面拖住。
+ */
+function unlinkWithShortRetrySync(file: string, doUnlink: (f: string) => void = unlinkSync): void {
+  let last: unknown
+  for (let i = 0; i < 3; i++) {
+    try {
+      doUnlink(file)
+      return
+    } catch (e) {
+      last = e
+      if (!isTransientRenameError(e)) throw e // ENOENT 之类一律立即抛，别白等
+      if (i < 2) sleepSync(i === 0 ? 0 : 120)
+    }
+  }
+  throw last
+}
+
+/**
  * 移动文件：先试 `rename`（同盘、原子、零拷贝），失败再退化成「拷贝 + 删源」。
  *
  * 退化路径是为**跨盘**准备的（`rename` 不能跨卷）。故意 catch 住所有错误而不只判 EXDEV：
  * `rename` 在 Windows 上还可能因目标被占用等杂因失败，而「拷贝 + 删源」在这些情况下同样成立，
- * 没必要把失败模式枚举全。拷完了才删源 —— 即使删源失败也只是留下一份副本，不会丢数据。
+ * 没必要把失败模式枚举全。
+ *
+ * ⚠️ 删源必须重试（`unlinkWithShortRetrySync`）；且**删源最终失败时要把刚拷出去的副本撤掉** ——
+ * 否则用户看到的是「提示失败，但目标文件夹里多了一份」：比直接失败更让人困惑，
+ * 而且下次再动同一批文件会产生「名字 (1)」这类重名副本。
+ * 撤副本本身失败就不再管：源文件才是数据本体，副本残留只是一份脏文件。
  *
  * ⚠️ 加短重试（实测依据见 `fsutil.isTransientRenameError`）：`rename` 撞上**瞬时占用**
  * （`EPERM`/`EBUSY`/`EACCES`）时先小幅重试几次，多半能直接成功，避免白白退化成「拷贝 + 删源」
  * （慢且留下一份半成品副本）。`EXDEV` 是确定的跨盘信号，**不重试、直接退化**。
  * ⚠️ 本函数**必须保持同步**：`moveAssets` 在 `BEGIN…COMMIT` 事务中间调它，不能出现 await。
  */
-export function moveFileSync(src: string, dest: string): void {
+export function moveFileSync(
+  src: string,
+  dest: string,
+  /** 仅测试用：注入 rename / unlink 实现（验证退化路径、重试与回滚），生产调用点不要传 */
+  opts: { renameFn?: (from: string, to: string) => void; unlinkFn?: (f: string) => void } = {}
+): void {
   try {
-    renameWithShortRetrySync(src, dest)
+    renameWithShortRetrySync(src, dest, opts.renameFn ? { renameFn: opts.renameFn } : {})
+    return
   } catch {
-    copyFileSync(src, dest)
-    unlinkSync(src)
+    /* 跨盘 / 占用超出预算 → 退化。下面的失败会在这里重新抛，语义更准确 */
+  }
+  copyFileSync(src, dest)
+  try {
+    unlinkWithShortRetrySync(src, opts.unlinkFn)
+  } catch (e) {
+    try {
+      unlinkSync(dest)
+    } catch {
+      /* 副本也删不掉：留着不影响源数据 */
+    }
+    // 抛语义码而不是裸 EBUSY：渲染层要据此告诉用户"文件正被占用"，
+    // 而不是甩一句 `EBUSY: resource busy or locked, unlink 'E:\...'`。
+    // 原始错误挂在 cause 上，排查时还能看到是哪一步失败。
+    const busy = new Error('ERR_MOVE_BUSY')
+    ;(busy as { cause?: unknown }).cause = e
+    throw busy
   }
 }
