@@ -33,7 +33,16 @@ contextBridge.exposeInMainWorld('stash', {
      *           `false` = 流静默后的**收尾** flush（额外 bumpThumbs + 弹一次提示）。
      */
     onExternal: (cb: (d: { added: number; changed: number; removed: number; partial: boolean }) => void) =>
-      subscribe('library:external', cb as (data: unknown) => void)
+      subscribe('library:external', cb as (data: unknown) => void),
+    /**
+     * 缓存占用账本**算完之后**的推送（`meta.thumbs_bytes` 缺失时由主进程后台重算）。
+     *
+     * 为什么需要它：`library:usage` 现在是 O(1) 的（只读账本），账本没算出来时先回
+     * `{thumbsPending:true}`，侧栏显示 `…`；重算完成（2 万条约 1 秒，分块跑、不卡界面）
+     * 后主进程推这事件，侧栏把数字补上。没有这个事件，用户就得等下一次 counts 变动才看到数值。
+     */
+    onUsage: (cb: (d: { assetsBytes: number; thumbsBytes: number; totalBytes: number; thumbsPending?: boolean }) => void) =>
+      subscribe('library:usage', cb as (data: unknown) => void)
   },
   folder: {
     mkdir: (relPath: string) => ipcRenderer.invoke('folder:mkdir', relPath),

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue'
+import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import SideBar from './components/SideBar.vue'
 import ColumnResizer from './components/ColumnResizer.vue'
@@ -8,6 +8,7 @@ import DetailPanel from './components/DetailPanel.vue'
 import Welcome from './components/Welcome.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import ThumbProgress from './components/ThumbProgress.vue'
+import BootLoader from './components/BootLoader.vue'
 import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
 import { useSettingsStore } from './stores/settings'
@@ -45,6 +46,78 @@ function onSystemThemeChange(): void {
  */
 const thumbProgress = ref<{ done: number; total: number } | null>(null)
 
+// ==================== 开库骨架屏（2026-11）====================
+//
+// 数据源是 `lib.booting` / `lib.bootStage`（见 stores/library.ts 的说明）。这里只负责**时序**：
+//   · 100ms 内就好的开库**什么都不显示**（本机 5.5ms，热开库更短）——闪一下骨架纯属噪音；
+//   · 超过 100ms 才亮骨架；超过 `bootStuckAfterMs`（默认 8s）给「先浏览」出口；
+//   · 首屏数据到位后由 `markBootPainted()` 收尾（等两帧，保证内容真的画出来）。
+//
+// ⚠️ 别把阈值改成 0：那等于每次切库都闪一下骨架，比没有更烦。
+const BOOT_SHOW_DELAY_MS = 100
+const bootVisible = ref(false)
+const bootStuck = ref(false)
+let bootShowTimer: ReturnType<typeof setTimeout> | null = null
+let bootStuckTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearBootTimers(): void {
+  if (bootShowTimer !== null) {
+    clearTimeout(bootShowTimer)
+    bootShowTimer = null
+  }
+  if (bootStuckTimer !== null) {
+    clearTimeout(bootStuckTimer)
+    bootStuckTimer = null
+  }
+}
+
+watch(
+  () => lib.booting,
+  (on) => {
+    clearBootTimers()
+    if (!on) {
+      bootVisible.value = false
+      bootStuck.value = false
+      return
+    }
+    bootShowTimer = setTimeout(() => {
+      bootShowTimer = null
+      bootVisible.value = true
+    }, BOOT_SHOW_DELAY_MS)
+    bootStuckTimer = setTimeout(() => {
+      bootStuckTimer = null
+      bootStuck.value = true
+    }, lib.bootStuckAfterMs)
+  }
+)
+
+/** 首屏画完 → 撤骨架（等两帧：第一帧 patch，第二帧上屏） */
+function markBootPainted(): void {
+  // 骨架压根没亮过（开库比阈值还快）→ 立刻收，别为了「等一帧」把自己顶过 100ms 阈值，
+  // 反而让本该无感的开库闪一下骨架（实测：79ms 的开库 + 两帧 rAF 就跨过了 100ms）。
+  if (!bootVisible.value) {
+    lib.endBoot()
+    return
+  }
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => lib.endBoot())
+  })
+}
+
+// 收尾判定：`bootStage === 'grid'`（索引与元信息都到位）+ **该库的首屏查询真的回来过**
+// （`assets.loadedOnce`，见 stores/assets.ts 的说明）。
+//
+// 为什么不用 `assets.loading` 的边沿：切库时 `reset()` 清空 items、refresh 下一帧才发，
+// 只盯 loading 会「提前收骨架 → 闪一下空网格」；而「空库」这种 `loading` 一闪而过的情况，
+// 边沿还可能被漏掉。`loadedOnce` 是「查询真的回来过」的直接证据，切库时会被 reset 复位。
+watch(
+  () => [lib.booting, lib.bootStage, assets.loadedOnce] as const,
+  () => {
+    if (lib.booting && lib.bootStage === 'grid' && assets.loadedOnce) markBootPainted()
+  },
+  { immediate: true }
+)
+
 /**
  * 完成后的淡出定时器。**必须留着句柄**：
  * ① 下一批生成开始时要把「隐藏计划」撤掉，否则新进度条会在 800ms 后被上一批的定时器抹掉；
@@ -76,6 +149,8 @@ onMounted(async () => {
     await assets.refresh()
     // 打开已有库：回填缺失缩略图（已存在的会跳过，只生成缺的）
     window.stash.thumb.backfill('grid')
+    // 首屏数据到位 + 一帧绘制之后才收骨架层：早一帧收会闪一下空白网格（比不显示骨架更糟）
+    markBootPainted()
   }
 
   // 缩略图批量生成完成 → bump 版本号，让所有 <img> 重新加载
@@ -212,7 +287,20 @@ onBeforeUnmount(() => {
         不会像加普通子元素那样凭空多出两条缝（改成 static 就会）。
       -->
       <ColumnResizer />
-      <GalleryGrid />
+      <!--
+        中栏包装层：只为给开库加载浮层提供定位锚点（`.gallery-wrap` 相对定位、`.gallery` 仍占满）。
+        ⚠️ 不要把浮层挂到 `.body` 上——那会盖住左右栏与标题栏（第二版明确要求「只虚化预览窗口」）。
+      -->
+      <div class="gallery-wrap">
+        <GalleryGrid />
+        <BootLoader
+          v-if="bootVisible && lib.booting"
+          :stage="lib.bootStage"
+          :thumb="thumbProgress"
+          :stuck="bootStuck"
+          @skip="lib.endBoot()"
+        />
+      </div>
       <!-- 收纳状态由标题栏右上角的按钮控制（见 TitleBar 的 .wc-btn）。
            收起后整个面板不渲染，点素材也不会把它带回来 —— 状态是显式的，不派生自「有没有选中」 -->
       <DetailPanel v-if="!assets.detailCollapsed" />

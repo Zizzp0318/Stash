@@ -10,6 +10,7 @@ import { readdirSync, rmSync, statSync } from 'fs'
 import { join } from 'path'
 import { requireCurrent, getLibrary, pruneUnlinkedTags } from './library'
 import { isThumbHash } from './paths'
+import { bumpThumbsBytes, cachedThumbsBytes, recountThumbsBytesAsync } from './usage'
 
 export interface LibraryStats {
   name: string
@@ -37,59 +38,50 @@ export function libraryStats(): LibraryStats {
 }
 
 /**
- * `.thumbs/<hash>/` 两层的总字节数。
- *
- * 只下探两层（缓存结构就是固定两层，不去递归子目录）；任何一处读失败都当 0 跳过 ——
- * 这只是给用户看个大概，不该因为它报错，也不该为了精确去 stat 每一个文件（那是体检的活）。
+ * ⚠️ 这里曾经有一个 `thumbsDirBytes()`（同步遍历 `.thumbs` 两层）。
+ * 它现在搬到了 `usage.ts` 的 `thumbsDirBytesSync()`，**只给测试/兜底用** ——
+ * 开库路径上不许再同步遍历（2 万条 1.1 s、5 万条 2.8 s，正是「开库卡死」的根因）。
  */
-function thumbsDirBytes(root: string): number {
-  let hashes: string[]
-  try {
-    hashes = readdirSync(root)
-  } catch {
-    return 0 // 还没生成过任何缩略图
-  }
-  let total = 0
-  for (const h of hashes) {
-    const dir = join(root, h)
-    let files: string[]
-    try {
-      files = readdirSync(dir)
-    } catch {
-      continue
-    }
-    for (const f of files) {
-      try {
-        total += statSync(join(dir, f)).size
-      } catch {
-        /* 正被写入/刚被清理，跳过 */
-      }
-    }
-  }
-  return total
-}
 
 export interface LibraryUsage {
   /** 素材文件占用（索引里的 size 之和，不碰磁盘） */
   assetsBytes: number
-  /** `.thumbs` 缩略图缓存占用（要遍历目录，几千个文件约几十毫秒） */
+  /**
+   * `.thumbs` 缩略图缓存占用。
+   *
+   * ⚠️ 这个值来自**账本**（`meta.thumbs_bytes`，由 `usage.ts` 增量维护），不再每次遍历目录 ——
+   * 同步遍历 `.thumbs` 在 2 万条库上要 1.1 秒、5 万条要 2.8 秒，而那正是「开库卡死」的根因。
+   * 账还没算出来时它是 0，同时 `thumbsPending` 为 true，稍后由异步重算推事件补上。
+   */
   thumbsBytes: number
   totalBytes: number
+  /** 账本还没算出来（首次开库 / 外部动过 .thumbs）：界面显示 `…`，后台正在重算 */
+  thumbsPending?: boolean
 }
 
 /**
  * 库占用空间 —— 侧栏那一行用的。
  *
- * 与 `libraryStats()` 分开的原因：那个要「快、一打开面板就有」，而这里多了缓存目录遍历；
- * 并且侧栏的数值会跟着素材增减反复刷新（导入/删除后），必须 debounce，不能每次 counts 变动都去扫目录。
+ * 与 `libraryStats()` 分开的原因：那个要「快、一打开面板就有」，而这里多了缓存占用。
+ *
+ * ⚠️ **开库路径上必须是 O(1)**：本函数现在只查一条 SQL（素材字节）+ 读一行 `meta`（缓存字节），
+ * 实测 2 万/5 万条库都是亚毫秒级。历史上它在这里同步遍历 `.thumbs`（2 万条 1.1 s、5 万条 2.8 s），
+ * 而且侧栏 `watch(counts.total)` 一变就再算一次 —— 等于每次导入/删除都冻一次界面。
+ * 需要精确值时用刷新按钮（`refreshUsage`）或让账本缺失后自动重算（见 `usage.ts`）。
  */
 export function libraryUsage(): LibraryUsage {
-  const { db, path } = requireCurrent()
+  const { db } = requireCurrent()
   const assetsBytes = (
     db.prepare('SELECT coalesce(sum(size),0) AS c FROM assets WHERE missing=0').get() as { c: number }
   ).c
-  const thumbsBytes = thumbsDirBytes(join(path, '.thumbs'))
-  return { assetsBytes, thumbsBytes, totalBytes: assetsBytes + thumbsBytes }
+  const cached = cachedThumbsBytes(db)
+  if (cached == null) {
+    // 没有账本：先把界面交出去，重算跑在后台（分块遍历，不阻塞事件循环），
+    // 算完写回 meta 并由 `main.ts` 接好的通知口推一次 `library:usage`
+    void recountThumbsBytesAsync()
+    return { assetsBytes, thumbsBytes: 0, totalBytes: assetsBytes, thumbsPending: true }
+  }
+  return { assetsBytes, thumbsBytes: cached, totalBytes: assetsBytes + cached }
 }
 
 export interface ScanResult {
@@ -207,6 +199,8 @@ export function cleanMissing(): CleanMissingResult {
       }
     }
   }
+  // 体检删掉了整个 hash 目录（含派生预览）→ 账本按实际释放量扣减，别让下次开库去重建账
+  bumpThumbsBytes(-freed)
   return { removed, freed, pruned: pruneUnlinkedTags(db, affectedTagIds) }
 }
 

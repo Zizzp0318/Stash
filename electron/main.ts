@@ -14,6 +14,7 @@ import {
 import * as configSvc from './services/config'
 import * as cacheSvc from './services/cache'
 import * as healthSvc from './services/health'
+import { setThumbsBytesNotifier } from './services/usage'
 import * as genmetaSvc from './services/genmeta'
 import * as compressSvc from './services/compress'
 import * as updateSvc from './services/update'
@@ -32,6 +33,8 @@ import { runSmokeCompress } from './services/smoke-compress'
 import { runSmokeWelcome } from './services/smoke-welcome'
 import { runSmokeWatch } from './services/smoke-watch'
 import { runSmokeVScroll } from './services/smoke-vscroll'
+import { runSmokeUsage } from './services/smoke-usage'
+import { runSmokeBoot } from './services/smoke-boot'
 import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, invalidateGridPresence, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
@@ -50,6 +53,26 @@ import { isThumbHash } from './services/paths'
  * 否则 `--smoke-folder` 那条端到端断言会因为「没人注册」而退化成空转（G11）。
  */
 registerMediaHandleGuard(previewSvc.mediaHandleGuard)
+
+/**
+ * 把「缓存占用账本算完了」的通知口接到窗口上。
+ *
+ * 背景：`library:usage` 现在只读 `meta.thumbs_bytes`（O(1) 的一行），账本缺失时先回
+ * `{thumbsPending:true}` 并触发一次**分块异步**重算（2 万条库约 1 秒，不阻塞事件循环）。
+ * 算完在这里推 `library:usage`，侧栏把 `…` 换成真实数字 —— 否则用户要等下一次 counts
+ * 变动才看得到（而 `counts` 只在导入/删除后才变）。
+ *
+ * 与其它注册表同一纪律：**写在模块顶层**，各套冒烟走自己的 argv 分支也能接上（G11）。
+ */
+setThumbsBytesNotifier(() => {
+  const win = BrowserWindow.getAllWindows()[0]
+  if (!win || win.isDestroyed()) return
+  try {
+    win.webContents.send('library:usage', healthSvc.libraryUsage())
+  } catch {
+    /* 窗口正在销毁：这次推送丢了没关系，下次开库/刷新会重算 */
+  }
+})
 
 /**
  * 把「改名隔离」的三个实现接进 `handles.ts` 的第二份注册表。
@@ -112,9 +135,75 @@ registerRenameIsolationGuard({
   }
 })
 
+// ==================== 缩略图回填：分批 + 低优先级 + 到点续批 ====================
+//
+// 数值取舍：300 条/轮 —— 低优先级一次只跑一个 job、job 间空 24ms，单张几十毫秒，
+// 一轮大约十几秒；续批间隔 1.2s。换成 1000 条/轮会让「回到上一屏」的等待变成十几秒，
+// 300 条正好覆盖 1~2 屏的预生成，又不至于让用户觉得「一直有东西在跑」。
+const BACKFILL_BATCH = 300
+const BACKFILL_NEXT_DELAY_MS = 1200
+
+let backfillTimer: ReturnType<typeof setTimeout> | null = null
+
+function cancelPendingBackfill(): void {
+  if (backfillTimer !== null) {
+    clearTimeout(backfillTimer)
+    backfillTimer = null
+  }
+}
+
+function scheduleBackfillNext(size: ThumbSize, limit: number): void {
+  if (backfillTimer !== null) return
+  backfillTimer = setTimeout(() => {
+    backfillTimer = null
+    // 库没了（关库/切库）就别再跑；切库后新库自己的开库流程会重新调 backfill
+    if (!librarySvc.getLibrary()) return
+    runBackfill(size, limit)
+  }, BACKFILL_NEXT_DELAY_MS)
+}
+
 /**
- * 移除库的**唯一收口入口**：IPC 与 `--smoke-forget` 都走它，避免两处各写一遍。
+ * 跑一轮回填（同步入队，立刻返回）。
  *
+ * @param limit 本轮最多入队多少条；省略用 `BACKFILL_BATCH`
+ * @returns `{queued, capped}`：capped=true 表示「还有欠账没排进来」，本轮结束后会自动续批
+ */
+function runBackfill(size: ThumbSize, limit?: number): { queued: number; capped: boolean } {
+  const n = Number(limit)
+  const take = Number.isFinite(n) && n > 0 ? Math.floor(n) : BACKFILL_BATCH
+  try {
+    // 存量尺寸重测（幂等、一次性）：老库里写的是「EXIF 旋转前 / 忽略旋转」的尺寸，
+    // 先清空让它们落回欠账条件，下面的 ensureBatch 才会把它们重新纳入并补写成**显示尺寸**。
+    // 放这里而不是缩略图队列内部：所有「开库」路径都会调本 handler，挂这里最省事。
+    retestLegacyDims()
+    const db = librarySvc.getDatabase()
+    const rows = db
+      .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE missing=0 ORDER BY imported_at DESC')
+      .all() as Array<never>
+    // 顺带补扫「该扫还没扫」的生成参数。挂在 backfill 上而不是缩略图队列内部，
+    // 是因为队列会按「缩略图是否已存在」过滤掉缓存命中的素材 —— 那些素材永远进不了队列，
+    // 于是「先关着用、后来才打开提取」的用户永远补不上（见 genmeta.ts 的位标记设计）。
+    genmetaSvc.backfillMeta()
+
+    let res: { queued: number; capped: boolean } = { queued: 0, capped: false }
+    res = ensureBatch(
+      rows,
+      size,
+      () => {
+        // 这一批跑完：还有欠账就隔一会儿续下一批（`res.capped` 由本轮的入队结果决定）
+        if (res.capped) scheduleBackfillNext(size, take)
+      },
+      { lowPriority: true, limit: take }
+    )
+    return res
+  } catch {
+    // 没开库 / 库刚被关掉：静默，别把异常甩给 IPC 调用方
+    return { queued: 0, capped: false }
+  }
+}
+
+/**
+ * 移除库的**唯一收口入口**：IPC 与 `--smoke-forget` 都走它，避免两处各写一遍。 *
  * 顺序刻意是「先删记录、后关库」：万一写配置失败，应用仍停在原来的库上，
  * 不会出现「库还开着、但列表里已经没了」这种半截状态。
  * 当前库要先 unwatch 再 close（同 library:close）：chokidar 持有句柄时直接 close 不干净。
@@ -264,6 +353,8 @@ const gotLock = app.requestSingleInstanceLock()
 // M1 冒烟测试模式：electron . --smoke-m1
 if (!gotLock) {
   app.quit()
+} else if (process.argv.includes('--smoke-usage')) {
+  app.whenReady().then(() => runSmokeUsage())
 } else if (process.argv.includes('--smoke-m1')) {
   app.whenReady().then(() => runSmoke())
 } else if (process.argv.includes('--smoke-m2')) {
@@ -520,22 +611,18 @@ function bootstrap(): void {
       })
     )
     // 回填：为全库缺失的缩略图排队生成（导入后/开库后调用）
-    ipcMain.handle('thumb:backfill', (_e, { size }) =>
+    //
+    // ⚠️ 2026-11 改成「**分批 + 低优先级 + 到点续批**」（见 thumbs.ts 的 Job.lowPriority）：
+    //   以前是一次性把「全库缺缩略图」全塞进 4 并发队列 —— 几万条库会连续跑几十分钟，
+    //   期间 sharp 把 libuv 线程池占满，用户滚动掉帧、点开图片要排队。
+    //   现在每轮最多 `BACKFILL_BATCH` 条、且一次只跑一个、job 之间空 24ms；
+    //   这批跑完若还有欠账，隔 `BACKFILL_NEXT_DELAY_MS` 自动续下一批 —— 界面始终有其余并发位留给交互。
+    //   终止条件：没有欠账（`queued === 0`）；生成失败过的素材会被 `failedThumbs` 拉黑，
+    //   所以不会出现「一张坏图让续批永不停止」。
+    ipcMain.handle('thumb:backfill', (_e, { size, limit } = {}) =>
       wrap(() => {
-        const s: ThumbSize = size in SIZES ? size : 'grid'
-        // 存量尺寸重测（幂等、一次性）：老库里写的是「EXIF 旋转前 / 忽略旋转」的尺寸，
-        // 先清空让它们落回欠账条件，下面的 ensureBatch 才会把它们重新纳入并补写成**显示尺寸**。
-        // 放这里而不是缩略图队列内部：所有「开库」路径都会调本 handler，挂这里最省事。
-        retestLegacyDims()
-        const rows = librarySvc.getDatabase()
-          .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE missing=0')
-          .all() as Array<never>
-        ensureBatch(rows, s)
-        // 顺带补扫「该扫还没扫」的生成参数。挂在 backfill 上而不是缩略图队列内部，
-        // 是因为队列会按「缩略图是否已存在」过滤掉缓存命中的素材 —— 那些素材永远进不了队列，
-        // 于是「先关着用、后来才打开提取」的用户永远补不上（见 genmeta.ts 的位标记设计）。
-        genmetaSvc.backfillMeta()
-        return { queued: rows.length }
+        cancelPendingBackfill() // 用户主动触发的这一轮优先，别和续批排在一起
+        return runBackfill(size in SIZES ? (size as ThumbSize) : 'grid', limit)
       })
     )
 
@@ -668,7 +755,7 @@ function bootstrap(): void {
     )
 
     // 缓存占用与清理（缩略图 / 派生预览分开算、分开清）
-    ipcMain.handle('cache:stats', () => wrap(() => cacheSvc.cacheStats()))
+    ipcMain.handle('cache:stats', () => wrap(() => cacheSvc.cacheStatsAsync()))
     ipcMain.handle('cache:clear', (_e, { kind }) =>
       wrap(() => {
         const k = kind === 'derived' || kind === 'thumbs' || kind === 'all' ? kind : 'thumbs'
@@ -988,6 +1075,13 @@ function bootstrap(): void {
     if (process.argv.includes('--smoke-vscroll')) {
       win.webContents.once('did-finish-load', () => {
         void runSmokeVScroll(win)
+      })
+    }
+
+    // 开库骨架屏：要真窗口（骨架是 DOM），等首帧加载完再驱动
+    if (process.argv.includes('--smoke-boot')) {
+      win.webContents.once('did-finish-load', () => {
+        void runSmokeBoot(win)
       })
     }
 

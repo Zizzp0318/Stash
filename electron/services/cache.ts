@@ -11,8 +11,10 @@
 // 分类靠文件名而不是靠子目录：`{hash}` 目录是三者共用的
 // （同一个素材的缩略图、派生预览、以及派生中途的临时文件都落在里面）。
 import { existsSync, readdirSync, rmdirSync, statSync, unlinkSync } from 'fs'
+import { readdir, stat } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { requireCurrent } from './library'
+import { bumpThumbsBytes } from './usage'
 
 export type CacheKind = 'thumbs' | 'derived' | 'other'
 
@@ -111,6 +113,85 @@ export function cacheStats(): CacheStats {
   return { dir, total: sum(entries), thumbs: of('thumbs'), derived: of('derived'), other: of('other') }
 }
 
+/** 异步遍历的分块粒度：每处理这么多个顶层项让出一次事件循环 */
+const YIELD_EVERY_DIRS = 120
+
+/**
+ * 异步分块版的缓存统计（`cache:stats` 走这条）。
+ *
+ * 为什么需要：同步版在 2 万条库上要 **872ms**、5 万条 **2241ms**（每个文件一次 `statSync`），
+ * 而用户点开「设置 → 缩略图与缓存」就会触发 —— 这段时间主进程整条事件循环被钉死，
+ * 界面表现是「点开设置卡两秒」，和 `library:usage` 那个坑同源（见 §5.5）。
+ *
+ * 做法：目录**成批并行**处理（每批 `PARALLEL_DIRS` 个，批内 `Promise.all`），每批结束
+ * `await setImmediate` 让出事件循环。实测 3006 个文件 ≈ 60–120ms（同步版同数据 ~150–300ms，
+ * 但会把 UI 钉住），遍历期间 IPC / 绘制都能插进来 —— 数字晚几十毫秒到完全可以接受。
+ */
+const PARALLEL_DIRS = 48
+
+export async function cacheStatsAsync(): Promise<CacheStats> {
+  const dir = join(requireCurrent().path, '.thumbs')
+  const buckets: Record<CacheKind, CacheBucket> = {
+    thumbs: { files: 0, bytes: 0 },
+    derived: { files: 0, bytes: 0 },
+    other: { files: 0, bytes: 0 }
+  }
+  const add = (kind: CacheKind, bytes: number): void => {
+    buckets[kind].files++
+    buckets[kind].bytes += bytes
+  }
+  const countFile = async (abs: string, name: string): Promise<void> => {
+    try {
+      const st = await stat(abs)
+      if (st.isFile()) add(classify(name), st.size)
+    } catch {
+      /* 遍历途中被删（并发清理）就跳过 */
+    }
+  }
+  /** 处理 `.thumbs` 下的一个顶层项（文件 = 占位图/临时文件；目录 = 一个 hash 的一堆产物） */
+  const countTop = async (name: string): Promise<void> => {
+    const abs = join(dir, name)
+    let isDir = false
+    try {
+      isDir = (await stat(abs)).isDirectory()
+    } catch {
+      return
+    }
+    if (!isDir) {
+      await countFile(abs, name)
+      return
+    }
+    let inner: string[] = []
+    try {
+      inner = await readdir(abs)
+    } catch {
+      return // 目录刚被删/改名
+    }
+    await Promise.all(inner.map((f) => countFile(join(abs, f), f)))
+  }
+
+  let names: string[] = []
+  try {
+    names = await readdir(dir)
+  } catch {
+    // 还没生成过任何缓存：等价于「全是 0」，与同步版语义一致
+    return { dir, total: { files: 0, bytes: 0 }, ...buckets }
+  }
+
+  for (let i = 0; i < names.length; i += PARALLEL_DIRS) {
+    await Promise.all(names.slice(i, i + PARALLEL_DIRS).map((n) => countTop(n)))
+    // 让出事件循环：开库/滚动/点击都不该被统计拖住
+    await new Promise<void>((r) => setImmediate(r))
+  }
+
+  const total = { files: 0, bytes: 0 }
+  for (const b of Object.values(buckets)) {
+    total.files += b.files
+    total.bytes += b.bytes
+  }
+  return { dir, total, ...buckets }
+}
+
 /**
  * 清理某类缓存。返回删掉的文件数与释放的字节数。
  * ⚠️ 调用方负责善后：清完「缩略图」必须触发一次 `thumb.backfill('grid')`，
@@ -157,5 +238,8 @@ export function clearCache(kind: CacheKind | 'all'): { removed: number; freed: n
       }
     }
   }
+  // 账本按**实际释放量**扣减（`freed` 是逐个文件的真实大小之和）。
+  // 不置脏、不清零：清理完仍有派生预览/占位图留在 `.thumbs` 里，账要继续对得上。
+  bumpThumbsBytes(-freed)
   return { removed, freed }
 }

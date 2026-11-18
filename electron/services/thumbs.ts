@@ -12,6 +12,7 @@ import { getSettings } from './config'
 import { isThumbHash, relFromLib } from './paths'
 import { thumbSinkWhere } from './derived'
 import { decodeHeifToJpeg, isHeifExt } from './heif'
+import { bumpThumbsBytes } from './usage'
 
 export const SIZES = { grid: 320, detail: 800 } as const
 export type ThumbSize = keyof typeof SIZES
@@ -256,6 +257,39 @@ function isFullScan(count: number): boolean {
  * 渲染层拼 `stash://` URL 时需要「磁盘上这份缩略图对应的 hash」，而不是它自己那一帧（可能是旧的）
  * 素材行里的 hash —— 见 `ensureThumb` 与 `GalleryGrid.onImgErr` 的注释。
  */
+/**
+ * 生成失败的缩略图黑名单（`${id}:${size}:${hash}`）。
+ *
+ * 为什么必须有：界面上「缺缩略图」的判定是「`.thumbs/{hash}/grid.webp` 不存在」，而
+ * `thumb:backfill` 每批都会重新查一遍欠账 —— 一张**永远解不出来**的图（损坏 / 0 字节 /
+ * 解码器不认）就会在每轮回填里重新入队、重新失败，把队列变成一个永不结束的轮子。
+ * 以前回填是一次性全量，轮子只转一圈；现在改成「分批 + 到点自动续批」（见 `backfill`），
+ * 不拉黑就会无限重试。
+ *
+ * key 里带 `hash`：素材内容一变（外部改写 → 新 hash），旧记录自然失效，不需要手工清。
+ */
+const failedThumbs = new Set<string>()
+const FAILED_MAX = 5000
+
+function failKey(id: number, size: ThumbSize, hash: string | null): string {
+  return `${id}:${size}:${hash ?? ''}`
+}
+
+/** 这个素材这次是不是「已经确认生成不出来」（黑名单命中直接跳过，别浪费 CPU） */
+export function isThumbFailed(id: number, size: ThumbSize, hash: string | null): boolean {
+  return failedThumbs.has(failKey(id, size, hash))
+}
+
+/** 清空黑名单（清缓存/换库后重新给一次机会；冒烟也用它） */
+export function clearThumbFailures(): void {
+  failedThumbs.clear()
+}
+
+/** 黑名单条数（冒烟断言用） */
+export function failedThumbCount(): number {
+  return failedThumbs.size
+}
+
 async function ensureOne(asset: { id: number; type: string; ext: string; content_hash: string | null; rel_path: string }, size: ThumbSize): Promise<{ path: string; generated: boolean; hash: string } | null> {
   // 形状不合法的 hash 一律当"没有 hash"：不拿它拼路径（见 thumbFile 的说明）
   const hash = asset.content_hash
@@ -265,7 +299,12 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
 
   const libPath = requireCurrent().path
   const abs = join(libPath, ...asset.rel_path.split('/'))
-  if (!existsSync(abs)) return null
+  if (!existsSync(abs)) {
+    // 源文件不在：这不是「解码失败」，但同样别让回填每轮都去捞它 —— 记黑名单，等文件回来
+    // （`health.scan` / watcher 会把行标 missing 或恢复，那时 hash/存在性变了会重新给它机会）
+    if (failedThumbs.size < FAILED_MAX) failedThumbs.add(failKey(asset.id, size, hash))
+    return null
+  }
 
   mkdirSync(join(out, '..'), { recursive: true })
   const tmp = tmpPath(out)
@@ -308,6 +347,9 @@ async function ensureOne(asset: { id: number; type: string; ext: string; content
     return { path: out, generated: true, hash }
   } catch {
     try { unlinkSync(tmp) } catch { /* ignore */ }
+    // 解码/写盘失败：拉黑（见 failedThumbs 的注释）。成功一次就清掉自己的记录，
+    // 这样「偶发失败」（文件被占用、临时 IO 错误）下次还有机会。
+    if (failedThumbs.size < FAILED_MAX) failedThumbs.add(failKey(asset.id, size, hash))
     return null
   }
 }
@@ -323,10 +365,21 @@ function tmpPath(out: string, ext = '.tmp'): string {
   return `${out}.${process.pid}-${++tmpSeq}${ext}`
 }
 
+/**
+ * 临时文件 → 最终路径（Windows 上 rename 不覆盖，先删旧的）。
+ *
+ * 顺带把「这次写入让 `.thumbs` 长了多少字节」记进账本（`usage.bumpThumbsBytes`）——
+ * 覆盖写要**先减旧文件的大小**，否则反复重建缩略图会把账越记越大。
+ * 账本不存在时 bump 是空操作（等 `recountThumbsBytesAsync()` 给出真值）。
+ */
 function renameTmp(tmp: string, out: string): void {
-  // Windows 上 rename 不覆盖已存在文件，先尝试删除
+  let before = 0
+  try { before = statSync(out).size } catch { /* 首次生成，没有旧文件 */ }
+  let after = 0
+  try { after = statSync(tmp).size } catch { /* 理论上不会：刚写完 */ }
   try { unlinkSync(out) } catch { /* ignore */ }
   renameSync(tmp, out)
+  bumpThumbsBytes(after - before)
 }
 
 /** ffmpeg 截帧：取 10% 处（不足 1s 取 0s），同时把时长/分辨率写回 assets */
@@ -622,10 +675,28 @@ interface Job {
    * 写进 `hashA` 的目录里（**内容与 hash 对不上**，之后这张图永远显示错图）。
    * 校验不过就丢弃 —— 新库自己的 backfill 会把它的素材重新入队，不会漏。
    */
-  libPath: string
+    libPath: string
+  /**
+   * 低优先级 job：**开库/导入后的批量回填**（不是用户正盯着的那些卡片）。
+   *
+   * 三条让路规则（见 `pump`）：① 只有队列里没有别的活时才开跑（独占一个并发位，
+   * 永远给交互留 `concurrency()-1` 个）；② 两个低优先级 job 之间空 `LOW_PRIORITY_GAP_MS`，
+   * 别把 CPU 顶满；③ 用户显式要的（`ensureThumb` / 可见卡片的 ensureBatch）一律不是低优先级。
+   *
+   * 为什么需要：原来开库/导入后一次性把「全库缺缩略图」全塞进 4 并发队列，几万条库要跑几十分钟，
+   * 期间 sharp 把线程池占满 → 滚动掉帧、点开图片要等。现在改成「分批 + 让路 + 到点续批」。
+   */
+  lowPriority?: boolean
 }
 const queue: Job[] = []
 let running = 0
+
+/** 两个低优先级 job 之间至少隔这么久（毫秒）：给渲染层留出解码/绘制的窗口 */
+const LOW_PRIORITY_GAP_MS = 24
+/** 下一次允许开跑低优先级 job 的时间戳 */
+let lowPriorityNotBefore = 0
+/** 「到点了再来推一次」的定时器（单飞，避免每帧排一个） */
+let lowPriorityTimer: ReturnType<typeof setTimeout> | null = null
 
 /**
  * 泵是否被**临时**暂停（改名隔离用，见 `pausePumpAsync`）。
@@ -722,8 +793,25 @@ function pump(): void {
   // 队列原样保留，`resumePump()` 会再推一次。
   if (paused) return
   while (running < concurrency() && queue.length > 0) {
+    const head = queue[0]
+    // —— 低优先级让路（见 Job.lowPriority 的三条规则）——
+    if (head.lowPriority) {
+      if (running > 0) break // 还有别的活在跑：让给它，别抢并发位
+      const wait = lowPriorityNotBefore - Date.now()
+      if (wait > 0) {
+        // 到点再来推一次（单飞）。不排这个定时器的话，队列会卡在这里直到下一次 finishJob/pump。
+        if (lowPriorityTimer === null) {
+          lowPriorityTimer = setTimeout(() => {
+            lowPriorityTimer = null
+            pump()
+          }, wait)
+        }
+        break
+      }
+    }
     const job = queue.shift()!
     running++
+    if (job.lowPriority) lowPriorityNotBefore = Date.now() + LOW_PRIORITY_GAP_MS
     if (libPathNow() !== job.libPath) {
       // 排队期间用户切了库 → 这个 job 的 rel_path/hash 属于上一个库，直接丢弃。
       // 见 Job.libPath 的注释：不丢的话会按旧库的 hash 往新库的 .thumbs 里写东西。
@@ -821,8 +909,14 @@ export function retestLegacyDims(): { cleared: boolean; rev: number } {
 export function ensureBatch(
   assets: Array<{ id: number; type: string; ext: string; content_hash: string | null; rel_path: string }>,
   size: ThumbSize,
-  onDone?: () => void
-): void {
+  onDone?: () => void,
+  opts?: {
+    /** 低优先级（开库/导入后的批量回填）：让路 + 分批，见 Job.lowPriority */
+    lowPriority?: boolean
+    /** 本批最多入队多少条（0/省略 = 不限）。回填分批用 */
+    limit?: number
+  }
+): { queued: number; capped: boolean } {
   // grid 顺带回写尺寸与色板 → 「索引里缺这两个字段」的也要进队列（虽然缩略图早就在了）
   const sink = size === 'grid' ? indexFieldsSinkIds(getSettings().importing.palette) : new Set<number>()
   /*
@@ -847,6 +941,8 @@ export function ensureBatch(
     // 形状校验而不是裸 `!hash`：脏值（`..` / 手改 DB）不能拿去拼 `.thumbs` 下的路径
     const h = a.content_hash
     if (!isThumbHash(h)) return false
+    // 已确认生成不出来的（损坏/源文件丢失）不再反复入队 —— 见 failedThumbs 的注释
+    if (isThumbFailed(a.id, size, h)) return false
     if (sink.has(a.id)) return true // 索引字段欠账：缩略图在也要跑一遍（见 indexFieldsSinkIds 的注释）
     if (haveGrid) return !haveGrid.has(h)
     return !existsSync(thumbFile(h, size))
@@ -857,14 +953,20 @@ export function ensureBatch(
   if (stale && isFullScan(assets.length)) clearGridPresenceDirty()
   if (fresh.length === 0) {
     onDone?.()
-    return
+    return { queued: 0, capped: false }
   }
+  // 分批：只取队首 `limit` 条（回填用）。剩下的由调用方（main.ts 的 thumb:backfill）
+  // 在下一轮再取 —— 配合 `lowPriority` 的让路规则，几万条库也不会把界面拖死。
+  const limit = Math.max(0, Math.floor(opts?.limit ?? 0))
+  const take = limit > 0 ? fresh.slice(0, limit) : fresh
+  const capped = take.length < fresh.length
   const id = ++batchSeq
   const libPath = requireCurrent().path
-  batches.set(id, { total: fresh.length, done: 0, cb: onDone ?? null })
-  queue.push(...fresh.map((asset) => ({ asset, size, batch: id, libPath })))
+  batches.set(id, { total: take.length, done: 0, cb: onDone ?? null })
+  queue.push(...take.map((asset) => ({ asset, size, batch: id, libPath, lowPriority: opts?.lowPriority === true })))
   pump()
   pump()
+  return { queued: take.length, capped }
 }
 
 /**

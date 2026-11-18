@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
+import type { StashLibraryUsage } from '../env'
 import { folderIcon } from '@/data/mock'
 import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
@@ -651,13 +652,30 @@ function onWindowMouseDown(e: MouseEvent): void {
 
 // ==================== 占用空间（侧栏底部） ====================
 /**
- * 库占用 = 素材文件 + `.thumbs` 缩略图缓存。
+ * 库占用 = 素材文件 + `.thumbs` 缓存。
  *
- * 为什么要 debounce：导入/删除会让 `lib.counts.total` 连着变好几次，
- * 而每次刷新都要遍历一遍缓存目录（几千个文件）—— 不拦一下就成了「边导入边扫盘」。
- * 数值本身只是给用户看个大概，晚半秒完全没关系；点一下那一行可以立即重算。
+ * ⚠️ 这条链路曾经是「开库卡死」的元凶：主进程每次都要同步遍历 `.thumbs` 的每个文件
+ * （实测 2 万条库 1.1 s、5 万条 2.8 s），而侧栏 `watch(counts.total)` 一变就再算一次 ——
+ * 等于开库、导入收尾、删除之后各冻一次界面。
+ *
+ * 现在主进程只读账本（`meta.thumbs_bytes`，O(1)，由 `usage.ts` 增量维护）：
+ *   · 有账 → 立刻给数字；
+ *   · 没账（新库 / 老库首次升级）→ 先回 `thumbsPending:true`，后台分块重算，
+ *     算完推 `library:usage` 事件，下面 `onUsage` 把数字补上。
+ * 所以这里的 debounce 只是为了让「连续导入」时少发几次 IPC，不再是为了躲避扫盘。
  */
-const usage = ref<{ assetsBytes: number; thumbsBytes: number; totalBytes: number } | null>(null)
+/**
+ * 排到「下一帧画完」之后（rAF → 宏任务）。
+ * 用它而不是 `await nextTick()`：nextTick 只是等 Vue 的 patch，仍在同一帧里，
+ * 会跟首屏渲染抢同一段主线程时间。
+ */
+function nextPaint(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    requestAnimationFrame(() => setTimeout(resolve, 0))
+  })
+}
+
+const usage = ref<StashLibraryUsage | null>(null)
 const usageBusy = ref(false)
 let usageTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -669,6 +687,12 @@ async function refreshUsage(): Promise<void> {
   if (r.ok && r.data) usage.value = r.data
 }
 
+/** 账本算完了（主进程推）→ 直接落值，不再回一趟 IPC */
+let unsubUsage: (() => void) | null = null
+function onUsagePushed(d: StashLibraryUsage): void {
+  usage.value = d
+}
+
 function scheduleUsage(): void {
   if (usageTimer) clearTimeout(usageTimer)
   usageTimer = setTimeout(() => void refreshUsage(), 800)
@@ -678,7 +702,19 @@ function scheduleUsage(): void {
 const usageTitle = computed(() => {
   const u = usage.value
   if (!u) return '正在统计库占用…（点一下可重新统计）'
+  if (u.thumbsPending) return `素材 ${fmtSize(u.assetsBytes)} · 缩略图缓存 正在统计…（点一下可立即重算）`
   return `素材 ${fmtSize(u.assetsBytes)} · 缩略图缓存 ${fmtSize(u.thumbsBytes)}（点一下重新统计）`
+})
+
+/**
+ * 数值文案：账本没算完时显示 `…`（不显示一个偏小的假数字）——
+ * 素材部分的字节数其实已经有了，但「占用空间」这一行给的是**合计**，只报素材会误导。
+ */
+const usageValueText = computed(() => {
+  const u = usage.value
+  if (!u) return '…'
+  if (u.thumbsPending) return '…'
+  return fmtSize(u.totalBytes)
 })
 
 // 条数变了（导入/删除）与体积变了（压缩/文本保存）都要重算；
@@ -688,12 +724,18 @@ watch([() => lib.counts.total, () => lib.usageRev], scheduleUsage)
 onMounted(() => {
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('mousedown', onWindowMouseDown)
-  void refreshUsage()
+  unsubUsage = window.stash.library.onUsage(onUsagePushed)
+  // 首屏先让位：这一行只是「看个大概」，不值得和第一批缩略图/布局抢主进程。
+  // 用 rAF + setTimeout(0) 排到第一帧之后，而不是直接在 onMounted 里 await。
+  void nextPaint().then(() => refreshUsage())
 })
+
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('mousedown', onWindowMouseDown)
   if (usageTimer) clearTimeout(usageTimer)
+  unsubUsage?.()
+  unsubUsage = null
 })
 </script>
 
@@ -867,7 +909,7 @@ onBeforeUnmount(() => {
           <path d="M2.4 7c0 1.05 2.06 1.9 4.6 1.9s4.6-.85 4.6-1.9" stroke="currentColor" stroke-width="1.2" />
         </svg>
         <span class="su-label">占用空间</span>
-        <span class="su-value" data-side-usage-value>{{ usage ? fmtSize(usage.totalBytes) : '…' }}</span>
+        <span class="su-value" data-side-usage-value>{{ usageValueText }}</span>
       </div>
       <div
         class="side-item"

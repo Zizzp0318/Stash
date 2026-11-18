@@ -2449,3 +2449,17 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   font-size: 11.5px; color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
+
+
+/* ============ 中栏包装层（开库加载浮层的定位锚点，见 App.vue / BootLoader.vue）============ */
+/*
+ * 为什么需要这一层：`.body` 是 flex 容器（侧栏 + 拖拽条 + 中栏 + 详情栏），
+ * 想让「虚化 + 加载条」只盖住中栏，就必须有一个**只包含中栏**的相对定位容器。
+ * 视觉上它不产生任何盒子：flex:1 + display:flex，`.gallery` 照旧吃满，间距仍由 `.body` 的 gap 管。
+ */
+.gallery-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  position: relative;
+}

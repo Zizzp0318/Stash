@@ -53,6 +53,7 @@ import { ensureBatch, gridPresenceState } from './thumbs'
 import { cacheStats, clearCache } from './cache'
 import { deriveFor } from './preview'
 import { libraryUsage } from './health'
+import { markThumbsBytesDirty, recountThumbsBytesAsync } from './usage'
 import { DEFAULT_SETTINGS, getSettings, patchSettings, type Settings } from './config'
 import {
   checkLatest,
@@ -638,17 +639,29 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
 
       // —— DOM：面板「派生预览」卡必须 > 0 且与独立口径一致 ——
       //    切走再切回 cache 分组 → pickGroup 会重新 loadStats()（SettingsPanel.vue:111）
+      //
+      // ⚠️ 2026-11 契约变更：`cache:stats` 改成**异步分块**（`cacheStatsAsync`，见 §5.4），
+      //    面板数字会晚几十~几百毫秒才刷新。原来只等「文本 !== '—'」不够 ——
+      //    S7 B 刚把派生清掉，那一瞬 DOM 上正好停着 **'0 B'**（非 '—'），waitFor 立刻通过，
+      //    读到的就是清理前的旧值（本机实测：bytes=0 B / files=1，被误判成「面板没数字」）。
+      //    改成**等真正的期望条件**（派生文件数 > 0 且不是 0 B），有界轮询。
       await clickEl('[data-sp-group="about"]')
       await clickEl('[data-sp-group="cache"]')
       await waitFor("!!document.querySelector('[data-sp-cache-derived]')", 6000)
-      await waitFor("document.querySelector('[data-sp-cache-total]')?.textContent.trim() !== '—'", 6000)
-      const domDerivedBytes = (await js<string>("document.querySelector('[data-sp-cache-derived]')?.textContent.trim() ?? ''")) ?? ''
-      const domDerivedFiles = (await js<number>(
-        "(() => { const b = document.querySelector('[data-sp-cache-derived]'); const n = b?.parentElement?.querySelector('.sp-card-sub'); return n ? parseInt(n.textContent, 10) : -1 })()"
-      )) ?? -1
+      const domWaitStart = Date.now()
+      let domDerivedBytes = ''
+      let domDerivedFiles = -1
+      while (Date.now() - domWaitStart < 8000) {
+        domDerivedBytes = (await js<string>("document.querySelector('[data-sp-cache-derived]')?.textContent.trim() ?? ''")) ?? ''
+        domDerivedFiles = (await js<number>(
+          "(() => { const b = document.querySelector('[data-sp-cache-derived]'); const n = b?.parentElement?.querySelector('.sp-card-sub'); return n ? parseInt(n.textContent, 10) : -1 })()"
+        )) ?? -1
+        if (domDerivedFiles > 0 && domDerivedBytes !== '' && domDerivedBytes !== '0 B') break
+        await new Promise((r) => setTimeout(r, 120))
+      }
       check('S7X DOM 前置：面板「派生预览」此刻 > 0（不是 0 B）',
         domDerivedBytes !== '' && domDerivedBytes !== '0 B' && domDerivedFiles > 0,
-        `bytes=${domDerivedBytes} files=${domDerivedFiles}`)
+        `bytes=${domDerivedBytes} files=${domDerivedFiles} 等=${Date.now() - domWaitStart}ms`)
       check('S7X DOM 对齐：面板「派生预览」文件数 == 独立口径（生产 → IPC → DOM 全链对齐）',
         domDerivedFiles === mine.derived.files,
         `dom=${domDerivedFiles} 独立=${mine.derived.files}`)
@@ -984,7 +997,13 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         !!g && /素材 .+ · 缩略图缓存 .+/.test(g.title), g?.title)
       await capture('shot-settings-usage.png')
 
-      // ② 数值本身：素材取自索引、缓存是真扫目录算的
+      // ② 数值本身：素材取自索引、缓存取自账本（账本的重算/增量由 `--smoke-usage` 专测）
+      //
+      // 接线断言：账本算完后主进程推 `library:usage`，preload 必须把它暴露成 `library.onUsage`。
+      // 少了这个函数，侧栏就只能等下一次 counts 变动才看到数字（用户会觉得「统计卡住不动」）。
+      const hasOnUsage = await js<boolean>("typeof window.stash?.library?.onUsage === 'function'")
+      check('S11b preload 暴露了 library.onUsage（账本算完的推送通道）', hasOnUsage === true, String(hasOnUsage))
+
       const u1 = libraryUsage()
       const sumAssets = q<{ c: number }>('SELECT coalesce(sum(size),0) AS c FROM assets WHERE missing=0').c
       check('S11b 服务层：素材占用 = 索引里有效素材 size 之和', u1.assetsBytes === sumAssets,
@@ -1034,21 +1053,41 @@ export async function runSmokeSettings(win: BrowserWindow): Promise<void> {
         }
         return total
       }
+      // ★ 2026-11 契约变更：`thumbsBytes` 现在是**账本**（`meta.thumbs_bytes`，由 `usage.ts` 增量维护），
+      //   不再每次实扫 —— 原因见 §5.5：同步遍历 2 万条库要 1.1s、5 万条 2.8s，正是「开库卡死」的根因。
+      //   所以判据改成「**重算之后**账本 == 独立实扫」，而不是「随时都等于实扫」：
+      //   账本只认应用自己的写入路径（thumbs/preview 的落盘、清理），测试直接往 `.thumbs` 里塞文件它当然不知道。
+      markThumbsBytesDirty()
+      const recounted = await recountThumbsBytesAsync()
       const thumbsWalked = thumbsDirBytesSameScope(join(lib.path, '.thumbs'))
-      check('S11b 服务层：缓存占用 == 独立实现（与产线同口径）实扫 .thumbs 的字节数（改前比的是 total==assets+thumbs 定义式恒等式，恒真无鉴别力）',
-        u1.thumbsBytes === thumbsWalked,
-        `产线 thumbsBytes=${u1.thumbsBytes} 独立实扫=${thumbsWalked}`)
+      check('S11b 账本重算值 == 独立实现（与产线同口径）实扫 .thumbs 的字节数',
+        recounted === thumbsWalked,
+        `重算=${String(recounted)} 独立实扫=${thumbsWalked}`)
 
-      // 往 .thumbs 里塞 4KB 再读一次：数值必须跟着涨（证明不是写死的常量/缓存）
+      const uAfter = libraryUsage()
+      check('S11b 有账时 library:usage 直接给账本值（O(1)，pending 不为真）',
+        uAfter.thumbsBytes === recounted && uAfter.thumbsPending !== true,
+        `thumbsBytes=${uAfter.thumbsBytes} pending=${String(uAfter.thumbsPending)}`)
+
+      // 外部直接写 .thumbs（别的程序动了缓存目录）→ 账本**刻意不立刻变**；
+      // 但一置脏重算就必须精确跟上。这条同时证明「记账不是写死常量」和「自愈通路在」。
       const probeHash = join(lib.path, '.thumbs', 'zz-probe-usage')
       mkdirSync(probeHash, { recursive: true })
       writeFileSync(join(probeHash, 'grid.webp'), Buffer.alloc(4096))
-      const u2 = libraryUsage()
-      check('S11b 缓存占用是实扫目录算出来的（塞 4KB 进去，数值跟着涨）',
-        u2.thumbsBytes === u1.thumbsBytes + 4096, `${u1.thumbsBytes} → ${u2.thumbsBytes}`)
+      const uNoChange = libraryUsage()
+      check('S11b 外部写入不立即改账本（记账只认应用自己的落盘路径，避免每次读都扫盘）',
+        uNoChange.thumbsBytes === uAfter.thumbsBytes,
+        `外部写入后=${uNoChange.thumbsBytes} 之前=${uAfter.thumbsBytes}`)
+
+      markThumbsBytesDirty()
+      const afterProbe = await recountThumbsBytesAsync()
+      check('S11b 置脏重算后账本精确包含外部写入（+4096）',
+        afterProbe === (recounted ?? -1) + 4096, `${String(recounted)} → ${String(afterProbe)}`)
+
       rmSync(probeHash, { recursive: true, force: true })
-      check('S11b 移除探针后数值回落', libraryUsage().thumbsBytes === u1.thumbsBytes,
-        String(libraryUsage().thumbsBytes))
+      markThumbsBytesDirty()
+      const afterRemove = await recountThumbsBytesAsync()
+      check('S11b 移除探针后重算回落', afterRemove === recounted, `${String(afterProbe)} → ${String(afterRemove)}`)
 
       // ⚠️ 必须把面板开回去：后面的「快捷键页」段还要在设置面板里查 DOM。
       // 这一段为了看侧栏把面板 Esc 掉了，不恢复就会把下一段整片弄红（实测踩过）。

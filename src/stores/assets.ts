@@ -66,6 +66,14 @@ export const useAssetStore = defineStore('assets', () => {
   const items = ref<StashAssetRow[]>([])
   const total = ref(0)
   const loading = ref(false)
+  /**
+   * 「这个库的首屏查询至少成功跑完过一次」——开库骨架屏的收尾信号（见 App.vue 的 checkBootDone）。
+   *
+   * 为什么不用 loading 的边沿：切库时 eset() 会把 items 清空、refresh 又是一帧后才发，
+   * 只盯 loading 会「提前收骨架 → 闪一下空网格」。loadedOnce 是新库第一次查询**真的回来**的证据；
+   * eset()（切库）会把它复位，所以每个库都要重新等一次。
+   */
+  const loadedOnce = ref(false)
   const selectedId = ref<number | null>(null)
   const detail = ref<StashAssetDetail | null>(null)
 
@@ -271,6 +279,7 @@ export const useAssetStore = defineStore('assets', () => {
     previewDirty.value = false
     // 切库清空：媒体版本号是按素材 id 记的，而各库 id 从 1 起（MEMORY A9 的同一条教训）
     mediaRev.value = {}
+    loadedOnce.value = false
   }
 
   /**
@@ -373,6 +382,7 @@ export const useAssetStore = defineStore('assets', () => {
       if (my === refreshGen) loading.value = false
     }
     if (my !== refreshGen) return
+    if (rows) loadedOnce.value = true
     if (!rows) {
       // 关库/切库导致的失败不提示：用户已经回到欢迎页，弹一条红字只会莫名其妙
       if (failMsg && failMsg !== 'ERR_NO_LIBRARY') notify('error', `加载素材列表失败：${failMsg}`)
@@ -817,8 +827,16 @@ export const useAssetStore = defineStore('assets', () => {
     if (parts.length) notify('info', parts.join('，'))
   }
 
+  /** 测试缝：资产列表状态快照（冒烟定位「骨架为什么不收 / 内容为什么没来」用） */
+  ;(window as unknown as Record<string, unknown>).__assetsState = (): Record<string, unknown> => ({
+    loadedOnce: loadedOnce.value,
+    loading: loading.value,
+    total: total.value,
+    items: items.value.length
+  })
+
   return {
-    query, items, total, loading,
+    query, items, total, loading, loadedOnce,
     selectedId, detail,
     selectedIds, selectedCount, selectedAllFav, selectedRating, selectedRatingMixed, isSelected,
     importing, importNotice, notify,

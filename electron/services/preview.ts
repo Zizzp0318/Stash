@@ -20,6 +20,7 @@
 // 绝不用 canPlayType 猜。白名单内的文件一律直出原文件，省掉一次转码。
 import { spawn } from 'child_process'
 import { decodeHeifToJpeg, isHeifExt } from './heif'
+import { bumpThumbsBytes } from './usage'
 import {
   createReadStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
   type ReadStream
@@ -432,10 +433,21 @@ async function deriveAudio(abs: string, out: string, onProgress?: (r: number, t:
   }
 }
 
-/** Windows 上 rename 不覆盖已存在文件，所以先删目标 */
+/**
+ * 派生文件落盘（Windows 上 rename 不覆盖，所以先删目标）。
+ *
+ * 顺带记账：`.thumbs` 的占用统计里**包含派生预览**（`preview-{px}.webp` / `preview.mp4` /
+ * `preview.mp3`），TIFF 大图那类动辄几十 MB —— 漏记会让侧栏「占用」明显偏小。
+ * 与 `thumbs.renameTmp` 同一套增量规则（覆盖写先减旧文件）。
+ */
 function renameOverwrite(from: string, to: string): void {
+  let before = 0
+  try { before = statSync(to).size } catch { /* 首次生成 */ }
+  let after = 0
+  try { after = statSync(from).size } catch { /* ignore */ }
   try { unlinkSync(to) } catch { /* 不存在就算了 */ }
   renameSync(from, to)
+  bumpThumbsBytes(after - before)
 }
 
 function unlinkQuiet(p: string): void {

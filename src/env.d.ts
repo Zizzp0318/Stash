@@ -22,10 +22,10 @@ export interface StashLibraryApi {
   list: () => Promise<{ ok: boolean; data?: Array<{ path: string; name: string }>; error?: string }>
   close: () => Promise<{ ok: boolean; data?: null; error?: string }>
   getInfo: () => Promise<{ ok: boolean; data?: { path: string; name: string } | null; error?: string }>
-  /** 库占用空间：素材（索引 size 之和）+ `.thumbs` 缓存实际占用 */
+  /** 库占用空间：素材（索引 size 之和）+ `.thumbs` 缓存实际占用（来自账本，O(1)） */
   usage: () => Promise<{
     ok: boolean
-    data?: { assetsBytes: number; thumbsBytes: number; totalBytes: number }
+    data?: StashLibraryUsage
     error?: string
   }>
   /** 在资源管理器里打开库目录 */
@@ -37,6 +37,20 @@ export interface StashLibraryApi {
    *           `false` = 流静默后的**收尾** flush（额外 bumpThumbs + 弹一次提示）。
    */
   onExternal: (cb: (d: { added: number; changed: number; removed: number; partial: boolean }) => void) => Unsub
+  /**
+   * 缓存占用账本**重算完成**后的推送（账本缺失时的后台补齐）。
+   * `thumbsPending` 为 true 表示还没算完（侧栏显示 `…`），false 才是最终值。
+   */
+  onUsage: (cb: (d: StashLibraryUsage) => void) => Unsub
+}
+
+/** 侧栏「占用」那一行（与主进程 `health.LibraryUsage` 同构） */
+export interface StashLibraryUsage {
+  assetsBytes: number
+  thumbsBytes: number
+  totalBytes: number
+  /** 账本还没算出来：后台正在分块重算，界面显示 `…` */
+  thumbsPending?: boolean
 }
 
 export interface StashFolderApi {

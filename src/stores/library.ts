@@ -39,6 +39,88 @@ export const useLibraryStore = defineStore('library', () => {
    */
   const bootError = ref('')
 
+  // ==================== 开库引导态（骨架屏的数据源，2026-11）====================
+  //
+  // 为什么需要：用户报「库一大，打开软件卡一会、点不动滚不动」。根因（`library:usage` 同步遍历
+  // `.thumbs`）已在 §5.5 修掉 —— 本机 2 万条库开库路径 5.5ms。但**别的机器/别的盘**上仍可能慢：
+  // 库在移动硬盘/网络盘、5 万条以上、首屏缩略图要现场生成。这时界面需要明说「在装东西」，
+  // 而不是让用户对着一块空白面板猜。
+  //
+  // 设计取舍（都与「别骗用户」有关）：
+  //   · 只在 > 100ms 时才显示骨架（`App.vue` 里定时器控制）—— 热开库 5ms，闪一下骨架反而是噪音；
+  //   · 不整页遮罩、不锁交互：骨架层 `pointer-events: none`，标题栏仍可拖动/最小化；骨架下面
+  //     是真实（此时还空着的）三栏，数据一到原地变内容，不跳动；
+  //   · 文案按阶段走真实状态（打开索引 → 读索引 → 首屏缩略图），不编假进度；
+  //   · 超过 `bootStuckAfterMs`（默认 8s）给「先浏览」出口 —— 后台继续补，别把人锁在引导页。
+  const booting = ref(false)
+  const bootStage = ref<'index' | 'meta' | 'grid'>('index')
+  /** 慢到什么程度才提示「可以先浏览」（可被测试缝改小，便于冒烟覆盖） */
+  const bootStuckAfterMs = ref(8000)
+  let bootDepth = 0
+
+  /**
+   * 测试缝：模拟「慢开库」。生产恒 0。
+   * 冒烟拿不到用户的几万条大库，只能把等待注进去 —— 否则骨架屏的时间线（100ms 显示 / 数据到就收）
+   * 在测试机上永远看不到（开库 5ms，骨架还没亮就结束了）。
+   */
+  let bootDelayMs = 0
+  function __testSlowBoot(delayMs = 0, stuckMs = 0): { delayMs: number; stuckMs: number } {
+    bootDelayMs = Math.max(0, Number(delayMs) || 0)
+    if (stuckMs > 0) bootStuckAfterMs.value = Math.max(1, Number(stuckMs))
+    return { delayMs: bootDelayMs, stuckMs: bootStuckAfterMs.value }
+  }
+
+  function beginBoot(): void {
+    bootDepth++
+    booting.value = true
+    bootStage.value = 'index'
+  }
+
+  /** 收尾（计数式：嵌套调用只有最外层真的关掉） */
+  function endBoot(): void {
+    bootDepth = Math.max(0, bootDepth - 1)
+    if (bootDepth === 0) booting.value = false
+  }
+
+  /** 阶段推进 + 测试缝的延迟（延迟期间界面就是「卡在某一阶段」的样子） */
+  async function bootStep(stage: 'index' | 'meta' | 'grid'): Promise<void> {
+    bootStage.value = stage
+    if (bootDelayMs > 0) await new Promise<void>((r) => setTimeout(r, bootDelayMs))
+  }
+
+  /**
+   * 测试缝：让冒烟能从渲染层触发一次**真实的**打开库流程（含骨架屏）。
+   * 不走这个缝的话，冒烟只能靠「最近库自动恢复」那条路，而那要求库在窗口加载**之前**就写进配置 ——
+   * 冒烟进程做不到（窗口已经加载完了）。
+   */
+  ;(window as unknown as Record<string, unknown>).__stashOpenLibrary = (p: string): Promise<string | null> =>
+    openLibrary(p)
+  /**
+   * 测试缝：**按真实切换库的顺序**再走一遍（`TitleBar.switchTo` 就是这么调的：
+   * `lib.openLibrary()` → `assets.refresh()` → `thumb.backfill()`）。
+   *
+   * 为什么要这条而不是只用上面那条：`openLibrary` 本身**不**刷新网格（它只管索引与元信息），
+   * 刷新是调用方的责任。只开不刷的话，骨架屏会一直等到 `loadedOnce` 的兜底超时 ——
+   * 那是测不出「内容接上」的。这里把调用方的动作也补上，让缝与真实路径同形。
+   */
+  ;(window as unknown as Record<string, unknown>).__stashSwitchLibrary = async (p: string): Promise<string | null> => {
+    const e = await openLibrary(p)
+    if (!e) {
+      await useAssetStore().refresh()
+      window.stash.thumb.backfill('grid')
+    }
+    return e
+  }
+  /** 测试缝：把「慢开库」注进去（骨架屏只有在真的慢时才看得见，见 `__testSlowBoot`） */
+  ;(window as unknown as Record<string, unknown>).__testSlowBoot = __testSlowBoot
+  /** 测试缝：骨架屏状态快照（冒烟用它定位「为什么没出现 / 为什么没消失」） */
+  ;(window as unknown as Record<string, unknown>).__bootState = (): Record<string, unknown> => ({
+    booting: booting.value,
+    stage: bootStage.value,
+    stuckAfter: bootStuckAfterMs.value
+  })
+
+
   const folderById = computed(() => {
     const m = new Map<number, FolderRow>()
     for (const f of folders.value) m.set(f.id, f)
@@ -175,9 +257,17 @@ export const useLibraryStore = defineStore('library', () => {
     bootError.value = ''
     const r = await window.stash.library.getInfo()
     if (r.data) {
-      info.value = r.data
-      await loadMeta()
-      await loadRecent()
+      beginBoot()
+      try {
+        info.value = r.data
+        await bootStep('index')
+        bootStage.value = 'meta'
+        await loadMeta()
+        await bootStep('grid')
+      } finally {
+        await loadRecent()
+        // 这里**不** endBoot：首屏数据还没到，收尾由 App 在「首屏到位 + 一帧绘制」后做
+      }
       return
     }
     // 启动时未开库：自动恢复最近一次打开的库；从未打开过则留在欢迎页
@@ -197,30 +287,64 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   async function createLibrary(name: string, parentDir: string): Promise<string | null> {
-    const r = await window.stash.library.create({ name, parentDir })
-    if (!r.ok) return r.error ?? '创建失败'
-    // 成功进入一个库 → 之前那条「启动时最近库打不开」的理由已经与用户当下所见无关，清掉，
-    // 否则回到欢迎页时 `.w-err` 会弹出一条早已过期的错误（见 openLibrary/closeLibrary 同款注释）。
-    bootError.value = ''
-    info.value = r.data ?? null
-    useAssetStore().reset()
-    await loadMeta()
-    await loadRecent()
-    return null
+    beginBoot()
+    try {
+      await bootStep('index')
+      const r = await window.stash.library.create({ name, parentDir })
+      if (!r.ok) {
+        endBoot()
+        return r.error ?? '创建失败'
+      }
+      // 成功进入一个库 → 之前那条「启动时最近库打不开」的理由已经与用户当下所见无关，清掉，
+      // 否则回到欢迎页时 `.w-err` 会弹出一条早已过期的错误（见 openLibrary/closeLibrary 同款注释）。
+      bootError.value = ''
+      info.value = r.data ?? null
+      useAssetStore().reset()
+      await bootStep('meta')
+      await loadMeta()
+      await loadRecent()
+      await bootStep('grid')
+      return null
+    } finally {
+      setTimeout(() => {
+        if (booting.value) {
+          bootDepth = 0
+          booting.value = false
+        }
+      }, 3000)
+    }
   }
 
   async function openLibrary(target: string): Promise<string | null> {
-    const r = await window.stash.library.open(target)
-    if (!r.ok) return r.error ?? '打开失败'
-    // 成功打开一个库 → 清掉启动失败时留下的 bootError。
-    // 场景：启动时最近库是「太新」的库 → bootError='ERR_LIBRARY_TOO_NEW' → 用户手动打开一个正常库，
-    // 若不在这里清，之后关掉该库回到欢迎页时，那条与当前无关的旧错误又会冒出来（I5 带出的低危 UI 缺陷）。
-    bootError.value = ''
-    info.value = r.data ?? null
-    useAssetStore().reset()
-    await loadMeta()
-    await loadRecent()
-    return null
+    beginBoot()
+    try {
+      await bootStep('index')
+      const r = await window.stash.library.open(target)
+      if (!r.ok) {
+        endBoot()
+        return r.error ?? '打开失败'
+      }
+      // 成功打开一个库 → 清掉启动失败时留下的 bootError。
+      // 场景：启动时最近库是「太新」的库 → bootError='ERR_LIBRARY_TOO_NEW' → 用户手动打开一个正常库，
+      // 若不在这里清，之后关掉该库回到欢迎页时，那条与当前无关的旧错误又会冒出来（I5 带出的低危 UI 缺陷）。
+      bootError.value = ''
+      info.value = r.data ?? null
+      useAssetStore().reset()
+      await bootStep('meta')
+      await loadMeta()
+      await loadRecent()
+      await bootStep('grid')
+      return null
+    } finally {
+      // 成功分支由 App 在「首屏数据到位 + 一帧绘制」后收尾；这里留兜底：
+      // 3s 后无论如何都关掉引导态 —— 用户不该被永远按在骨架屏上。
+      setTimeout(() => {
+        if (booting.value) {
+          bootDepth = 0
+          booting.value = false
+        }
+      }, 3000)
+    }
   }
 
   async function closeLibrary(): Promise<void> {
@@ -283,5 +407,7 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, forgetLibrary, refreshCounts, usageRev, bumpUsage, loadMeta,
-    collapsed, isCollapsed, toggleCollapse, expandTo }
+    collapsed, isCollapsed, toggleCollapse, expandTo,
+    // 开库引导态（骨架屏）：`booting` 期间 App 渲染骨架层；阶段文案看 `bootStage`
+    booting, bootStage, bootStuckAfterMs, endBoot, __testSlowBoot }
 })
