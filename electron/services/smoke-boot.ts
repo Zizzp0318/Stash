@@ -81,29 +81,39 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const hasSeam = await js<boolean>("typeof window.__stashOpenLibrary === 'function' && typeof window.__stashSwitchLibrary === 'function'")
     check('前置：渲染层暴露了 __stashOpenLibrary / __stashSwitchLibrary 测试缝', hasSeam === true, String(hasSeam))
 
-    // ==================== A. 快开库（不注入延迟）不该闪骨架 ====================
+    // ==================== A. 快开库：固定开场窗口同样生效 ====================
     await js('window.__testSlowBoot(0, 0)')
+    // 冒烟环境下固定窗口应当是 0（否则每个套件都被 9 秒拖死）
+    result.initMinMs = await js<number>('(window.__bootState && window.__bootState() || {}).minMs')
+    // 生产是 9 秒固定窗口；冒烟压到 700ms —— 验的是「到窗口才收」，不是「数据一到就收」
+    await js('window.__testBootMin(700)')
     const aT0 = Date.now()
     // ⚠️ 这里**await** 完整流程：A 验的是「一次正常速度的开库全过程」，等完才知道它到底花了多久
     const aRes = await js<string | null>(`window.__stashSwitchLibrary(${JSON.stringify(fastLib.path)})`)
     const aOpenMs = Date.now() - aT0
     const aState = await js<Record<string, unknown>>('window.__assetsState ? window.__assetsState() : null')
     result.fast = { openMs: aOpenMs, result: aRes, state: aState }
-    // 轮询 400ms：这期间如果骨架亮过，就说明 100ms 阈值失效（本机开库只要几十毫秒）
+    // 轮询 1.6s：骨架应当出现，并且在 窗口(700) + 淡出(420) 之后才消失
     let fastSawSkeleton = false
+    let fastGoneAt = -1
     const trace: Array<Record<string, unknown>> = []
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < 64; i++) {
       const snap = await js<{ layer: boolean; boot: unknown; assets: unknown }>(
         "({ layer: !!document.querySelector('[data-boot-layer]'), boot: window.__bootState ? window.__bootState() : null, assets: window.__assetsState ? window.__assetsState() : null })"
       )
       if (snap?.layer === true) fastSawSkeleton = true
+      else if (fastSawSkeleton && fastGoneAt < 0) fastGoneAt = i * 25
       trace.push({ at: i * 25, ...(snap ?? {}) })
       await sleep(25)
     }
     result.fastTrace = trace
     const fastReady = await waitTrue("document.querySelectorAll('.masonry-card, .list-row').length > 0 || document.querySelector('.empty') !== null", 5000)
-    result.fast = { ...(result.fast as Record<string, unknown>), fastSawSkeleton, fastReady }
-    check('A 快开库（无注入延迟）全程不该闪加载浮层（200ms 阈值有效）', fastSawSkeleton === false, `openMs=${aOpenMs} 骨架亮过=${fastSawSkeleton}`)
+    result.fast = { ...(result.fast as Record<string, unknown>), fastSawSkeleton, fastGoneAt, fastReady }
+    check(
+      'A 快开库也会播固定开场（骨架出现，且测试窗口 700ms 之后才收）',
+      fastSawSkeleton === true && fastGoneAt >= 600,
+      `openMs=${aOpenMs} 骨架亮过=${fastSawSkeleton} 消失于≈${fastGoneAt}ms`
+    )
     check('A 快开库仍然正常到位（有卡片或空态）', fastReady >= 0, `readyAfter=${fastReady}ms state=${JSON.stringify(aState)}`)
 
     // ==================== B. 慢开库（每阶段注入 600ms）→ 骨架必须出现 ====================
@@ -119,8 +129,8 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const layerSeenAfter = await waitTrue("!!document.querySelector('[data-boot-layer]')", 1200, 20)
     result.layerSeenAfter = layerSeenAfter
     check(
-      `B 慢开库时加载浮层出现（实测调用后 ${layerSeenAfter}ms；阈值 200ms，>190 才算没提前闪）`,
-      layerSeenAfter >= 190 && layerSeenAfter <= 900,
+      `B 慢开库时加载浮层立即出现（固定窗口下不再有防闪阈值；实测 +${layerSeenAfter}ms）`,
+      layerSeenAfter >= 0 && layerSeenAfter <= 250,
       `seenAfter=${layerSeenAfter}ms`
     )
 
@@ -237,9 +247,11 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const hintText = await js<string>("(document.querySelector('[data-boot-hint]')?.textContent ?? '').trim()")
     check('C 提示说的是「首次打开/刚开机会慢」，不是含糊的「请稍候」', /首次打开|刚开机/.test(hintText ?? ''), hintText ?? '')
 
-    const noSkip = await js<boolean>("!document.querySelector('[data-boot-skip]')")
-    result.noSkip = noSkip
-    check('C 不提供「先浏览」出口（无库可浏览，点了只会露出冻住的界面）', noSkip === true, String(noSkip))
+    // 语义变了：以前是「早收骨架、不给出口」（怕揭开露出冻住的界面）；
+    // 现在固定 9 秒窗口，不给出口就等于把人锁 9 秒，必须有「跳过」。
+    const hasSkip = await js<boolean>("!!document.querySelector('[data-boot-skip]')")
+    result.hasSkip = hasSkip
+    check('C 提供「跳过」出口（固定窗口必须能提前结束）', hasSkip === true, String(hasSkip))
 
     // ==================== D. 内容最终到位，浮层收掉且不再回来 ====================
     const contentAfter = await waitTrue("document.querySelectorAll('.masonry-card, .list-row').length > 0", 8000, 50)

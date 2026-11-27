@@ -8,6 +8,8 @@ function subscribe(channel: string, cb: (data: unknown) => void): () => void {
 }
 
 contextBridge.exposeInMainWorld('stash', {
+  /** 冒烟环境（主进程用 --smoke-* 启动时注入）：渲染层据此关掉固定开场窗口的等待 */
+  isSmoke: process.argv.includes('--stash-smoke'),
   win: {
     minimize: () => ipcRenderer.send('win:minimize'),
     toggleMaximize: () => ipcRenderer.send('win:toggle-maximize'),

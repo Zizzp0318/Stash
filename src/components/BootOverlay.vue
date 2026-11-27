@@ -22,6 +22,12 @@ import { useLibraryStore } from '../stores/library'
 
 const lib = useLibraryStore()
 
+/** 跳过这几秒的开场 → App 立即进入淡出（不等到最小展示时间） */
+const emit = defineEmits<{ (e: 'skip'): void }>()
+
+/** 固定窗口时长（App 传 lib.bootMinMs）。0/未传时按 9 秒算 */
+const props = defineProps<{ minMs?: number }>()
+
 /** 主标题固定：换库/开库对用户是同一件事 */
 const TITLE = '正在打开素材库'
 
@@ -54,11 +60,17 @@ function tick(now: number): void {
 
   /*
    * 渐近曲线：1.2s 线性冲到 34%（让人觉得「确实在动」），
-   * 之后 34 + 58·(1-e^(-t/4.5)) 逼近 92%。30s 时约 91%，40s 也到不了 92 —— 永远不会假满。
+   * 之后 34 + 58·(1-e^(-t/4.5)) 逼近 92%。
+   *
+   * 但固定窗口是 9 秒，光靠渐近曲线到点只有 80% 出头 —— 会在「没满」的状态下淡出。
+   * 所以再叠一条「窗口进度」：按 dur 线性走到 92%，两者取大。
+   * 前段仍是 34% 的冲刺（窗口进度那时才 14%），中段由窗口进度接管，到点时正好 92%。
    */
-  const p = s < 1.2 ? (s / 1.2) * 34 : 34 + 58 * (1 - Math.exp(-(s - 1.2) / 4.5))
+  const dur = props.minMs && props.minMs > 0 ? props.minMs : 9000
+  const base = s < 1.2 ? (s / 1.2) * 34 : 34 + 58 * (1 - Math.exp(-(s - 1.2) / 4.5))
+  const byWindow = dur > 0 ? (s * 1000) / dur * 92 : 92
   // 起点给 8%：第一帧就有可见的一小截，否则 0% 时像“还没开始”
-  pct.value = Math.min(Math.max(p, 8), 92)
+  pct.value = Math.min(Math.max(Math.max(base, byWindow), 8), 92)
 
   let idx = 0
   for (let i = 0; i < PHASES.length; i++) if (s >= PHASES[i].at) idx = i
@@ -87,6 +99,9 @@ onBeforeUnmount(() => {
     <div class="boot-vignette" aria-hidden="true"></div>
 
     <div class="boot-card" data-boot-pill>
+      <!-- 固定 9 秒窗口 + 可跳过：不是「防闪白」，而是把这段时间当成开场。
+           没有出口的 9 秒会让人觉得软件卡死，所以入口必须一直在。 -->
+      <button class="boot-skip" type="button" data-boot-skip @click="emit('skip')">跳过</button>
       <div class="boot-head">
         <div class="boot-orb" aria-hidden="true"></div>
         <div class="boot-titles">
@@ -100,7 +115,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="boot-foot">
-        <span class="boot-note">完成后会自动进入，无需操作</span>
+        <span class="boot-note">约 9 秒后自动进入，可随时跳过</span>
         <span v-if="slow" class="boot-hint" data-boot-hint>首次打开或刚开机会慢一些</span>
       </div>
     </div>
@@ -123,7 +138,44 @@ onBeforeUnmount(() => {
   -webkit-backdrop-filter: blur(22px) saturate(1.3) brightness(0.8);
   backdrop-filter: blur(22px) saturate(1.3) brightness(0.8);
   animation: boot-in 0.35s ease-out both;
+  /* 固定窗口结束时淡出（.is-leaving 由 App 加上），而不是「啪」一下消失 */
+  transition: opacity 0.42s ease;
   -webkit-app-region: drag;
+}
+/*
+ * 离场：必须先 animation:none —— `boot-in` 带 fill-mode both，结束后会把 opacity
+ * 锁在 1，transition 改不动它（表现就是「加了过渡但没淡出」）。
+ */
+.boot-overlay.is-leaving {
+  animation: none;
+  opacity: 0;
+  /*
+   * 淡出期间不能继续吃点击：层还挂在 DOM 上（等 420ms 结束才卸载），
+   * opacity:0 不会解除命中测试 —— 这 420ms 里用户点哪儿都没反应，
+   * 表现为「骨架刚淡出，界面却点不动」。
+   */
+  pointer-events: none;
+}
+
+/* 跳过：右上角常驻。固定 9 秒窗口如果没有出口，观感就是「卡死了」 */
+.boot-skip {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  font-family: var(--font);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.boot-skip:hover {
+  color: var(--text-1);
+  background: var(--bg-hover);
 }
 
 /* 浅色：从「压暗」改成「提亮」。米白界面被压暗会变成水泥灰 */

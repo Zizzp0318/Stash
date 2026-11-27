@@ -211,8 +211,24 @@ const FOLDER_ERR: Record<string, string> = {
   ERR_OUTSIDE_LIBRARY: '路径超出库目录',
   ERR_NO_LIBRARY: '未打开任何库'
 }
-function errText(code: string | undefined): string {
-  return FOLDER_ERR[code ?? ''] ?? String(code ?? '未知错误')
+function errText(raw: string | undefined): string {
+  const s = String(raw ?? '').trim()
+  /*
+   * 删除失败会带出「卡住的文件名|错误码」（见 library.deleteFolder）。
+   * 只读 / 占用 / 权限不足在系统层面是同一类硬失败，但用户的处理方式不同，
+   * 至少要说清是**哪个文件**卡住的，否则「关掉占用它的程序」根本无从下手。
+   */
+  const [code, file, errno] = s.split('|')
+  if (code === 'ERR_FOLDER_DELETE_PARTIAL' && file) {
+    const why =
+      errno === 'EPERM' || errno === 'EACCES'
+        ? '是只读文件或没有权限'
+        : errno === 'EBUSY' || errno === 'ENOTEMPTY'
+          ? '正被其它程序占用'
+          : `无法删除（${errno || '未知错误'}）`
+    return `删除被中断：${file} ${why}。已删除的部分已在索引里标记失效，处理后再重试`
+  }
+  return FOLDER_ERR[code] ?? s
 }
 
 function fail(msg: string): void {

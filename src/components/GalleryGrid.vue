@@ -2198,7 +2198,10 @@ function uninstallVsDebug(): void {
         </div>
       </div>
 
-      <div v-if="!assets.items.length && !assets.loading" class="empty">
+      <!-- ⚠️ `!lib.booting`：切库时 items 被 reset 清空、而 refresh 还没发出，
+           这一小段 `loading` 也是 false —— 不加这条就会先闪一下「暂无素材」再出内容
+           （录屏里看到的就是：左栏已换成新库、中栏写着「暂无素材」、半秒后素材冒出来）。 -->
+      <div v-if="!assets.items.length && !assets.loading && !lib.booting" class="empty">
         <template v-if="filtering">
           <p>没有匹配的素材</p>
           <p class="empty-sub">已应用 {{ assets.activeFilterCount }} 个筛选条件，试试放宽或清除</p>

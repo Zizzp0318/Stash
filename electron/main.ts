@@ -451,7 +451,15 @@ function bootstrap(): void {
         preload: join(__dirname, '../preload/preload.js'),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false
+        sandbox: false,
+        /*
+         * 冒烟模式标记：渲染层据此把「固定 9 秒开场」压到 0，
+         * 否则每跑一次套件都要真等 9 秒 × 每次开库（folder/ edit 会慢到没法用）。
+         * 生产启动没有 --smoke-* 参数 → 不传，行为与用户手动启动一致。
+         */
+        additionalArguments: process.argv.some((a) => a.startsWith('--smoke'))
+          ? ['--stash-smoke']
+          : []
       }
     })
 

@@ -53,26 +53,49 @@ const thumbProgress = ref<{ done: number; total: number } | null>(null)
 const busyProgress = computed(() => assets.exporting ?? assets.importing)
 const busyTitle = computed(() => (assets.exporting ? '正在导出素材…' : '正在导入素材…'))
 
-// ==================== 开库全屏加载层（2026-11 第三版）====================
+// ==================== 开库全屏加载层（2026-11 第四版：固定开场窗口）====================
 //
-// 数据源是 `lib.booting`；这里只负责**时序**：
-//   · 200ms 内就好的开库**什么都不显示**（完整切库含首屏刷新实测 ~110ms，闪一下反而像卡了）；
-//   · 超过 200ms 才亮全屏层，一直盖到 `markBootPainted()`（首屏数据到位 + 两帧绘制）。
+// 数据源是 `lib.booting`；这里只负责**时序**。
 //
-// 为什么从「只盖中栏」改成「全屏」：切进大库时主进程会同步扫全库，几十秒内 IPC 全断，
-// 而左右栏还挂着上一个库的文件夹与标签 —— 只盖中栏会让人以为已经好了，伸手一点没反应。
-// 全屏盖住是更诚实的反馈；窗口仍可拖动（见 BootOverlay 的 -webkit-app-region）。
+// 这一版语义变了：从「数据到就撤」改成**固定 9 秒的开场窗口** ——
+// 数据再快也要把这段播完，用户可点「跳过」提前结束。
+// 借鉴 SuYan 的思路（把不确定的等待变成可预期的开场），但不搬它的 9 图轮播，
+// 沿用现有的半透明读条。
 //
-// ⚠️ 别把阈值改成 0：那等于每次切库都闪一下，比没有更烦。
-const BOOT_SHOW_DELAY_MS = 200
+// 触发范围：**有库才播**。欢迎页 / 从没打开过库时 `booting` 根本不会置位，天然不触发。
+/** 离场淡出时长，必须与 BootOverlay 的 `.boot-overlay` transition 保持一致 */
+const BOOT_FADE_MS = 420
+
 const bootVisible = ref(false)
-let bootShowTimer: ReturnType<typeof setTimeout> | null = null
+const bootFading = ref(false)
+let bootFinishTimer: ReturnType<typeof setTimeout> | null = null
+/** 骨架**真正可见**的时刻（9 秒窗口从这里算，不是从「开始开库」算） */
+let bootShownAt = 0
 
 function clearBootTimer(): void {
-  if (bootShowTimer !== null) {
-    clearTimeout(bootShowTimer)
-    bootShowTimer = null
+  if (bootFinishTimer !== null) {
+    clearTimeout(bootFinishTimer)
+    bootFinishTimer = null
   }
+}
+
+/** 开始淡出；动画播完再真正 endBoot（组件要留到动画结束才卸载） */
+function beginBootFade(): void {
+  if (bootFading.value) return
+  bootFading.value = true
+  if (bootFinishTimer !== null) clearTimeout(bootFinishTimer)
+  bootFinishTimer = setTimeout(() => {
+    bootFinishTimer = null
+    bootFading.value = false
+    // finishBoot 而不是 endBoot：bootstrap + 手动切库会叠两层计数，减一次退不掉
+    lib.finishBoot()
+  }, BOOT_FADE_MS)
+}
+
+/** 用户点「跳过」：不等固定窗口结束，直接进淡出 */
+function skipBoot(): void {
+  if (!lib.booting) return
+  beginBootFade()
 }
 
 watch(
@@ -81,25 +104,70 @@ watch(
     clearBootTimer()
     if (!on) {
       bootVisible.value = false
+      bootFading.value = false
       return
     }
-    bootShowTimer = setTimeout(() => {
-      bootShowTimer = null
-      bootVisible.value = true
-    }, BOOT_SHOW_DELAY_MS)
+    bootFading.value = false
+    /*
+     * 立即亮骨架，**不再等 200ms**。
+     *
+     * 旧逻辑是「快开库别闪一下」，但固定 9 秒窗口下这个前提不成立了：反正要停留 9 秒，
+     * 延迟只剩副作用 —— 数据 30ms 就到了、素材先渲染出来，200ms 后骨架才盖上来，
+     * 用户看到的正是「先出现库里的素材，再弹出骨架」。
+     *
+     * 计时也从这一刻算（bootShownAt），保证是「看到骨架 9 秒」，
+     * 而不是「从开始开库算 9 秒」（大库开 3 秒，骨架就只剩 6 秒）。
+     */
+    bootVisible.value = true
+    bootShownAt = performance.now()
   }
 )
 
-/** 首屏画完 → 撤骨架（等两帧：第一帧 patch，第二帧上屏） */
+/** 首屏画完 → 等满固定窗口 → 淡出 */
 function markBootPainted(): void {
-  // 骨架压根没亮过（开库比阈值还快）→ 立刻收，别为了「等一帧」把自己顶过 100ms 阈值，
-  // 反而让本该无感的开库闪一下骨架（实测：79ms 的开库 + 两帧 rAF 就跨过了 100ms）。
-  if (!bootVisible.value) {
-    lib.endBoot()
-    return
-  }
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => lib.endBoot())
+  /*
+   * ⚠️ 这里**不能**因为「骨架还没亮」就 endBoot。
+   * 切库有 200ms 阈值，而数据常常 30ms 就绪 —— 以前那个分支会在这里直接收尾，
+   * 结果是「固定窗口还没开始就已经结束」，骨架一次都看不到。
+   * 固定窗口的语义是「到点才走」，所以这里只负责排期，不再管可见性。
+   */
+  void waitFirstThumbs(6, 1200).then(() => {
+    // 数据再快也展示满窗口；慢库则 remain<=0，立刻淡出
+    const remain = lib.bootMinMs - (performance.now() - bootShownAt)
+    if (remain > 0) {
+      bootFinishTimer = setTimeout(() => {
+        bootFinishTimer = null
+        beginBootFade()
+      }, remain)
+    } else {
+      beginBootFade()
+    }
+  })
+}
+
+/** 首屏卡片里的图至少 ready `min` 张，或超过 `maxMs` 就返回 */
+function waitFirstThumbs(min: number, maxMs: number): Promise<void> {
+  const t0 = performance.now()
+  return new Promise<void>((resolve) => {
+    const check = (): void => {
+      const imgs = Array.from(document.querySelectorAll<HTMLImageElement>('.card img'))
+      if (imgs.length === 0 || performance.now() - t0 >= maxMs) {
+        resolve()
+        return
+      }
+      const ready = imgs.filter((i) => i.complete && i.naturalWidth > 0).length
+      if (ready >= Math.min(min, imgs.length)) {
+        resolve()
+        return
+      }
+      /*
+       * 用 setTimeout 而不是 rAF：窗口在后台/隐藏时 Chromium 会冻结 rAF，
+       * 这个 Promise 就永远不 resolve，收尾排期也就永远轮不到（骨架停在那儿）。
+       * 超时上限本来就兜着，16ms 的轮询开销可以忽略。
+       */
+      setTimeout(check, 16)
+    }
+    check()
   })
 }
 
@@ -330,5 +398,10 @@ onBeforeUnmount(() => {
     放在两个分支之外，所以「欢迎页点库」和「库内切库」走的是同一条渲染路径 ——
     这正是上一版盖不住卡顿的原因（当时它藏在 `v-else` 里，没库时根本不在 DOM）。
   -->
-  <BootOverlay v-if="bootVisible && lib.booting" />
+  <BootOverlay
+    v-if="bootVisible && lib.booting"
+    :class="{ 'is-leaving': bootFading }"
+    :min-ms="lib.bootMinMs"
+    @skip="skipBoot"
+  />
 </template>

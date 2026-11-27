@@ -60,8 +60,24 @@ export const useLibraryStore = defineStore('library', () => {
   //   · 超过 `bootStuckAfterMs`（默认 8s）给「先浏览」出口 —— 后台继续补，别把人锁在引导页。
   const booting = ref(false)
   const bootStage = ref<'index' | 'meta' | 'grid'>('index')
+  /**
+   * 这次开库是**冷启动**还是**用户在切库**。
+   *
+   * App 用它决定骨架要不要立刻亮：冷启动时窗口刚出现、页面上还是首屏兜底，
+   * 200ms 空白也会被看成白屏；切库时库已经在眼前，闪一下骨架反而像卡了。
+   * 光看「第几次 booting」判断不了 —— 测试和用户都可能在启动后手动切库。
+   */
+  const bootKind = ref<'startup' | 'switch'>('switch')
   /** 慢到什么程度才提示「可以先浏览」（可被测试缝改小，便于冒烟覆盖） */
   const bootStuckAfterMs = ref(8000)
+  /**
+   * 固定开场窗口（毫秒）。数据再快也要展示这么久 —— 这不是「防闪白的最小值」，
+   * 而是刻意保留的一段开场；用户可点「跳过」提前结束。
+   *
+   * 冒烟环境直接置 0：否则每次开库真等 9 秒，folder/edit 套件会被拖到没法跑
+   * （只有 smoke-boot 用 __testBootMin 显式设成几百毫秒去验窗口语义）。
+   */
+  const bootMinMs = ref(window.stash.isSmoke ? 0 : 9000)
   let bootDepth = 0
 
   /**
@@ -76,6 +92,17 @@ export const useLibraryStore = defineStore('library', () => {
     return { delayMs: bootDelayMs, stuckMs: bootStuckAfterMs.value }
   }
 
+  /**
+   * 测试缝：改固定开场窗口时长（生产 9000）。
+   * 冒烟不可能真等 9 秒 × N 次开库，压到几百毫秒才能验证「到点才收、且确实等满了」。
+   */
+  function __testBootMin(ms: number): number {
+    const prev = bootMinMs.value
+    bootMinMs.value = Math.max(0, Number(ms) || 0)
+    return prev
+  }
+  ;(window as unknown as Record<string, unknown>).__testBootMin = __testBootMin
+
   function beginBoot(): void {
     bootDepth++
     booting.value = true
@@ -86,6 +113,19 @@ export const useLibraryStore = defineStore('library', () => {
   function endBoot(): void {
     bootDepth = Math.max(0, bootDepth - 1)
     if (bootDepth === 0) booting.value = false
+  }
+
+  /**
+   * 强制收尾：忽略嵌套计数，直接归零。
+   *
+   * App 在「固定开场窗口结束」时用这个，而不是 endBoot()：
+   * 启动自动恢复最近库（bootstrap）+ 用户手动切库会叠两层 beginBoot，
+   * 计数式只减一次 → booting 仍是 true → 骨架永远退不掉。
+   * App 是整条流程的最终收尾方，它说结束就是结束。
+   */
+  function finishBoot(): void {
+    bootDepth = 0
+    booting.value = false
   }
 
   /** 阶段推进 + 测试缝的延迟（延迟期间界面就是「卡在某一阶段」的样子） */
@@ -123,7 +163,8 @@ export const useLibraryStore = defineStore('library', () => {
   ;(window as unknown as Record<string, unknown>).__bootState = (): Record<string, unknown> => ({
     booting: booting.value,
     stage: bootStage.value,
-    stuckAfter: bootStuckAfterMs.value
+    stuckAfter: bootStuckAfterMs.value,
+    minMs: bootMinMs.value
   })
 
 
@@ -280,7 +321,7 @@ export const useLibraryStore = defineStore('library', () => {
     await loadRecent()
     const last = recent.value[0]
     if (last) {
-      const e = await openLibrary(last.path)
+      const e = await openLibrary(last.path, 'startup')
       if (e) {
         // 库目录可能已被移动/删除，或该库由更新版本的 Stash 升级过（ERR_LIBRARY_TOO_NEW）。
         // 两种情况都从最近列表里剔除并**留在欢迎页**，同时把原因记下来给欢迎页展示 ——
@@ -312,16 +353,27 @@ export const useLibraryStore = defineStore('library', () => {
       await bootStep('grid')
       return null
     } finally {
+      /*
+       * 兜底：防止流程异常把人永远按在引导态。
+       *
+       * ⚠️ 必须**长于固定开场窗口**。这里原来是写死的 3000ms，固定 9 秒之后它反而成了 bug：
+       * 开库 0.1s 就绪 → 3 秒后这个定时器把 booting 一关，骨架在 3~4 秒就被掐掉，
+       * 用户看到的是「进度条走到一半就没了」。
+       */
       setTimeout(() => {
         if (booting.value) {
           bootDepth = 0
           booting.value = false
         }
-      }, 3000)
+      }, bootMinMs.value + 5000)
     }
   }
 
-  async function openLibrary(target: string): Promise<string | null> {
+  async function openLibrary(
+    target: string,
+    kind: 'startup' | 'switch' = 'switch'
+  ): Promise<string | null> {
+    bootKind.value = kind
     beginBoot()
     try {
       await bootStep('index')
@@ -349,7 +401,7 @@ export const useLibraryStore = defineStore('library', () => {
           bootDepth = 0
           booting.value = false
         }
-      }, 3000)
+      }, bootMinMs.value + 5000)
     }
   }
 
@@ -415,5 +467,5 @@ export const useLibraryStore = defineStore('library', () => {
   return { info, folders, tags, counts, recent, bootError, folderById, subtreeCount, recentTags, tagCount, bootstrap, createLibrary, openLibrary, closeLibrary, forgetLibrary, refreshCounts, usageRev, bumpUsage, loadMeta,
     collapsed, isCollapsed, toggleCollapse, expandTo,
     // 开库引导态（骨架屏）：`booting` 期间 App 渲染骨架层；阶段文案看 `bootStage`
-    booting, bootStage, bootStuckAfterMs, endBoot, __testSlowBoot }
+    booting, bootStage, bootKind, bootStuckAfterMs, bootMinMs, endBoot, finishBoot, __testSlowBoot }
 })

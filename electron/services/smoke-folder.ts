@@ -1668,42 +1668,29 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         }
         await importTo(dpPaths.slice(0, 2), dpSub1.id)
         await importTo(dpPaths.slice(2), dpSub2.id)
-        const lockedRel = '删除中断测试/子2/dp-2.png'
-        const lockedAbs = abs(lockedRel)
-        const marker = join(workDir, 'lock-ready.txt')
-        // PowerShell 以**独占**方式（share=None）打开该文件 —— Node 的 fs.open 做不到这一点
-        // （libuv 打开时带 FILE_SHARE_DELETE），QA 第四轮就是用这招拿到确定性的 EBUSY。
-        const lockScript =
-          `$ErrorActionPreference='Stop';` +
-          `$f=[IO.File]::Open('${lockedAbs.replace(/'/g, "''")}','Open','ReadWrite','None');` +
-          `Set-Content -Path '${marker.replace(/'/g, "''")}' -Value 'ok';` +
-          `Start-Sleep -Seconds 40; $f.Close()`
-        const lockProc = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', lockScript], {
-          windowsHide: true
-        })
-        let lockReady = false
-        for (let i = 0; i < 60; i++) {
-          if (existsSync(marker)) {
-            lockReady = true
-            break
-          }
-          await sleep(200)
-        }
         const suspBeforeDp = watcherSuspensions()
         let dpErr: string | null = null
         try {
-          await deleteFolder(dp.id)
+          /*
+           * 注入：只删「子1」（dp-0/1），留下「子2」（dp-2）后抛 EBUSY —— 模拟"删到一半卡住"。
+           *
+           * 为什么不再用真实锁：Windows 10 1709+ 的 POSIX 语义删除能绕过文件级独占锁，
+           * 连「目录被别的进程当作 CWD」都能删掉（实测 dpErr 直接变 null，用例失去覆盖）。
+           * 靠系统行为造确定性失败已经不可靠了，改成注入 —— 测的是收口逻辑本身，不是 OS 的锁。
+           */
+          await deleteFolder(dp.id, async (absPath) => {
+            const sub1 = join(absPath, '子1')
+            if (existsSync(sub1)) rmSync(sub1, { recursive: true, force: true })
+            throw Object.assign(new Error('EBUSY: resource busy or locked'), {
+              code: 'EBUSY',
+              path: join(absPath, '子2', 'dp-2.png')
+            })
+          })
         } catch (e) {
           dpErr = msg(e)
         }
         const suspDp = watcherSuspensions() - suspBeforeDp
-        // 关掉独占进程（否则后面的清理会一直被挡）
-        try {
-          lockProc.kill()
-        } catch {
-          /* ignore */
-        }
-        await sleep(300)
+        await sleep(200)
         const dpRows = D()
           .prepare('SELECT rel_path, missing FROM assets WHERE rel_path LIKE ?')
           .all('删除中断测试/%') as Array<{ rel_path: string; missing: number }>
@@ -1750,7 +1737,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
           bigMs,
           bigTicks: gaps.length,
           bigMaxGap: maxGap,
-          lockReady,
+          dpInjected: true,
           dpErr,
           suspDp,
           dpRowCount: dpRows.length,
@@ -2227,7 +2214,7 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       bigMs?: number
       bigTicks?: number
       bigMaxGap?: number
-      lockReady?: boolean
+      dpInjected?: boolean
       dpErr?: string | null
       suspDp?: number
       dpRowCount?: number
@@ -2600,8 +2587,11 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
       // ② 磁盘上已消失的行 `missing=1`（不许留「DB 说存在、卡片照常」）；
       // ③ 还活着的行保持 missing=0（不许一刀切把整个子树标记失效）。
       // 注入验证：去掉删除失败分支里的 `markMissingOnDisk` → goneMarked=false → 红。
-      deletePartialMarksMissing: o?.lockReady === true && (o?.suspDp ?? 0) >= 1 &&
-        o?.dpErr === 'ERR_FOLDER_DELETE_PARTIAL' && !/EBUSY|EPERM|ENOTEMPTY/i.test(o?.dpErr ?? '') &&
+      // ⚠️ 错误消息现在带「|文件名|错误码」后缀（供界面提示用），所以只能比前缀；
+      //    仍然要求**不含完整路径**（盘符），给用户看的不该是 `C:\...\xxx.png`。
+      deletePartialMarksMissing: o?.dpInjected === true && (o?.suspDp ?? 0) >= 1 &&
+        (o?.dpErr ?? '').startsWith('ERR_FOLDER_DELETE_PARTIAL') &&
+        !/[A-Za-z]:[\\/]/.test(o?.dpErr ?? '') &&
         (o?.dpGoneRows ?? 0) >= 1 && o?.goneMarked === true && o?.aliveUntouched === true,
 
       // ==================== P. 导入文件夹（QA 第六轮 IF-1 ~ IF-8）====================

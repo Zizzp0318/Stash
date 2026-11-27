@@ -601,6 +601,8 @@ export interface StashAppApi {
 }
 
 export interface StashApi {
+  /** 冒烟环境标记（--smoke-* 启动时为 true）。生产恒 false */
+  isSmoke: boolean
   win: StashWinApi
   library: StashLibraryApi
   folder: StashFolderApi

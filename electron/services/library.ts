@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, rmSync } from 'fs'
+import { existsSync, mkdirSync, rmSync, chmodSync, lstatSync, readdirSync } from 'fs'
+import { rm } from 'fs/promises'
 import { join, dirname, basename, relative, isAbsolute, resolve } from 'path'
 import { openDatabase, SCHEMA_VERSION, type DB } from './db'
 import { addRecentLibrary, listRecentLibraries, removeRecentLibrary } from './config'
@@ -696,15 +697,54 @@ export function pruneAllEmptyTags(db: DB): Array<{ id: number; name: string }> {
  * 隔离（停监听器）已经从根上消除该占用；这里再补一次重试，专门兜住「隔离之后仍有残余句柄」的
  * 最后一瞬 —— 第二次通常就干净删完，把「数据丢失」变成「删除成功」。
  */
-function rmTreeWithRetry(abs: string, attempts = 2): void {
+/**
+ * 兜底清只读 —— **不是主因，别指望它解决占用**。
+ *
+ * 实测（`rmSync` 删 0o444 文件）：Node 在 Windows 上能直接删掉只读文件，
+ * 内部已处理 FILE_ATTRIBUTE_READONLY，所以「只读」不会单独导致删除失败。
+ * 保留这一步只为覆盖极端情况（安全软件在失败瞬间把文件重设成只读、属性组合异常）；
+ * 只在失败之后跑一次，不进正常路径。
+ *
+ * 真正会让目录删不掉的是**常驻句柄**（资源管理器缩略图 / 预览器 / 播放器 / 杀软扫描中），
+ * 那类失败只能靠退避重试 + 把文件名报给用户。
+ */
+function clearReadOnlyUnder(abs: string): void {
+  try {
+    const st = lstatSync(abs)
+    if (st.isDirectory()) {
+      for (const name of readdirSync(abs)) clearReadOnlyUnder(join(abs, name))
+    } else if (st.isFile()) {
+      chmodSync(abs, 0o666)
+    }
+  } catch {
+    /* 已经不存在 / 无权限：交给下一轮重试去暴露真实原因 */
+  }
+}
+
+/**
+ * 删除整棵目录，带退避重试。
+ *
+ * 之前是「两次同步重试、中间不让位」：对杀软扫描这种瞬时占用勉强够，对**常驻句柄**
+ *（资源管理器缩略图 / 预览器 / 播放器）必然两次都失败；而且两次删除之间主进程被钉住，
+ * 用户看到的是窗口卡一下然后报错。
+ *
+ * 现在：异步 `rm` + 指数退避 + 每次失败先清只读，最多约 1.1 秒再放弃。
+ * 用 `fs/promises` 的 rm 而不是 rmSync —— 删大目录时不再阻塞主进程（UI 不卡）。
+ */
+async function rmTreeWithRetry(abs: string, attempts = 4): Promise<void> {
   let last: unknown
   for (let i = 0; i < attempts; i++) {
     try {
-      rmSync(abs, { recursive: true, force: true })
+      // maxRetries/retryDelay 交给 Node 处理 EBUSY/EPERM 的短抖动
+      await rm(abs, { recursive: true, force: true, maxRetries: 3, retryDelay: 80 })
       return
     } catch (e) {
       last = e
-      if (i < attempts - 1) console.warn('[library] 删除目录第一次失败（已隔离），立刻重试一次：', e)
+      clearReadOnlyUnder(abs)
+      if (i < attempts - 1) {
+        console.warn(`[library] 删除目录第 ${i + 1} 次失败（已清只读），稍后重试：`, e)
+        await new Promise((r) => setTimeout(r, 120 * (i + 1)))
+      }
     }
   }
   throw last
@@ -758,17 +798,30 @@ function markMissingOnDisk(db: DB, libPath: string, rootPath: string): number {
  * ⚠️ 因为连带删了素材，挂在那些素材上的标签可能归零，所以最后要清一次空标签。
  * 候选集必须在 `DELETE FROM assets` **之前**取，删完关联就查不到了。
  */
-export async function deleteFolder(id: number): Promise<{
+/**
+ * 删除整个文件夹：**直接从磁盘删除**，不进回收站，不可恢复。
+ *
+ * `rmTree` 只在测试里被替换：Windows 10 1709+ 的 POSIX 语义删除连「文件被独占打开」
+ * 和「目录被当作工作目录」都能绕过，靠 PowerShell 造锁已经拿不到确定性的删除失败，
+ * 所以由冒烟注入一个「删一半就抛 EBUSY」的实现来覆盖收口逻辑。生产调用不传。
+ */
+export async function deleteFolder(
+  id: number,
+  rmTree: (abs: string) => Promise<void> = rmTreeWithRetry
+): Promise<{
   folders: number
   assets: number
   thumbsRemoved: number
   pruned: Array<{ id: number; name: string }>
 }> {
   // 与 renameFolder 共用一把串行锁：并发「删 + 改 / 删 + 删」会在同一份 folders 行上撞 UNIQUE(path)
-  return withFolderWriteLock(() => deleteFolderUnlocked(id))
+  return withFolderWriteLock(() => deleteFolderUnlocked(id, rmTree))
 }
 
-async function deleteFolderUnlocked(id: number): Promise<{
+async function deleteFolderUnlocked(
+  id: number,
+  rmTree: (abs: string) => Promise<void> = rmTreeWithRetry
+): Promise<{
   folders: number
   assets: number
   thumbsRemoved: number
@@ -798,14 +851,22 @@ async function deleteFolderUnlocked(id: number): Promise<{
     // （`ERR_FOLDER_DELETE_PARTIAL` → SideBar 的 FOLDER_ERR 有对应人话文案），
     // 绝不把原始 `EBUSY/ENOTEMPTY + 完整路径` 泄漏给用户，也绝不假装删除成功。
     try {
-      if (existsSync(abs)) rmTreeWithRetry(abs)
+      if (existsSync(abs)) await rmTree(abs)
     } catch (rmErr) {
       const marked = markMissingOnDisk(db, libPath, row.path)
       console.warn(
         `[library] 删除文件夹失败（已删除的文件已标记失效 ${marked} 条）：${row.path}`,
         rmErr
       )
-      throw new Error('ERR_FOLDER_DELETE_PARTIAL')
+      /*
+       * 把「卡在哪个文件、什么错误码」一起带出去。
+       * 界面文案原本只有「可能被其它程序占用」——只读文件、路径超长、权限不足都被归到这句里，
+       * 用户照着去关程序永远关不掉。带出文件名之后，提示才有指向性。
+       * 用 `|` 分隔（Windows 路径里可能有冒号，不能用 `:`）。
+       */
+      const err = rmErr as NodeJS.ErrnoException
+      const detail = err?.path ? `${basename(err.path)}|${err.code ?? ''}` : ''
+      throw new Error(detail ? `ERR_FOLDER_DELETE_PARTIAL|${detail}` : 'ERR_FOLDER_DELETE_PARTIAL')
     }
 
     const assetRows = db
