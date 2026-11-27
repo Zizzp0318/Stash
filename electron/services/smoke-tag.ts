@@ -540,11 +540,22 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
     }
     await capture('shot-tag-deleted.png')
 
+    // H5b 重命名：点别处（blur）= 取消，不能卡在编辑态
+    // （cancelTagRename 曾漏定义 → commitTagRename 抛 ReferenceError → 输入框永远退不出去）
+    const idxSky = (await sidebarTags()).findIndex((t) => t.name === '天空')
+    R.h5b_ctxMode = await openTagCtx(idxSky)
+    R.h5b_opened = await clickCtxItem('重命名标签')
+    await sleep(340)
+    R.h5b_inputShown = await js(`!!document.querySelector('.side-item input.side-rename')`)
+    R.h5b_blurred = await js(`(() => { const i = document.querySelector('.side-item input.side-rename'); if (!i) return false; i.blur(); return true })()`)
+    await sleep(420)
+    R.h5b_inputGone = await js(`!document.querySelector('.side-item input.side-rename')`)
+    R.h5b_nameKept = tagIdOf('天空') != null
+
     // H6 先按「天空」筛选，再把这个标签删掉 → 筛选必须重置回「所有素材」
     await clickEl(`.side-item[data-tag-id="${tSky.id}"]`)
     await sleep(800)
     R.h6_filtered = { cards: await cardNames(), sidebar: await sideMap() }
-    const idxSky = (await sidebarTags()).findIndex((t) => t.id === tSky.id)
     R.h6_ctxMode = await openTagCtx(idxSky)
     R.h6_clicked = await clickCtxItem('删除标签')
     await sleep(400)
@@ -1304,6 +1315,10 @@ export async function runSmokeTag(win: BrowserWindow): Promise<void> {
       tagMenuOpened: R.h5_ctxMode === 'real' || R.h5_ctxMode === 'dispatch',
       tagMenuItems: (R.h5_menuItems as string[])?.join('|') === '重命名标签|删除标签',
       tagMenuHitCorrectRow: (R.h5_targetIndex as number) >= 0,
+      // 点别处取消重命名：输入框必须收起来，标签名保持原样
+      tagRenameBlurCancels:
+        R.h5b_inputShown === true && R.h5b_blurred === true &&
+        R.h5b_inputGone === true && R.h5b_nameKept === true,
       confirmShowsImpact: h5m?.title?.includes('水') === true && /1 个素材/.test(h5m?.text ?? ''),
       confirmSaysFilesSafe: /不受影响/.test(h5m?.text ?? ''),
       deleteRemovesTagRow: h5?.tagGone === true,

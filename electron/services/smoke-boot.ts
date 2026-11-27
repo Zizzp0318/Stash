@@ -1,10 +1,11 @@
-// 开库骨架屏冒烟：electron . --smoke-boot
+// 开库全屏加载层冒烟：electron . --smoke-boot
 //
-// 第 2 批（开库引导页）的验收。设计前提见 `App.vue` 与 `BootSkeleton.vue` 的文件头：
-//   · 只有「真的要等」才显示（>100ms）——本机开库 5.5ms，热开库闪一下骨架比不显示更糟；
-//   · 骨架层**不吃事件、不盖标题栏**（用户对「卡死」的第一判断是「窗口拖不动」）；
-//   · 首屏数据到位 + 一帧绘制后立刻收，**不能晚到让用户看着空网格**，也不能早到闪一下空白；
-//   · 超过阈值（默认 8s）给「先浏览」出口，后台继续补。
+// 第三版（全屏磨砂层）的验收。设计前提见 `App.vue` 与 `BootOverlay.vue` 的文件头：
+//   · 只有「真的要等」才显示（>100ms）——本机开库 5.5ms，热开库闪一下反而像卡了；
+//   · **全屏覆盖**（含标题栏与左右栏）：切库时左右栏还是旧库内容，只盖中栏会让人以为已经好了；
+//   · 但窗口仍然拖得动（-webkit-app-region: drag）——「拖不动」是用户判断卡死的第一依据；
+//   · 进度由渲染层自驱（主进程卡住时没有任何事件可等），且永远到不了 100%；
+//   · 首屏数据到位 + 两帧绘制后立刻收，不能晚到让用户看着空网格。
 //
 // 怎么把它测成「可证伪」：真机上开库太快，骨架根本来不及亮 → 用一个**测试缝**
 // `lib.__testSlowBoot(delayMs, stuckMs)` 把等待注进去（生产恒 0）。这不是打桩实现，
@@ -102,7 +103,7 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     result.fastTrace = trace
     const fastReady = await waitTrue("document.querySelectorAll('.masonry-card, .list-row').length > 0 || document.querySelector('.empty') !== null", 5000)
     result.fast = { ...(result.fast as Record<string, unknown>), fastSawSkeleton, fastReady }
-    check('A 快开库（无注入延迟）全程不该闪加载浮层（100ms 阈值有效）', fastSawSkeleton === false, `openMs=${aOpenMs} 骨架亮过=${fastSawSkeleton}`)
+    check('A 快开库（无注入延迟）全程不该闪加载浮层（200ms 阈值有效）', fastSawSkeleton === false, `openMs=${aOpenMs} 骨架亮过=${fastSawSkeleton}`)
     check('A 快开库仍然正常到位（有卡片或空态）', fastReady >= 0, `readyAfter=${fastReady}ms state=${JSON.stringify(aState)}`)
 
     // ==================== B. 慢开库（每阶段注入 600ms）→ 骨架必须出现 ====================
@@ -118,8 +119,8 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const layerSeenAfter = await waitTrue("!!document.querySelector('[data-boot-layer]')", 1200, 20)
     result.layerSeenAfter = layerSeenAfter
     check(
-      `B 慢开库时加载浮层出现（实测调用后 ${layerSeenAfter}ms；阈值 100ms，>90 才算没提前闪）`,
-      layerSeenAfter >= 90 && layerSeenAfter <= 900,
+      `B 慢开库时加载浮层出现（实测调用后 ${layerSeenAfter}ms；阈值 200ms，>190 才算没提前闪）`,
+      layerSeenAfter >= 190 && layerSeenAfter <= 900,
       `seenAfter=${layerSeenAfter}ms`
     )
 
@@ -138,6 +139,7 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
       barWidth: number
       ratio: string | null
       cardPointer: string
+      winW: number
     }>(`(() => {
       const el = document.querySelector('[data-boot-layer]')
       if (!el) return null
@@ -163,21 +165,21 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
         label: (el.querySelector('[data-boot-label]')?.textContent ?? '').trim(),
         barWidth: fill ? Math.round(fill.getBoundingClientRect().width) : -1,
         ratio: fill ? fill.getAttribute('data-boot-ratio') : null,
-        cardPointer: card ? getComputedStyle(card).pointerEvents : ''
+        cardPointer: card ? getComputedStyle(card).pointerEvents : '',
+        winW: window.innerWidth
       }
     })()`)
     result.geo = geo
-    check('B 浮层 pointer-events:none（不吃点击，背后内容照常可交互）', geo?.pointer === 'none', geo?.pointer)
-    check('B 浮层上的卡片可以点（「先浏览」要能按）', geo?.cardPointer === 'auto', geo?.cardPointer)
+    check('B 浮层挡住整窗（加载期间不接受点击）', geo?.pointer === 'auto', geo?.pointer)
     check(
-      'B 浮层不盖标题栏（窗口仍能拖动/最小化）',
-      !!geo && geo.layerTop >= geo.titleBarBottom - 1,
-      geo ? `layer.top=${geo.layerTop} titlebar.bottom=${geo.titleBarBottom}` : '(层不存在)'
+      'B 浮层覆盖整个窗口（含标题栏与左右栏）',
+      !!geo && geo.layerTop <= 0 && geo.layerLeft <= 0 && geo.layerRight >= geo.winW - 1,
+      geo ? `layer=[${geo.layerLeft},${geo.layerTop},${geo.layerRight}] winW=${geo.winW}` : '(层不存在)'
     )
     check(
-      'B 只盖中栏：左边缘不越过侧栏、右边缘不越过详情栏',
-      !!geo && geo.layerLeft >= geo.sidebarRight - 1 && (geo.detailLeft < 0 || geo.layerRight <= geo.detailLeft + 1),
-      geo ? `layer=[${geo.layerLeft},${geo.layerRight}] sidebar.right=${geo.sidebarRight} detail.left=${geo.detailLeft}` : '(层不存在)'
+      'B 标题栏也在遮盖范围内（切库时左右栏/标题栏都是旧内容，必须一起盖住）',
+      !!geo && geo.layerTop <= geo.titleBarBottom,
+      geo ? `layer.top=${geo.layerTop} titlebar.bottom=${geo.titleBarBottom}` : '(层不存在)'
     )
     check(
       'B 预览窗口被虚化（backdrop-filter 含 blur）',
@@ -186,8 +188,8 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     )
     check('B 加载条真的画出来了（宽度 > 0）', (geo?.barWidth ?? 0) > 0, String(geo?.barWidth))
     check(
-      'B 阶段文案是真状态（正在打开/读取/准备），不是「加载中」',
-      !!geo && /正在打开素材库|正在读取索引|正在准备/.test(geo.label),
+      'B 标题是真状态（正在打开素材库），不是笼统的「加载中」',
+      !!geo && /正在打开素材库/.test(geo.label),
       geo?.label
     )
 
@@ -213,8 +215,10 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     })()`)
     result.visual = visual
 
-    // 留一张现场图（与其它套件的 shot-*.png 同规范），方便人工复看骨架的样子
+    // 留一张现场图（与其它套件的 shot-*.png 同规范），方便人工复看加载层的样子。
+    // 先等一下再截：--disable-gpu 下 capturePage 可能拿到上一帧，磨砂层还没合成进去。
     try {
+      await sleep(180)
       const img = await win.webContents.capturePage()
       writeFileSync(join(process.cwd(), 'shot-boot-loading.png'), img.toPNG())
       result.shot = 'shot-boot-loading.png'
@@ -222,27 +226,33 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
       result.shotError = String((e as Error)?.message ?? e)
     }
 
-    // ==================== C. 超过阈值 → 「先浏览」出口 ====================
-    const skipAfter = await waitTrue("!!document.querySelector('[data-boot-skip]')", 2000, 25)
-    result.skipAfter = skipAfter
-    check(`C 超过阈值（注入 700ms）出现「先浏览」出口（实测 +${skipAfter}ms）`, skipAfter >= 0, `skipAfter=${skipAfter}`)
+    // ==================== C. 超过阈值 → 慢盘提示（不再有「先浏览」出口）====================
+    const hintAfter = await waitTrue("!!document.querySelector('[data-boot-hint]')", 2000, 25)
+    result.hintAfter = hintAfter
+    check(
+      `C 超过阈值（注入 700ms）出现慢盘提示（实测 +${hintAfter}ms）`,
+      hintAfter >= 0,
+      `hintAfter=${hintAfter}`
+    )
     const hintText = await js<string>("(document.querySelector('[data-boot-hint]')?.textContent ?? '').trim()")
-    check('C 出口旁边说清「后台继续补」', /可以先浏览/.test(hintText ?? ''), hintText ?? '')
+    check('C 提示说的是「首次打开/刚开机会慢」，不是含糊的「请稍候」', /首次打开|刚开机/.test(hintText ?? ''), hintText ?? '')
 
-    const clicked = await js<boolean>("(() => { const b = document.querySelector('[data-boot-skip]'); if (!b) return false; b.click(); return true })()")
-    const goneAfterSkip = await waitTrue("!document.querySelector('[data-boot-layer]')", 1200, 20)
-    result.skip = { clicked, goneAfterSkip }
-    check('C 点「先浏览」后浮层立刻收掉（不被按在引导页上）', clicked === true && goneAfterSkip >= 0, `clicked=${String(clicked)} goneAfter=${goneAfterSkip}ms`)
+    const noSkip = await js<boolean>("!document.querySelector('[data-boot-skip]')")
+    result.noSkip = noSkip
+    check('C 不提供「先浏览」出口（无库可浏览，点了只会露出冻住的界面）', noSkip === true, String(noSkip))
 
-    // ==================== D. 内容最终到位，骨架不再回来 ====================
+    // ==================== D. 内容最终到位，浮层收掉且不再回来 ====================
     const contentAfter = await waitTrue("document.querySelectorAll('.masonry-card, .list-row').length > 0", 8000, 50)
+    // 内容出现 ≠ 层已收：收层要等 markBootPainted（首屏到位 + 两帧绘制），给一个独立窗口
+    const layerGone = await waitTrue("!document.querySelector('[data-boot-layer]')", 3000, 25)
     const backAgain = await js<boolean>("!!document.querySelector('[data-boot-layer]')")
     const slowOpen = await js<{ res: string; assets: unknown; boot: unknown }>(
       '({ res: window.__slowOpenRes ?? "(未设置)", assets: window.__assetsState ? window.__assetsState() : null, boot: window.__bootState ? window.__bootState() : null })'
     )
-    result.content = { contentAfter, backAgain, slowOpen }
+    result.content = { contentAfter, layerGone, backAgain, slowOpen }
     check('D 打开完成后首屏有素材（浮层收掉 → 内容接上）', contentAfter >= 0,
       `cardsAfter=${contentAfter}ms open=${slowOpen?.res} assets=${JSON.stringify(slowOpen?.assets)}`)
+    check('D 内容到位后浮层收掉', layerGone >= 0, `goneAfter=${layerGone}ms`)
     check('D 收掉之后浮层不再回来', backAgain === false, String(backAgain))
 
     // 素材数量与库一致（300 行里有 300 条；虚拟滚动下只断「有卡片」且上界 120）

@@ -12,6 +12,12 @@ export interface FolderRow {
   parent_id: number | null
   path: string
   name: string
+  /** glyph 的具体值：emoji 字符 或 图标 key；null = 默认文件夹图标 */
+  icon: string | null
+  /** 'emoji' | 'icon' | null —— 决定 icon 列怎么解释 */
+  glyph_kind: string | null
+  /** 语义色 ID（blue/indigo/…）；null = 不染色 */
+  color: string | null
 }
 export interface TagRow {
   id: number

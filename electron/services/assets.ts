@@ -859,3 +859,57 @@ export function counts(): { total: number; byFolder: Record<string, number>; byT
   }
   return { total, byFolder, byTag }
 }
+
+/**
+ * 把素材**导出副本**到用户选的目录（右键「导出到…」，支持框选批量）。
+ *
+ * 与 `copyAssets` 的区别：那个是在**库内**复制并带上评分/标签等元数据；
+ * 这个是把文件本身拿出去给别的软件用 —— 不写索引、不动库内文件。
+ *
+ * 重名：目标目录已有同名文件 → 自动改成 `名字 (1).ext`，**绝不覆盖**。
+ * 同一批里两个不同文件夹的同名文件也要错开 —— `uniqueName` 只查磁盘，
+ * 而此刻前一个还没写完，所以额外用 `taken` 记住本批已分配的名字。
+ *
+ * 进度：每处理一个回调一次；每 20 个让出一次事件循环 —— 几百张图连续复制
+ * 会把主进程钉住（拖窗口、点菜单都卡），让出后界面保持可响应。
+ */
+export async function exportAssets(
+  ids: number[],
+  targetDir: string,
+  onProgress?: (done: number, total: number) => void
+): Promise<{ exported: number; renamed: number; failed: Array<{ name: string; error: string }>; dir: string }> {
+  const { db, path: libPath } = requireCurrent()
+  const failed: Array<{ name: string; error: string }> = []
+  if (!ids.length) return { exported: 0, renamed: 0, failed, dir: targetDir }
+
+  const ph = ids.map(() => '?').join(',')
+  const rows = db.prepare(`SELECT name, rel_path FROM assets WHERE id IN (${ph})`).all(...ids) as Array<{
+    name: string
+    rel_path: string
+  }>
+
+  const taken = new Set<string>()
+  let exported = 0
+  let renamed = 0
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    const src = join(libPath, ...r.rel_path.split('/'))
+    try {
+      if (!existsSync(src)) {
+        failed.push({ name: r.name, error: 'ERR_FILE_MISSING' })
+      } else {
+        const name = uniqueName(targetDir, r.name, (n) => taken.has(n.toLowerCase()))
+        if (name !== r.name) renamed++
+        copyFileSync(src, join(targetDir, name))
+        taken.add(name.toLowerCase())
+        exported++
+      }
+    } catch (e) {
+      failed.push({ name: r.name, error: String((e as Error).message ?? e) })
+    }
+    onProgress?.(i + 1, rows.length)
+    if ((i + 1) % 20 === 0) await new Promise<void>((res) => setImmediate(res))
+  }
+  return { exported, renamed, failed, dir: targetDir }
+}

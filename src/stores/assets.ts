@@ -118,6 +118,12 @@ export const useAssetStore = defineStore('assets', () => {
 
   // 导入浮层状态
   const importing = ref<{ done: number; total: number } | null>(null)
+  /**
+   * 导出进度（右键「导出到…」时由 GalleryGrid 置初值、主进程逐个推）。
+   * 与 `importing` 分开是因为文案不同（“正在导出” vs “正在导入”），
+   * 但浮层样式共用 —— App 里取 `exporting ?? importing`。
+   */
+  const exporting = ref<{ done: number; total: number } | null>(null)
   // 导入结果提示（错误 / 摘要）
   const importNotice = ref<{ kind: 'error' | 'info'; text: string } | null>(null)
 
@@ -840,6 +846,7 @@ export const useAssetStore = defineStore('assets', () => {
     selectedId, detail,
     selectedIds, selectedCount, selectedAllFav, selectedRating, selectedRatingMixed, isSelected,
     importing, importNotice, notify,
+    exporting,
     thumbV, bumpThumbs, thumbUrl,
     mediaRev, bumpMedia, mediaRevOf,
     aiLabels, loadAiLabels, aiSourceLabel, reloadDetail,

@@ -55,7 +55,12 @@ contextBridge.exposeInMainWorld('stash', {
       ipcRenderer.invoke('folder:move', { id, targetParentId }),
     /** 删除整个文件夹：物理删除，不可恢复（无回收站） */
     remove: (id: number) => ipcRenderer.invoke('folder:delete', id),
-    list: () => ipcRenderer.invoke('folder:list')
+    list: () => ipcRenderer.invoke('folder:list'),
+    /** 设置外观（glyph + 颜色 ID）；只改软件内显示，不动磁盘目录；null = 恢复默认 */
+    setMeta: (
+      id: number,
+      patch: { glyphKind?: string | null; glyphValue?: string | null; colorId?: string | null }
+    ) => ipcRenderer.invoke('folder:set-meta', { id, patch })
   },
   import: {
     files: (args: { paths: string[]; folderId?: number | null; mode?: 'copy' | 'move' }) =>
@@ -88,6 +93,9 @@ contextBridge.exposeInMainWorld('stash', {
     rename: (id: number, name: string) => ipcRenderer.invoke('asset:rename', { id, name }),
     /** 库内复制：在目标文件夹生成一份带评分/喜欢/备注/标签的副本 */
     copy: (ids: number[], folderId?: number | null) => ipcRenderer.invoke('asset:copy', { ids, folderId }),
+    /** 导出副本到用户选的目录（右键「导出到…」）。取消目录选择时 data 为 null */
+    exportTo: (ids: number[]) => ipcRenderer.invoke('asset:export', { ids }),
+    onExportProgress: (cb: (d: unknown) => void) => subscribe('export:progress', cb),
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线 */
     paste: (paths: string[], folderId?: number | null) => ipcRenderer.invoke('asset:paste', { paths, folderId }),
     setTags: (id: number, tagIds: number[]) => ipcRenderer.invoke('asset:setTags', { id, tagIds }),

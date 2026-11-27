@@ -496,29 +496,132 @@ function placeholder(type: string): Promise<string> {
   return p
 }
 
+/**
+ * 占位图设计版本。改设计时 +1：
+ * 文件名带版本 → 老库里的 `placeholder-audio.webp` 不会被命中，新图会重新生成；
+ * 再配合 `migratePlaceholderThumbs()` 把已复制进 `{hash}/grid.webp` 的旧图清掉。
+ * 只改 SVG 不加版本的话，老库永远看不到新设计（缩略图是复制品，不会自动更新）。
+ */
+const PLACEHOLDER_REV = 2
+
+/** 320×320，纯图形（不用 `<text>`：sharp 依赖系统字体，缺字体会变空框） */
+const PLACEHOLDER_SVG: Record<'audio' | 'text' | 'file', string> = {
+  // 音频：深色渐变 + 居中波形。比「两个圆点当音符」更像声音，也不会和任何真实封面撞脸。
+  audio: `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320">
+<defs>
+<linearGradient id="abg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1B2130"/><stop offset="0.55" stop-color="#12151D"/><stop offset="1" stop-color="#0B0D12"/></linearGradient>
+<linearGradient id="abar" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#9DC0FF"/><stop offset="1" stop-color="#6A78E8"/></linearGradient>
+<radialGradient id="aglow" cx="0.5" cy="0.44" r="0.5"><stop offset="0" stop-color="#5B8CFF" stop-opacity="0.30"/><stop offset="1" stop-color="#5B8CFF" stop-opacity="0"/></radialGradient>
+</defs>
+<rect width="320" height="320" fill="url(#abg)"/>
+<rect width="320" height="320" fill="url(#aglow)"/>
+<g fill="url(#abar)">
+<rect x="76" y="142" width="8" height="36" rx="4"/>
+<rect x="92" y="132" width="8" height="56" rx="4"/>
+<rect x="108" y="120" width="8" height="80" rx="4"/>
+<rect x="124" y="106" width="8" height="108" rx="4"/>
+<rect x="140" y="92" width="8" height="136" rx="4"/>
+<rect x="156" y="84" width="8" height="152" rx="4"/>
+<rect x="172" y="92" width="8" height="136" rx="4"/>
+<rect x="188" y="106" width="8" height="108" rx="4"/>
+<rect x="204" y="120" width="8" height="80" rx="4"/>
+<rect x="220" y="132" width="8" height="56" rx="4"/>
+<rect x="236" y="142" width="8" height="36" rx="4"/>
+</g>
+</svg>`,
+  // 文本：一张「纸」+ 标题行 + 正文行 + 光标。光标是暗示「可以点开编辑」的关键一笔。
+  text: `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320">
+<defs>
+<linearGradient id="tbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1A1D24"/><stop offset="1" stop-color="#0D0F14"/></linearGradient>
+</defs>
+<rect width="320" height="320" fill="url(#tbg)"/>
+<rect x="82" y="62" width="156" height="196" rx="16" fill="#FFFFFF" fill-opacity="0.045" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="1.5"/>
+<rect x="104" y="92" width="58" height="8" rx="4" fill="#82B4FF" fill-opacity="0.95"/>
+<g fill="#DCE3EC">
+<rect x="104" y="120" width="112" height="6" rx="3" fill-opacity="0.30"/>
+<rect x="104" y="138" width="96" height="6" rx="3" fill-opacity="0.24"/>
+<rect x="104" y="156" width="112" height="6" rx="3" fill-opacity="0.30"/>
+<rect x="104" y="174" width="76" height="6" rx="3" fill-opacity="0.22"/>
+<rect x="104" y="192" width="104" height="6" rx="3" fill-opacity="0.26"/>
+<rect x="104" y="210" width="60" height="6" rx="3" fill-opacity="0.18"/>
+</g>
+<rect x="118" y="228" width="3" height="12" rx="1.5" fill="#82B4FF" fill-opacity="0.9"/>
+</svg>`,
+  // 未知格式：折角文档 + 三条内容线。与 text 的区别靠「折角 vs 整张纸」，一眼能分开。
+  file: `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320" viewBox="0 0 320 320">
+<defs>
+<linearGradient id="fbg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1A1D22"/><stop offset="1" stop-color="#0E1015"/></linearGradient>
+</defs>
+<rect width="320" height="320" fill="url(#fbg)"/>
+<g fill="none" stroke="#CBD5E1" stroke-opacity="0.50" stroke-width="7" stroke-linejoin="round" stroke-linecap="round">
+<path d="M112 58h56l40 40v150a14 14 0 0 1-14 14H112a14 14 0 0 1-14-14V72a14 14 0 0 1 14-14z"/>
+<path d="M168 58v40h40"/>
+</g>
+<g fill="#CBD5E1" fill-opacity="0.16">
+<rect x="118" y="140" width="76" height="6" rx="3"/>
+<rect x="118" y="160" width="60" height="6" rx="3"/>
+<rect x="118" y="180" width="68" height="6" rx="3"/>
+</g>
+</svg>`
+}
+
 async function generatePlaceholder(key: string, type: string): Promise<string> {
-  const out = join(requireCurrent().path, '.thumbs', `placeholder-${type}.webp`)
+  const out = join(requireCurrent().path, '.thumbs', `placeholder-${type}-v${PLACEHOLDER_REV}.webp`)
   if (existsSync(out)) {
     placeholderCache.set(key, out)
     return out
   }
   mkdirSync(join(out, '..'), { recursive: true })
-  // 三种占位：音频（音符）/ 未知格式（折角文档）/ 文本（三横线）。
+  // 三种占位：音频（波形）/ 未知格式（折角文档）/ 文本（纸张 + 文字行 + 光标）。
   // `file` 必须与 `text` 区分开 —— 用户一眼要能看出「这是能打开但预览不了的文件」，
   // 而不是「一篇文本」。网格里没缩略图时全靠这张图说话。
   // ⚠️ 不要用 `<text>` 渲染扩展名：sharp 的 SVG 渲染依赖系统字体，缺字体会变成空白框，
   //    同一份库在不同机器上长得不一样。纯图形表达。
-  const svg = type === 'audio'
-    ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="#7FA8D9"><circle cx="140" cy="180" r="14"/><circle cx="190" cy="164" r="14"/><rect x="150" y="100" width="6" height="82" rx="3"/><rect x="200" y="84" width="6" height="82" rx="3"/></g></svg>`
-    : type === 'file'
-      ? `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g fill="none" stroke="#9AA3AD" stroke-width="9" stroke-linejoin="round" stroke-linecap="round"><path d="M116 88h60l32 32v96a12 12 0 0 1-12 12H116a12 12 0 0 1-12-12V100a12 12 0 0 1 12-12z"/><path d="M176 88v32h32"/></g></svg>`
-      : `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="320"><rect width="320" height="320" fill="#2A2D31"/><g stroke="#9AA3AD" stroke-width="10" stroke-linecap="round"><line x1="100" y1="120" x2="220" y2="120"/><line x1="100" y1="160" x2="220" y2="160"/><line x1="100" y1="200" x2="180" y2="200"/></g></svg>`
+  const svg = PLACEHOLDER_SVG[type === 'audio' ? 'audio' : type === 'file' ? 'file' : 'text']
   const buf = await sharp(Buffer.from(svg)).webp({ quality: quality() }).toBuffer()
   const tmp = tmpPath(out)
   writeFileSync(tmp, buf)
   renameTmp(tmp, out) // 原子替换：失败也只可能留下临时文件，最终路径要么没有、要么是完整的
   placeholderCache.set(key, out)
   return out
+}
+
+/**
+ * 一次性迁移：把旧版占位图复制出来的缩略图清掉，让回填用新版重画。
+ *
+ * 为什么需要：`{hash}/grid.webp` 是占位图的**复制品**，改设计不会自动更新它。
+ * 只删 grid/detail 不够 —— `thumbHashDirs()` 用「目录存在」判断有没有缩略图，
+ * 目录还在（里面可能还有别的产物）就会骗过回填，所以顺手 `invalidateGridPresence()`
+ * 让下一轮全量回填改用逐条 `existsSync`。
+ *
+ * 范围只限 audio/text/file：图片/视频的真实缩略图一张都不碰。
+ */
+export function migratePlaceholderThumbs(): { removed: number; rev: number } {
+  const { db } = requireCurrent()
+  const row = db.prepare("SELECT value FROM meta WHERE key='placeholder_rev'").get() as
+    | { value?: string }
+    | undefined
+  if (row?.value === String(PLACEHOLDER_REV)) return { removed: 0, rev: PLACEHOLDER_REV }
+
+  const rows = db
+    .prepare("SELECT content_hash FROM assets WHERE missing=0 AND type IN ('audio','text','file')")
+    .all() as Array<{ content_hash: string | null }>
+  let removed = 0
+  for (const r of rows) {
+    if (!isThumbHash(r.content_hash)) continue
+    for (const size of ['grid', 'detail'] as const) {
+      try {
+        unlinkSync(thumbFile(r.content_hash, size))
+        removed++
+      } catch {
+        /* 本来就没生成过：正常，不算失败 */
+      }
+    }
+  }
+  // 目录集合现在会撒谎（目录还在、文件没了）→ 让下一次全量回填退回逐条 existsSync
+  if (removed) invalidateGridPresence()
+  db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES('placeholder_rev',?)").run(String(PLACEHOLDER_REV))
+  return { removed, rev: PLACEHOLDER_REV }
 }
 
 // —— 图片元数据 + 主色回写 ——

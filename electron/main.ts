@@ -35,7 +35,7 @@ import { runSmokeWatch } from './services/smoke-watch'
 import { runSmokeVScroll } from './services/smoke-vscroll'
 import { runSmokeUsage } from './services/smoke-usage'
 import { runSmokeBoot } from './services/smoke-boot'
-import { ensureThumb, ensureBatch, retestLegacyDims, pausePumpAsync, resumePump, invalidateGridPresence, SIZES, type ThumbSize } from './services/thumbs'
+import { ensureThumb, ensureBatch, retestLegacyDims, migratePlaceholderThumbs, pausePumpAsync, resumePump, invalidateGridPresence, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
 import { isThumbHash } from './services/paths'
@@ -176,6 +176,8 @@ function runBackfill(size: ThumbSize, limit?: number): { queued: number; capped:
     // 先清空让它们落回欠账条件，下面的 ensureBatch 才会把它们重新纳入并补写成**显示尺寸**。
     // 放这里而不是缩略图队列内部：所有「开库」路径都会调本 handler，挂这里最省事。
     retestLegacyDims()
+    // 占位图设计换代：清掉旧版复制出来的缩略图，让本轮回填用新图重画（只动 audio/text/file）
+    migratePlaceholderThumbs()
     const db = librarySvc.getDatabase()
     const rows = db
       .prepare('SELECT id, type, ext, content_hash, rel_path FROM assets WHERE missing=0 ORDER BY imported_at DESC')
@@ -590,6 +592,8 @@ function bootstrap(): void {
       wrap(() => librarySvc.moveFolder(id, targetParentId)))
     ipcMain.handle('folder:delete', (_e, id) => wrap(() => librarySvc.deleteFolder(id)))
     ipcMain.handle('folder:list', () => wrap(() => librarySvc.listFolders()))
+    // 图标 / 颜色：只改索引里的显示字段，磁盘目录一个字节都不动
+    ipcMain.handle('folder:set-meta', (_e, { id, patch }) => wrap(() => librarySvc.setFolderMeta(id, patch ?? {})))
 
     // 导入
     ipcMain.handle('import:files', (_e, args) => wrap(() => importerSvc.importFiles(args)))
@@ -671,6 +675,25 @@ function bootstrap(): void {
     ipcMain.handle('asset:rename', (_e, { id, name }) => wrap(() => assetsSvc.renameAsset(id, name)))
     /** 库内复制：在目标文件夹生成一份保留评分/喜欢/备注/标签的副本 */
     ipcMain.handle('asset:copy', (_e, { ids, folderId }) => wrap(() => assetsSvc.copyAssets(ids ?? [], folderId ?? null)))
+    /**
+     * 导出素材到用户选的目录（右键「导出到…」，支持框选批量）。
+     *
+     * 目录选择必须在主进程做（渲染层拿不到系统对话框）。取消选择时 `data` 为 `null` ——
+     * 渲染层据此**不弹提示**：用户主动取消，不该被通知一次“导出 0 个”。
+     */
+    ipcMain.handle('asset:export', (_e, { ids }) =>
+      wrap(async () => {
+        const r = await dialog.showOpenDialog(win, {
+          title: '导出到…',
+          buttonLabel: '导出到此处',
+          properties: ['openDirectory', 'createDirectory']
+        })
+        if (r.canceled || !r.filePaths[0]) return null
+        return assetsSvc.exportAssets(ids ?? [], r.filePaths[0], (done, total) => {
+          if (!win.isDestroyed()) win.webContents.send('export:progress', { done, total })
+        })
+      })
+    )
     /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（分流在服务层） */
     ipcMain.handle('asset:paste', (_e, { paths, folderId }) => wrap(() => assetsSvc.pastePaths(paths ?? [], folderId ?? null)))
     ipcMain.handle('asset:setTags', (_e, { id, tagIds }) => wrap(() => assetsSvc.setTags(id, tagIds)))

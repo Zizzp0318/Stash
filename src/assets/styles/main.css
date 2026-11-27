@@ -134,6 +134,20 @@
   /* 播放条进度轨道：它压在 --bg-raised 派生出来的条子上，必须跟着主题换 */
   --track:     rgba(255,255,255,0.14);
 
+  /*
+   * 文件夹外观的 8 个语义色。深色下要亮（细线图标压在近黑底上），
+   * 浅色下必须压深——同一套亮色放米白底上会糊成一片浅雾。
+   * 存的是 ID，不是 hex：换主题时这里整套替换，数据库里的值不用动。
+   */
+  --folder-tint-blue:   #6ea8dc;
+  --folder-tint-indigo: #8b9be8;
+  --folder-tint-purple: #b794e8;
+  --folder-tint-pink:   #e89bb8;
+  --folder-tint-orange: #e8a06a;
+  --folder-tint-green:  #7dbe7a;
+  --folder-tint-teal:   #5cb8b0;
+  --folder-tint-red:    #e07a7a;
+
   /* 原生控件（滚动条 / 输入框光标 / 时间选择器）跟着主题走，否则浅色下滚条还是黑的 */
   color-scheme: dark;
 
@@ -212,6 +226,16 @@
   --on-danger: #FFFFFF;
   --knob:      #FFFFFF;
   --track:     rgba(0,0,0,0.12);
+
+  /* 浅色：同一组色相压深，保证细线图标在米白底上仍然读得出来 */
+  --folder-tint-blue:   #2f6fad;
+  --folder-tint-indigo: #4c5fd0;
+  --folder-tint-purple: #7c4db8;
+  --folder-tint-pink:   #c45d86;
+  --folder-tint-orange: #c46a2a;
+  --folder-tint-green:  #3d8f45;
+  --folder-tint-teal:   #2a8a82;
+  --folder-tint-red:    #c44545;
 
   color-scheme: light;
 }
@@ -1070,12 +1094,26 @@ mark {
 }
 
 /* 文件夹右键菜单比素材菜单窄一点（条目文案短） */
-.folder-ctx { width: 184px; }
+/*
+ * ⚠️ 必须写成 `.ctx-menu.folder-ctx`（两个类）。
+ * `.ctx-menu` 定义在本文件更靠后的位置，单类选择器会被它按顺序盖掉，
+ * 宽度就悄悄变回 212 —— 表面看没报错，实际规则失效。
+ */
+.ctx-menu.folder-ctx { width: 184px; }
 .folder-ctx .ctx-head {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/*
+ * 标签菜单：内容只有「重命名 / 色块 / 删除」，用默认 212 会让色块右边空出一大块。
+ * 10 个色块排成一行、宽度按内容收紧：
+ *   10*18 色块 + 9*4 间隙 = 216，加上菜单 6*2 与色块行 8*2 的内边距 = 244。
+ * 实际取 252，留 8px 余量 —— 正好 244 时最后一个圆点的边框会被裁掉半像素。
+ */
+.ctx-menu.tag-ctx { width: 252px; }
+.tag-ctx .ctx-color-grid { grid-template-columns: repeat(10, 18px); gap: 4px; }
 
 /* 工具栏右侧操作区 */
 .toolbar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
@@ -1613,14 +1651,26 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   max-width: calc(100% - 24px);
   box-sizing: border-box;
   border-radius: 12px;
-  /* 浮层色（--bg-raised）：它是压在网格上的一块托盘，不能是半透明黑——那会随底下的图变色 */
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-pop);
-  backdrop-filter: blur(10px);
+  /*
+   * 半透明毛玻璃（与 .ctx-menu 同一套参数）。
+   * 原来是实底 --bg-raised，虽然挂了 blur(10px) 但底色不透明，等于白挂。
+   * 78% + blur 18 能透出底下的网格又不至于让文字发飘：
+   * 这条子比右键菜单更宽、压的素材更多，透明度再低一点就会糊。
+   * 浅色主题下 saturate 收到 1.15（见下方 [data-theme="light"] 覆盖）。
+   */
+  background: color-mix(in srgb, var(--bg-raised) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  box-shadow: var(--shadow-pop), 0 1px 0 var(--hairline) inset;
+  -webkit-backdrop-filter: blur(18px) saturate(1.45);
+  backdrop-filter: blur(18px) saturate(1.45);
   z-index: 40;
   /* 单个按钮内部的文字仍不许折行；换行只发生在"整件"之间 */
   white-space: nowrap;
+}
+/* 浅色：背后是彩色缩略图，不再加饱和，否则条子内部会发花 */
+[data-theme="light"] .batchbar {
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  backdrop-filter: blur(18px) saturate(1.15);
 }
 .bb-count { font-size: 12px; color: var(--text-2); }
 /* 计数数字用 --text-1 而不是 --accent：这是**数字**不是状态，而 accent 在小字上的对比度
@@ -1767,10 +1817,25 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   width: 212px;
   padding: 6px;
   border-radius: 10px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-pop);
+  /*
+   * 半透明毛玻璃。
+   * 菜单常浮在素材缩略图上：实底看起来像贴了一块不透明的补丁，也切断了
+   * 「这个菜单属于哪张图 / 哪个文件夹」的视觉联系。78% + blur 既保留背景轮廓，
+   * 又足以压住花哨的图片、保证文字可读。
+   * ⚠️ 别降到 60% 以下：浅色下白底菜单压在白素材上会糊成一片，
+   *    深色下白字压亮图也只剩 3:1 出头。
+   */
+  background: color-mix(in srgb, var(--bg-raised) 78%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.45);
+  backdrop-filter: blur(18px) saturate(1.45);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  box-shadow: var(--shadow-pop), 0 1px 0 var(--hairline) inset;
   z-index: 110;
+}
+/* 浅色：背后的彩色缩略图不需要再被加饱和，否则菜单内部会显得花 */
+[data-theme="light"] .ctx-menu {
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  backdrop-filter: blur(18px) saturate(1.15);
 }
 .ctx-head { font-size: 10px; color: var(--text-3); padding: 5px 8px 7px; }.ctx-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px 7px; }
 .ctx-label { font-size: 11.5px; color: var(--text-2); }
@@ -1814,7 +1879,14 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
 .ctx-item svg { width: 13px; height: 13px; flex-shrink: 0; }
 .ctx-item:hover { background: var(--bg-hover); color: var(--text-1); }
 .ctx-item.danger { color: var(--danger-text); }
-.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--text-1); }
+/* 带二级面板的菜单项：右端一个 chevron，提示「悬停会展开」 */
+.ctx-item--sub .ctx-arrow {
+  margin-left: auto;
+  width: 8px;
+  height: 8px;
+  flex: none;
+  opacity: 0.55;
+}.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--text-1); }
 .ctx-sep { height: 1px; background: var(--border-soft); margin: 5px 2px; }
 .ctx-confirm { padding: 4px 4px 2px; display: flex; flex-direction: column; gap: 6px; }
 .ctx-confirm-text { font-size: 12px; color: var(--text-1); padding: 0 4px; }
@@ -2463,3 +2535,165 @@ body.drag-moving .card:hover .thumb-img { transform: none; }
   display: flex;
   position: relative;
 }
+
+/* ============ 文件夹图标 / 颜色 ============ */
+
+/* 图标容器：让 48 viewBox 的 IconPark svg 在 flex 行里垂直居中 */
+.side-item .folder-ico {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  /* 行内样式给 --folder-tint；没设颜色时 inherit，保持和文字同色 */
+  color: var(--folder-tint, inherit);
+}
+/* IconPark 自带 currentColor，不再压 opacity（默认的 .75 会让 14px 的线条发虚） */
+.side-item .folder-ico svg { opacity: 1; }
+
+/* emoji 字形：比线框图标略小，视觉重量才接近；emoji 是彩色字形，不能吃 color */
+.side-item .folder-ico .folder-emoji {
+  font-size: 13px;
+  line-height: 1;
+  color: initial;
+}
+
+/*
+ * 设过颜色的文件夹：选中态换成该色的淡底 + 左侧色条。
+ * 只作用于**选中态**——未选中时保持中性，避免一屏文件夹五颜六色。
+ * 颜色变量由行内 style 提供（见 SideBar 的 folderRowStyle），没设过就不命中这条。
+ */
+.side-item.has-color.active {
+  background: color-mix(in srgb, var(--folder-tint) 16%, transparent);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--folder-tint) 70%, transparent);
+}
+
+/* ============ 文件夹外观：hover 展开的二级面板 ============ */
+/*
+ * 定位由 JS 计算（菜单项右侧，越界翻到左侧），这里只管样子。
+ * 宽度 306 = 8 列 × 约 36px + 内边距；再宽就会盖住中栏的素材。
+ */
+.folder-appearance {
+  position: fixed;
+  z-index: 121;
+  width: 306px;
+  max-height: min(430px, calc(100vh - 64px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 10px 8px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-panel) 96%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  backdrop-filter: blur(18px) saturate(1.2);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-pop);
+}
+
+.fa-colors {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 2px 2px 4px;
+}
+.fa-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--hairline);
+  cursor: pointer;
+}
+/* 「无颜色」用一条斜线表示，比再画一个灰色圆点清楚 */
+.fa-swatch.is-none {
+  background: linear-gradient(
+    135deg,
+    transparent 46%,
+    var(--text-3) 46%,
+    var(--text-3) 54%,
+    transparent 54%
+  );
+}
+.fa-swatch.on { outline: 2px solid var(--text-1); outline-offset: 2px; }
+
+.fa-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow: auto;
+  padding: 2px;
+}
+.fa-group h4 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-3);
+}
+.fa-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 2px;
+}
+.fa-cell {
+  height: 30px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.fa-cell svg { width: 17px; height: 17px; }
+.fa-cell:hover { background: var(--bg-hover); color: var(--text-1); }
+.fa-cell.on {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--text-1);
+}
+
+.fa-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border-soft);
+}
+.fa-preview {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+/* 预览用**真实渲染路径**，和侧栏同一套（颜色 + glyph），不是另画一个 */
+.fa-preview-glyph {
+  display: flex;
+  align-items: center;
+  color: var(--folder-tint, var(--text-2));
+}
+.fa-preview-glyph svg { width: 15px; height: 15px; }
+.fa-preview-glyph .folder-emoji { font-size: 14px; color: initial; }
+.fa-preview-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fa-clear {
+  flex: none;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-raised);
+  color: var(--text-2);
+  font-size: 11px;
+  font-family: var(--font);
+  cursor: pointer;
+}
+.fa-clear:disabled { opacity: 0.4; cursor: default; }
+.fa-clear:not(:disabled):hover { color: var(--text-1); background: var(--bg-hover); }

@@ -2,6 +2,9 @@
 import { ref, computed, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
 import type { StashLibraryUsage } from '../env'
 import { folderIcon } from '@/data/mock'
+import { FOLDER_ICON_GROUPS, FOLDER_ICON_MAP } from '@/data/folderIcons'
+import { FOLDER_EMOJI_GROUPS } from '@/data/folderEmojis'
+import { FOLDER_COLORS, folderTint } from '@/data/folderAppearance'
 import { useLibraryStore, type FolderRow, type TagRow } from '../stores/library'
 import { useAssetStore } from '../stores/assets'
 import { useSettingsStore } from '../stores/settings'
@@ -45,7 +48,9 @@ const folderRows = computed(() =>
       /** 只算本层：仅在悬停提示里用来解释「数字里有多少是子文件夹贡献的」 */
       own: lib.counts.byFolder[String(f.id)] ?? 0,
       hasChildren: parentPaths.value.has(f.path),
-      folded: lib.isCollapsed(f.path)
+      folded: lib.isCollapsed(f.path),
+      // 预先解释一次 glyph，模板里就不用反复查表（也避免 emoji / 图标两条分支重复判断）
+      glyph: folderGlyphOf(f)
     }))
 )
 
@@ -294,9 +299,10 @@ const menu = ref<{ x: number; y: number; folder: FolderRow } | null>(null)
 function openMenu(e: MouseEvent, f: FolderRow): void {
   e.preventDefault()
   e.stopPropagation()
-  // 靠近窗口右/下边缘时向内收，避免被裁掉
+  // 靠近窗口右/下边缘时向内收，避免被裁掉。
+  // 高度按「5 个条目 + 分隔线 + 标题」估：少估会把菜单顶出窗口底部。
   const w = 184
-  const h = 140
+  const h = 200
   menu.value = {
     folder: f,
     x: Math.max(6, Math.min(e.clientX, window.innerWidth - w - 6)),
@@ -305,6 +311,146 @@ function openMenu(e: MouseEvent, f: FolderRow): void {
 }
 function closeMenu(): void {
   menu.value = null
+  cancelSubClose()
+  iconPanel.value = null
+}
+
+// ==================== 文件夹外观：glyph（emoji / 图标）+ 颜色 ====================
+//
+// 三个字段：
+//   glyph_kind  'emoji' | 'icon' | null
+//   icon        具体值（emoji 字符 / 图标 key）
+//   color       语义色 ID（blue/indigo/…）—— 不是 hex，深浅主题各一套色值
+//
+// 交互：右键菜单第一项「图标与颜色」，**鼠标移上去**在右侧展开二级面板；
+// 面板离开后 160ms 才关（鼠标斜着划过去不会误关）。
+
+const iconPanel = ref<FolderRow | null>(null)
+const panelPos = ref({ left: 0, top: 0 })
+let subCloseTimer: ReturnType<typeof setTimeout> | null = null
+
+function cancelSubClose(): void {
+  if (subCloseTimer !== null) {
+    clearTimeout(subCloseTimer)
+    subCloseTimer = null
+  }
+}
+
+function scheduleSubClose(): void {
+  cancelSubClose()
+  subCloseTimer = setTimeout(() => {
+    iconPanel.value = null
+    subCloseTimer = null
+  }, 160)
+}
+
+/**
+ * 展开二级面板并定位。
+ *
+ * 默认贴在菜单项右侧；右边放不下就翻到菜单**左侧**（不能遮住菜单本身），
+ * 上下也夹在视口内 —— 否则靠近屏幕底部的文件夹右键后，面板会有一半在窗口外。
+ */
+function openIconSub(e?: MouseEvent): void {
+  const f = menu.value?.folder
+  if (!f) return
+  cancelSubClose()
+  if (iconPanel.value?.id !== f.id) iconPanel.value = f
+
+  const el =
+    (e?.currentTarget as HTMLElement | null) ??
+    document.querySelector<HTMLElement>('.folder-ctx [data-ctx="folder-appearance"]')
+  if (!el) return
+
+  const r = el.getBoundingClientRect()
+  const W = 306
+  const H = Math.min(430, window.innerHeight - 64)
+  let left = r.right + 6
+  if (left + W > window.innerWidth - 8) left = Math.max(8, r.left - W - 6)
+  let top = r.top - 8
+  if (top + H > window.innerHeight - 8) top = Math.max(8, window.innerHeight - H - 8)
+  panelPos.value = { left, top }
+}
+
+/** 把库里的两个字段解释成渲染指令；未知值一律回落默认文件夹图标 */
+function folderGlyphOf(f: { glyph_kind: string | null; icon: string | null }): {
+  kind: 'emoji' | 'icon' | 'default'
+  value: string | null
+  svg: string | null
+} {
+  if (f.glyph_kind === 'emoji' && f.icon) return { kind: 'emoji', value: f.icon, svg: null }
+  if (f.glyph_kind === 'icon' && f.icon) {
+    const def = FOLDER_ICON_MAP[f.icon]
+    if (def) return { kind: 'icon', value: f.icon, svg: def.svg }
+  }
+  return { kind: 'default', value: null, svg: null }
+}
+
+function folderIconFor(f: { glyph_kind: string | null; icon: string | null }): string {
+  return folderGlyphOf(f).svg ?? folderIcon
+}
+
+/**
+ * 文件夹行的内联样式：缩进 + 颜色变量。
+ * `--folder-tint` 同时给两处用：图标线条的 color，以及选中态那层淡底。
+ */
+function folderRowStyle(f: { indent: number; color: string | null }): Record<string, string> {
+  const s: Record<string, string> = { paddingLeft: `${8 + f.indent * 13}px` }
+  const tint = folderTint(f.color)
+  if (tint) s['--folder-tint'] = tint
+  return s
+}
+
+/** 面板里的 f 是 folderRows 的浅拷贝，侧栏那一行是 lib.folders 里的原对象 —— 两处都要改 */
+function patchFolderRow(id: number, patch: Partial<FolderRow>): void {
+  const row = lib.folders.find((x) => x.id === id)
+  if (row) Object.assign(row, patch)
+}
+
+/**
+ * 选字形。**再点一次同一个 = 取消**（颜色保留）—— 和 Serpent 一致：
+ * 想拿掉图标时不用先去找「默认」那一格。
+ */
+async function setGlyph(kind: 'emoji' | 'icon', value: string): Promise<void> {
+  const f = iconPanel.value
+  if (!f) return
+  const same = f.glyph_kind === kind && f.icon === value
+  const nextKind = same ? null : kind
+  const nextValue = same ? null : value
+  const r = await window.stash.folder.setMeta(f.id, { glyphKind: nextKind, glyphValue: nextValue })
+  if (!r.ok) {
+    assets.notify('error', `设置图标失败：${r.error ?? '未知错误'}`)
+    return
+  }
+  f.glyph_kind = nextKind
+  f.icon = nextValue
+  patchFolderRow(f.id, { glyph_kind: nextKind, icon: nextValue })
+}
+
+async function setFolderColor(colorId: string | null): Promise<void> {
+  const f = iconPanel.value
+  if (!f) return
+  const r = await window.stash.folder.setMeta(f.id, { colorId })
+  if (!r.ok) {
+    assets.notify('error', `设置颜色失败：${r.error ?? '未知错误'}`)
+    return
+  }
+  f.color = colorId
+  patchFolderRow(f.id, { color: colorId })
+}
+
+/** 恢复默认：字形和颜色一起清掉 */
+async function clearAppearance(): Promise<void> {
+  const f = iconPanel.value
+  if (!f) return
+  const r = await window.stash.folder.setMeta(f.id, { glyphKind: null, glyphValue: null, colorId: null })
+  if (!r.ok) {
+    assets.notify('error', `清除失败：${r.error ?? '未知错误'}`)
+    return
+  }
+  f.glyph_kind = null
+  f.icon = null
+  f.color = null
+  patchFolderRow(f.id, { glyph_kind: null, icon: null, color: null })
 }
 
 // ==================== 草稿编辑（新建子级 / 重命名 共用一套内联输入）====================
@@ -342,6 +488,19 @@ function clearDraft(seq: number): void {
 
 function cancelDraft(): void {
   clearDraft(draftSeq)
+}
+
+/**
+ * 收起 / 展开当前右键的文件夹。
+ *
+ * 菜单文案与图标方向都跟着实时状态走：已收起 → 「展开文件夹」+ 箭头朝右；
+ * 展开着 → 「收起文件夹」+ 箭头朝下。折叠状态本身存在 lib.collapsed（按库隔离）。
+ */
+function toggleMenuFolder(): void {
+  const f = menu.value?.folder
+  closeMenu()
+  if (!f) return
+  lib.toggleCollapse(f.path)
 }
 
 function startCreateChild(): void {
@@ -527,6 +686,20 @@ function setTagDraftInput(el: unknown): void {
 }
 
 /**
+ * 退出标签重命名并丢弃草稿。
+ *
+ * ⚠️ 这个函数是「点别处取消」的唯一出口：输入框 blur → commitTagRename →
+ * 名字没变/为空 → 调它。它一旦缺失，那条分支会抛 ReferenceError，
+ * 状态清不掉，输入框就永远退不出去（用户看到的是「必须改名才能离开」）。
+ * Esc 键也走这里。
+ */
+function cancelTagRename(): void {
+  tagDraftSeq++
+  renamingTagId.value = null
+  tagDraftName.value = ''
+}
+
+/**
  * 改标签颜色：只动配色，不动名字与素材关联。
  *
  * 选中的颜色与当前一致就只关菜单（先 `return` 避免一次无意义 IPC）。
@@ -646,7 +819,14 @@ function onKeyDown(e: KeyboardEvent): void {
 /** 点击菜单以外的任何地方都关闭右键菜单 */
 function onWindowMouseDown(e: MouseEvent): void {
   const t = e.target as HTMLElement
-  if (menu.value && !t.closest('.ctx-menu')) closeMenu()
+  /*
+   * ⚠️ 二级外观面板必须一起排除。
+   * 它是 portal 到 body 的，不在 `.ctx-menu` 里；只判断 `.ctx-menu` 的话，
+   * 点面板里的图标会先走到这里 → closeMenu() → iconPanel 变 null → 面板在
+   * **mousedown 阶段就被卸载**，随后的 mouseup/click 没有目标，用户看到的就是「点了没反应」。
+   * （`el.click()` 只发 click 不发 mousedown，所以自动化测试测不出这个问题。）
+   */
+  if (menu.value && !t.closest('.ctx-menu') && !t.closest('.folder-appearance')) closeMenu()
   if (tagMenu.value && !t.closest('.ctx-menu')) closeTagMenu()
 }
 
@@ -783,11 +963,12 @@ onBeforeUnmount(() => {
             class="side-item"
             :class="{
               active: assets.query.folderId === f.id,
-              'drop-on': assets.dragOverFolderId === f.id || dropTargetId === f.id
+              'drop-on': assets.dragOverFolderId === f.id || dropTargetId === f.id,
+              'has-color': !!f.color
             }"
             :data-folder-id="f.id"
             :data-folder-path="f.path"
-            :style="{ paddingLeft: 8 + f.indent * 13 + 'px' }"
+            :style="folderRowStyle(f)"
             :draggable="renamingId !== f.id"
             @click="pickFolder(f)"
             @contextmenu="openMenu($event, f)"
@@ -808,7 +989,10 @@ onBeforeUnmount(() => {
                 <path d="M2.7 1.3L5.7 4l-3 2.7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
             </span>
-            <span v-html="folderIcon"></span>
+            <span class="folder-ico">
+              <span v-if="f.glyph.kind === 'emoji'" class="folder-emoji">{{ f.glyph.value }}</span>
+              <span v-else v-html="f.glyph.svg ?? folderIcon"></span>
+            </span>
             <input
               v-if="renamingId === f.id"
               :ref="setDraftInput"
@@ -937,6 +1121,25 @@ onBeforeUnmount(() => {
         @mousedown.stop
       >
         <div class="ctx-head">{{ menu.folder.path }}</div>
+        <!-- 外观放最上面：改图标是「看一眼就想调」的动作，比新建/重命名更常被找 -->
+        <button
+          class="ctx-item ctx-item--sub"
+          data-ctx="folder-appearance"
+          @mouseenter="openIconSub($event)"
+          @mouseleave="scheduleSubClose"
+          @focus="openIconSub()"
+          @click.stop="openIconSub($event)"
+        >
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M6.5 1.6a2.1 2.1 0 0 1 2.1 2.1c0 1-.7 1.6-1.3 2.1-.4.3-.8.6-.8 1.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+            <circle cx="6.5" cy="10.4" r="1" fill="currentColor" />
+            <path d="M1.7 6.5a4.8 4.8 0 1 1 9.6 0c0 1.5-1 2.3-2 2.3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
+          </svg>
+          图标与颜色
+          <svg class="ctx-arrow" viewBox="0 0 8 8" fill="none">
+            <path d="M3 1.6L5.4 4 3 6.4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </button>
         <button class="ctx-item" @click="startCreateChild">
           <svg viewBox="0 0 13 13" fill="none">
             <path d="M1.6 4.2h9.8v6.2H1.6z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
@@ -944,6 +1147,17 @@ onBeforeUnmount(() => {
             <path d="M6.5 6.2v3.2M4.9 7.8h3.2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" />
           </svg>
           新建子文件夹
+        </button>
+        <!-- 收起 / 展开：夹在「新建子文件夹」与「重命名」之间 -->
+        <button class="ctx-item" data-ctx="toggle-folder" @click="toggleMenuFolder">
+          <svg
+            viewBox="0 0 13 13"
+            fill="none"
+            :style="{ transform: lib.isCollapsed(menu.folder.path) ? 'rotate(-90deg)' : 'none' }"
+          >
+            <path d="M3 5l3.5 3.5L10 5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          {{ lib.isCollapsed(menu.folder.path) ? '展开文件夹' : '收起文件夹' }}
         </button>
         <button class="ctx-item" @click="startRename">
           <svg viewBox="0 0 13 13" fill="none">
@@ -958,6 +1172,97 @@ onBeforeUnmount(() => {
           </svg>
           删除文件夹
         </button>
+      </div>
+    </Teleport>
+
+    <!-- 文件夹外观二级面板：菜单项 hover 时在右侧展开（定位由 openIconSub 计算） -->
+    <Teleport to="body">
+      <div
+        v-if="iconPanel"
+        class="folder-appearance"
+        :style="{ left: panelPos.left + 'px', top: panelPos.top + 'px' }"
+        role="group"
+        aria-label="文件夹图标与颜色"
+        @mousedown.stop
+        @mouseenter="cancelSubClose"
+        @mouseleave="scheduleSubClose"
+        @contextmenu.prevent
+      >
+        <div class="fa-colors" role="listbox" aria-label="颜色">
+          <button
+            class="fa-swatch is-none"
+            :class="{ on: !iconPanel.color }"
+            type="button"
+            title="无颜色"
+            @click="setFolderColor(null)"
+          />
+          <button
+            v-for="c in FOLDER_COLORS"
+            :key="c.id"
+            class="fa-swatch"
+            :class="{ on: iconPanel.color === c.id }"
+            type="button"
+            :title="c.label"
+            :style="{ background: `var(--folder-tint-${c.id})` }"
+            @click="setFolderColor(c.id)"
+          />
+        </div>
+
+        <div class="fa-scroll">
+          <section v-for="g in FOLDER_EMOJI_GROUPS" :key="'e-' + g.id" class="fa-group">
+            <h4>{{ g.label }}</h4>
+            <div class="fa-grid">
+              <button
+                v-for="e in g.items"
+                :key="e"
+                class="fa-cell"
+                :class="{ on: iconPanel.glyph_kind === 'emoji' && iconPanel.icon === e }"
+                data-glyph="emoji"
+                type="button"
+                @click="setGlyph('emoji', e)"
+              >{{ e }}</button>
+            </div>
+          </section>
+
+          <section v-for="g in FOLDER_ICON_GROUPS" :key="'i-' + g.id" class="fa-group">
+            <h4>{{ g.label }}</h4>
+            <div class="fa-grid">
+              <button
+                v-for="it in g.items"
+                :key="it.key"
+                class="fa-cell"
+                :class="{ on: iconPanel.glyph_kind === 'icon' && iconPanel.icon === it.key }"
+                data-glyph="icon"
+                :data-key="it.key"
+                type="button"
+                :title="it.label"
+                v-html="it.svg"
+                @click="setGlyph('icon', it.key)"
+              ></button>
+            </div>
+          </section>
+        </div>
+
+        <div class="fa-foot">
+          <span class="fa-preview">
+            <span
+              class="fa-preview-glyph"
+              :style="iconPanel.color ? { '--folder-tint': folderTint(iconPanel.color) ?? '' } : {}"
+            >
+              <span v-if="iconPanel.glyph_kind === 'emoji' && iconPanel.icon" class="folder-emoji">{{ iconPanel.icon }}</span>
+              <span v-else v-html="folderIconFor(iconPanel)"></span>
+            </span>
+            <span class="fa-preview-name">{{ iconPanel.name }}</span>
+          </span>
+          <button
+            class="fa-clear"
+            type="button"
+            :disabled="!iconPanel.icon && !iconPanel.color"
+            @click="clearAppearance"
+          >
+            清除
+          </button>
+        </div>
       </div>
     </Teleport>
 

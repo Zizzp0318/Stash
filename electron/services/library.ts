@@ -901,7 +901,79 @@ export function ensureFolderRows(db: DB, parts: string[]): { id: number; path: s
   return { id: lastId, path: cur }
 }
 
-export function listFolders(): Array<{ id: number; parent_id: number | null; path: string; name: string }> {
+export function listFolders(): Array<{
+  id: number
+  parent_id: number | null
+  path: string
+  name: string
+  icon: string | null
+  glyph_kind: string | null
+  color: string | null
+}> {
   const { db } = requireCurrent()
-  return db.prepare('SELECT id, parent_id, path, name FROM folders ORDER BY path').all() as never
+  return db
+    .prepare('SELECT id, parent_id, path, name, icon, glyph_kind, color FROM folders ORDER BY path')
+    .all() as never
+}
+
+const FOLDER_GLYPH_KINDS = new Set(['emoji', 'icon'])
+/** 与渲染层 src/data/folderIcons.ts 的 FOLDER_COLORS 一一对应；存 ID 而不是 hex */
+const FOLDER_COLOR_IDS = new Set(['blue', 'indigo', 'purple', 'pink', 'orange', 'green', 'teal', 'red'])
+
+/**
+ * 设置文件夹外观（右键「图标与颜色」的二级面板）。
+ *
+ * 三个字段各管一件事：
+ *   · glyph_kind  'emoji' | 'icon' | null —— 决定用 emoji 还是线框图标；
+ *   · icon        具体值（emoji 字符 或 图标 key）；
+ *   · color       语义色 ID（blue/indigo/…），**不是 hex** —— 深浅主题各有一套色值，
+ *                 存 hex 就会在切主题后发灰。
+ *
+ * 只写索引，**不碰磁盘目录**：资源管理器里它仍是普通文件夹（库要能整包搬走）。
+ * 传 null 表示恢复该项默认；三项全空 = 回到最初的默认外观。
+ *
+ * 校验必须在服务层：glyphValue 会进渲染层的文本节点、colorId 会拼进 CSS 变量名，
+ * 脏值（`<img onerror>`、`red; background:`）不能指望调用方去挡。
+ */
+export function setFolderMeta(
+  id: number,
+  patch: { glyphKind?: string | null; glyphValue?: string | null; colorId?: string | null }
+): { id: number; glyphKind: string | null; glyphValue: string | null; colorId: string | null } {
+  const { db } = requireCurrent()
+  const row = db.prepare('SELECT icon, glyph_kind, color FROM folders WHERE id=?').get(id) as
+    | { icon: string | null; glyph_kind: string | null; color: string | null }
+    | undefined
+  if (!row) throw new Error('ERR_FOLDER_NOT_FOUND')
+
+  let glyphKind = row.glyph_kind
+  let glyphValue = row.icon
+  let colorId = row.color
+
+  if ('glyphKind' in patch) {
+    const v = patch.glyphKind ?? null
+    if (v !== null && !FOLDER_GLYPH_KINDS.has(v)) throw new Error('ERR_INVALID_GLYPH_KIND')
+    glyphKind = v
+  }
+  if ('glyphValue' in patch) {
+    const v = patch.glyphValue ?? null
+    if (v !== null && (v.length > 16 || /[<>"']/.test(v))) throw new Error('ERR_INVALID_GLYPH_VALUE')
+    glyphValue = v
+  }
+  if ('colorId' in patch) {
+    const v = patch.colorId ?? null
+    if (v !== null && !FOLDER_COLOR_IDS.has(v)) throw new Error('ERR_INVALID_COLOR')
+    colorId = v
+  }
+
+  // glyph 的两半必须同时存在或同时为空：只剩 kind 没有值 = 渲染层要回落，等于没设
+  if (glyphValue === null) glyphKind = null
+  if (glyphKind === null) glyphValue = null
+
+  db.prepare('UPDATE folders SET icon=?, glyph_kind=?, color=? WHERE id=?').run(
+    glyphValue,
+    glyphKind,
+    colorId,
+    id
+  )
+  return { id, glyphKind, glyphValue, colorId }
 }

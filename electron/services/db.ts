@@ -64,7 +64,12 @@ CREATE TABLE IF NOT EXISTS folders (
   parent_id INTEGER,
   path TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- 文件夹外观：glyph_kind='emoji'|'icon'，icon 列存具体值（emoji 字符或图标 key）；
+  -- color 列存语义色 ID（blue/indigo/...），不是 hex —— 深浅主题各自映射一套色值
+  icon TEXT,
+  glyph_kind TEXT,
+  color TEXT
 );
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -150,6 +155,8 @@ export function openDatabase(stashFile: string): DB {
   //    却能兜住「列被外部工具损坏 / 老版本残留」这类版本号看不出来的状态
   //    （`--smoke-edit` 的 S7 就是「删掉 note 列再开库，必须自动补回」这条契约）。
   ensureAdditiveColumns(db)
+  // 文件夹的图标/颜色：用户数据而非派生字段，单独补列（老库打开时幂等 ADD COLUMN）
+  ensureFolderColumns(db)
   // ② 版本阶梯迁移（**只在版本号偏小时跑**）：留给 ADD COLUMN 表达不了的破坏性变更。
   //    成功后把版本号回写到当前值；stored === 当前 → 什么都不写（正常路径）。
   if (stored < SCHEMA_VERSION) {
@@ -191,6 +198,18 @@ function ensureAdditiveColumns(db: DB): void {
   // 列清单由**派生字段注册表**派生（审计 §2.17）：新增派生字段只需改 `derived.ts`，
   // 别再手写这一串（漏一处就是「缓存命中的素材永远补不上字段」那类 B2 复发型 bug）。
   for (const { col, decl } of derivedAdditiveColumns()) ensureColumn(db, 'assets', col, decl)
+}
+
+/**
+ * `folders` 的图标/颜色列（可空，老版本软件读到也不认识、但无害）。
+ *
+ * 为什么不用 `ensureAdditiveColumns`：那个只覆盖 `assets` 的派生字段注册表，
+ * 这两列是**用户自己设的**数据，不属于任何派生规则，漏在注册表外面才对。
+ */
+function ensureFolderColumns(db: DB): void {
+  ensureColumn(db, 'folders', 'icon', 'TEXT')
+  ensureColumn(db, 'folders', 'glyph_kind', 'TEXT')
+  ensureColumn(db, 'folders', 'color', 'TEXT')
 }
 
 /**

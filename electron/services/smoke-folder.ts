@@ -439,6 +439,68 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
 
 
+    // H4 外观二级面板：展开、emoji/图标落库、颜色直染、清除
+    const jsT = async <T>(code: string): Promise<T | null> => (await js(code)) as T | null
+    /**
+     * 真实点击：`el.click()` 只派发 click，**不派发 mousedown**。
+     * 侧栏的全局 mousedown 会关菜单，而面板是 portal 到 body 的 ——
+     * 用 .click() 测不出「mousedown 先把面板卸掉」这类 bug，必须走完整序列。
+     */
+    const realClick = async (sel: string): Promise<boolean> =>
+      (await jsT<boolean>(`(() => {
+        const b = document.querySelector(${JSON.stringify(sel)})
+        if (!b) return false
+        b.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+        b.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+        b.click()
+        return true
+      })()`)) === true
+
+    R.h4_ctxMode = await openCtx('对照')
+    R.h4_opened = await clickMenuItem('图标与颜色')
+    await sleep(420)
+    R.h4_panel = await jsT<{ colors: number; groups: number; cells: number; scroll: boolean }>(`(() => {
+      const p = document.querySelector('.folder-appearance')
+      if (!p) return null
+      return {
+        colors: p.querySelectorAll('.fa-swatch').length,
+        groups: p.querySelectorAll('.fa-group').length,
+        cells: p.querySelectorAll('.fa-cell').length,
+        scroll: !!p.querySelector('.fa-scroll')
+      }
+    })()`)
+    // 第一个 emoji
+    R.h4_emojiClicked = await realClick('[data-glyph="emoji"]')
+    await sleep(450)
+    R.h4_afterEmoji = {
+      db: D().prepare("SELECT icon, glyph_kind, color FROM folders WHERE path='对照'").get() ?? null
+    }
+    // 第一个图标（folder）
+    R.h4_iconClicked = await realClick('[data-glyph="icon"]')
+    await sleep(450)
+    R.h4_afterIcon = {
+      db: D().prepare("SELECT icon, glyph_kind, color FROM folders WHERE path='对照'").get() ?? null,
+      activeCells: await jsT<number>(`document.querySelectorAll('.fa-cell.on').length`)
+    }
+    // 第 2 个色块 = blue（第 1 个是「无颜色」）
+    R.h4_colorClicked = await realClick('.fa-swatch:nth-child(2)')
+    await sleep(450)
+    R.h4_afterColor = {
+      db: D().prepare("SELECT icon, glyph_kind, color FROM folders WHERE path='对照'").get() ?? null,
+      hasColorClass: await jsT<boolean>(`!!document.querySelector('.side-item[data-folder-path="对照"]')?.classList.contains('has-color')`),
+      // 直染的实证：图标容器的 computed color 必须已经变成 blue 的值，而不是只有个 class
+      tintColor: await jsT<string>(`(() => {
+        const el = document.querySelector('.side-item[data-folder-path="对照"] .folder-ico')
+        return el ? getComputedStyle(el).color : ''
+      })()`)
+    }
+    await capture('shot-folder-icon.png')
+    // 清除：字形与颜色一起回默认
+    R.h4_clearClicked = await realClick('.fa-clear')
+    await sleep(450)
+    R.h4_afterClear = D().prepare("SELECT icon, glyph_kind, color FROM folders WHERE path='对照'").get() ?? null
+
+
     // ==================== I. 侧栏文件夹折叠 ====================
     step('I')
     // 造出「对照/树A/树B」三级，折叠才有意义；再建一个拖拽落点「对照/目标」
@@ -2069,6 +2131,23 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
     }
     const h3modal = R.h3_modal as { title: string; body: string } | null
     const h3ctx = R.h3_ctxMode as string
+    const h4p = R.h4_panel as { colors: number; groups: number; cells: number; scroll: boolean } | null
+    const h4e = R.h4_afterEmoji as
+      | { db: { icon: string | null; glyph_kind: string | null; color: string | null } | null }
+      | undefined
+    const h4i = R.h4_afterIcon as
+      | { db: { icon: string | null; glyph_kind: string | null; color: string | null } | null; activeCells: number }
+      | undefined
+    const h4c = R.h4_afterColor as
+      | {
+          db: { icon: string | null; glyph_kind: string | null; color: string | null } | null
+          hasColorClass: boolean
+          tintColor: string
+        }
+      | undefined
+    const h4cl = R.h4_afterClear as
+      | { icon: string | null; glyph_kind: string | null; color: string | null }
+      | null
     const h2pre = R.h2_prefilled as string | null
 
     const iCollapse = R.i_afterCollapse as { rows: string[]; foldedClass: boolean; saved: string[] }
@@ -2301,11 +2380,18 @@ export async function runSmokeFolder(win: BrowserWindow): Promise<void> {
         g.thumbsBeforeDelete === 4 && g.thumbsLeft === 0,
       // 且清掉的正是挂在被删素材上的那个标签
       deleteFolderPrunesTag: (g?.prunedTags ?? []).join('|') === '冒烟标签',
-      // H UI：菜单 / 新建子级 / 重命名 / 删除
+      // H UI：菜单 / 新建子级 / 收起展开 / 重命名 / 图标 / 删除
       uiMenu: R.h1_menuItems !== null &&
-        (R.h1_menuItems as string[]).join('|') === '新建子文件夹|重命名|删除文件夹',
-      uiCreateChild: h1?.onDiskAfter === true && h1.dbPaths.includes('对照/sub-a') && h1.rowsAfter.includes('对照/sub-a'),
-      uiRenamePrefilled: h2pre === 'sub-a',
+        (R.h1_menuItems as string[]).join('|') === '图标与颜色|新建子文件夹|收起文件夹|重命名|删除文件夹',
+      // 外观面板：9 个色块（无颜色 + 8 色）、20 个分组（11 emoji + 9 图标）、可滚动
+      uiAppearancePanel: !!h4p && h4p.colors === 9 && h4p.groups >= 18 && h4p.cells > 200 && h4p.scroll === true,
+      uiEmojiApplied: h4e?.db?.glyph_kind === 'emoji' && !!h4e?.db?.icon,
+      uiIconApplied: h4i?.db?.glyph_kind === 'icon' && h4i?.db?.icon === 'folder' && h4i?.activeCells === 1,
+      uiColorApplied: h4c?.db?.color === 'blue' && h4c?.hasColorClass === true &&
+        h4c?.tintColor === 'rgb(110, 168, 220)',
+      uiClearWorks: h4c?.db?.color === 'blue' &&
+        h4cl !== null && h4cl.icon === null && h4cl.glyph_kind === null && h4cl.color === null,
+      uiCreateChild: h1?.onDiskAfter === true && h1.dbPaths.includes('对照/sub-a') && h1.rowsAfter.includes('对照/sub-a'),      uiRenamePrefilled: h2pre === 'sub-a',
       uiRename: h2?.oldGone === true && h2.newOnDisk === true &&
         h2.dbPaths.includes('对照/sub-b') && !h2.dbPaths.includes('对照/sub-a') && h2.rowsAfter.includes('对照/sub-b'),
       uiDeleteConfirm: !!h3modal && /没有回收站/.test(h3modal.body),

@@ -67,7 +67,32 @@ export interface StashFolderApi {
   move: (id: number, targetParentId: number | null) => Promise<{ ok: boolean; data?: { id: number; path: string; name: string; renamed: boolean; folders: number; assets: number }; error?: string }>
   /** 删除整个文件夹：直接从磁盘删除，不可恢复（无回收站）。`pruned` = 连带失去全部素材的标签 */
   remove: (id: number) => Promise<{ ok: boolean; data?: { folders: number; assets: number; thumbsRemoved: number; pruned: StashPrunedTag[] }; error?: string }>
-  list: () => Promise<{ ok: boolean; data?: Array<{ id: number; parent_id: number | null; path: string; name: string }>; error?: string }>
+  list: () => Promise<{
+    ok: boolean
+    data?: Array<{
+      id: number
+      parent_id: number | null
+      path: string
+      name: string
+      icon: string | null
+      glyph_kind: string | null
+      color: string | null
+    }>
+    error?: string
+  }>
+  /**
+   * 设置文件夹外观：`glyphKind` = emoji | icon，`glyphValue` = emoji 字符或图标 key，
+   * `colorId` = 语义色 ID（blue/indigo/…）。传 null 恢复默认。
+   * 只改软件内的显示，磁盘目录不动。
+   */
+  setMeta: (
+    id: number,
+    patch: { glyphKind?: string | null; glyphValue?: string | null; colorId?: string | null }
+  ) => Promise<{
+    ok: boolean
+    data?: { id: number; glyphKind: string | null; glyphValue: string | null; colorId: string | null }
+    error?: string
+  }>
 }
 
 export interface StashImportApi {
@@ -207,6 +232,18 @@ export interface StashAssetApi {
     data?: { copied: number; renamed: number; failed: StashBulkFail[] }
     error?: string
   }>
+  /**
+   * 导出**副本**到用户选的目录（右键「导出到…」，支持框选批量）。
+   * `data` 为 `null` = 用户在目录对话框里取消了 —— 不要弹任何提示。
+   * 重名自动改成 `名字 (1).ext`，不覆盖目标目录里的已有文件。
+   */
+  exportTo: (ids: number[]) => Promise<{
+    ok: boolean
+    data?: { exported: number; renamed: number; failed: Array<{ name: string; error: string }>; dir: string } | null
+    error?: string
+  }>
+  /** 导出进度（每处理一个文件发一次） */
+  onExportProgress: (cb: (d: unknown) => void) => () => void
   /** 粘贴剪贴板里的文件：库内的生成副本，库外的走导入管线（进度复用 import 事件） */
   paste: (paths: string[], folderId?: number | null) => Promise<{
     ok: boolean

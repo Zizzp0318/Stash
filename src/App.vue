@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { onMounted, onBeforeUnmount, ref, watch, computed } from 'vue'
 import TitleBar from './components/TitleBar.vue'
 import SideBar from './components/SideBar.vue'
 import ColumnResizer from './components/ColumnResizer.vue'
@@ -8,7 +8,7 @@ import DetailPanel from './components/DetailPanel.vue'
 import Welcome from './components/Welcome.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import ThumbProgress from './components/ThumbProgress.vue'
-import BootLoader from './components/BootLoader.vue'
+import BootOverlay from './components/BootOverlay.vue'
 import { useLibraryStore } from './stores/library'
 import { useAssetStore } from './stores/assets'
 import { useSettingsStore } from './stores/settings'
@@ -46,48 +46,47 @@ function onSystemThemeChange(): void {
  */
 const thumbProgress = ref<{ done: number; total: number } | null>(null)
 
-// ==================== 开库骨架屏（2026-11）====================
-//
-// 数据源是 `lib.booting` / `lib.bootStage`（见 stores/library.ts 的说明）。这里只负责**时序**：
-//   · 100ms 内就好的开库**什么都不显示**（本机 5.5ms，热开库更短）——闪一下骨架纯属噪音；
-//   · 超过 100ms 才亮骨架；超过 `bootStuckAfterMs`（默认 8s）给「先浏览」出口；
-//   · 首屏数据到位后由 `markBootPainted()` 收尾（等两帧，保证内容真的画出来）。
-//
-// ⚠️ 别把阈值改成 0：那等于每次切库都闪一下骨架，比没有更烦。
-const BOOT_SHOW_DELAY_MS = 100
-const bootVisible = ref(false)
-const bootStuck = ref(false)
-let bootShowTimer: ReturnType<typeof setTimeout> | null = null
-let bootStuckTimer: ReturnType<typeof setTimeout> | null = null
+/**
+ * 导入与导出共用同一块进度浮层。
+ * 同一时刻不可能两者都跑（导出是菜单里的显式动作，导入来自拖入/粘贴），所以取 `??` 就够。
+ */
+const busyProgress = computed(() => assets.exporting ?? assets.importing)
+const busyTitle = computed(() => (assets.exporting ? '正在导出素材…' : '正在导入素材…'))
 
-function clearBootTimers(): void {
+// ==================== 开库全屏加载层（2026-11 第三版）====================
+//
+// 数据源是 `lib.booting`；这里只负责**时序**：
+//   · 200ms 内就好的开库**什么都不显示**（完整切库含首屏刷新实测 ~110ms，闪一下反而像卡了）；
+//   · 超过 200ms 才亮全屏层，一直盖到 `markBootPainted()`（首屏数据到位 + 两帧绘制）。
+//
+// 为什么从「只盖中栏」改成「全屏」：切进大库时主进程会同步扫全库，几十秒内 IPC 全断，
+// 而左右栏还挂着上一个库的文件夹与标签 —— 只盖中栏会让人以为已经好了，伸手一点没反应。
+// 全屏盖住是更诚实的反馈；窗口仍可拖动（见 BootOverlay 的 -webkit-app-region）。
+//
+// ⚠️ 别把阈值改成 0：那等于每次切库都闪一下，比没有更烦。
+const BOOT_SHOW_DELAY_MS = 200
+const bootVisible = ref(false)
+let bootShowTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearBootTimer(): void {
   if (bootShowTimer !== null) {
     clearTimeout(bootShowTimer)
     bootShowTimer = null
-  }
-  if (bootStuckTimer !== null) {
-    clearTimeout(bootStuckTimer)
-    bootStuckTimer = null
   }
 }
 
 watch(
   () => lib.booting,
   (on) => {
-    clearBootTimers()
+    clearBootTimer()
     if (!on) {
       bootVisible.value = false
-      bootStuck.value = false
       return
     }
     bootShowTimer = setTimeout(() => {
       bootShowTimer = null
       bootVisible.value = true
     }, BOOT_SHOW_DELAY_MS)
-    bootStuckTimer = setTimeout(() => {
-      bootStuckTimer = null
-      bootStuck.value = true
-    }, lib.bootStuckAfterMs)
   }
 )
 
@@ -227,6 +226,16 @@ onMounted(async () => {
     await assets.reloadDetail()
   })
 
+  // 导出进度：发起方（GalleryGrid）已把 exporting 置了初值，这里只负责推进
+  window.stash.asset.onExportProgress((d) => {
+    if (!assets.exporting) return
+    const p = d as { done?: unknown; total?: unknown } | null
+    const done = Number(p?.done)
+    const total = Number(p?.total)
+    if (!Number.isFinite(done) || !Number.isFinite(total)) return
+    assets.exporting = { done, total }
+  })
+
   // 导入进度事件（全局一份）
   window.stash.import.onProgress((d) => {
     assets.importing = { done: d.done, total: d.total }
@@ -288,31 +297,25 @@ onBeforeUnmount(() => {
       -->
       <ColumnResizer />
       <!--
-        中栏包装层：只为给开库加载浮层提供定位锚点（`.gallery-wrap` 相对定位、`.gallery` 仍占满）。
-        ⚠️ 不要把浮层挂到 `.body` 上——那会盖住左右栏与标题栏（第二版明确要求「只虚化预览窗口」）。
+        中栏包装层：只为给网格一个独立的定位 / 溢出上下文（`.gallery-wrap` 相对定位、`.gallery` 仍占满）。
+        开库加载层已改为全屏 fixed，不再挂在这里。
       -->
       <div class="gallery-wrap">
         <GalleryGrid />
-        <BootLoader
-          v-if="bootVisible && lib.booting"
-          :stage="lib.bootStage"
-          :thumb="thumbProgress"
-          :stuck="bootStuck"
-          @skip="lib.endBoot()"
-        />
       </div>
       <!-- 收纳状态由标题栏右上角的按钮控制（见 TitleBar 的 .wc-btn）。
            收起后整个面板不渲染，点素材也不会把它带回来 —— 状态是显式的，不派生自「有没有选中」 -->
       <DetailPanel v-if="!assets.detailCollapsed" />
     </div>
     <!-- 导入进度浮层 -->
-    <div v-if="assets.importing" class="import-overlay">
+    <!-- 导入 / 导出进度浮层：样式共用，文案由 busyTitle 决定（导出优先） -->
+    <div v-if="busyProgress" class="import-overlay">
       <div class="import-box">
-        <div class="import-title">正在导入素材…</div>
+        <div class="import-title">{{ busyTitle }}</div>
         <div class="import-bar">
-          <div class="import-fill" :style="{ width: (assets.importing.total ? (assets.importing.done / assets.importing.total) * 100 : 0) + '%' }"></div>
+          <div class="import-fill" :style="{ width: (busyProgress.total ? (busyProgress.done / busyProgress.total) * 100 : 0) + '%' }"></div>
         </div>
-        <div class="import-meta">{{ assets.importing.done }} / {{ assets.importing.total }}</div>
+        <div class="import-meta">{{ busyProgress.done }} / {{ busyProgress.total }}</div>
       </div>
     </div>
     <!-- 轻提示条（导入结果 / 批量操作回执）实际渲染在 GalleryGrid 的工具栏标题行里，
@@ -321,4 +324,11 @@ onBeforeUnmount(() => {
     <!-- 设置面板：全局单例，只渲染已实现的分组；入口在侧栏底部 -->
     <SettingsPanel v-if="settings.panelOpen" />
   </div>
+
+  <!--
+    开库全屏加载层：与 Welcome / 主界面平级，`position: fixed` 覆盖整窗。
+    放在两个分支之外，所以「欢迎页点库」和「库内切库」走的是同一条渲染路径 ——
+    这正是上一版盖不住卡顿的原因（当时它藏在 `v-else` 里，没库时根本不在 DOM）。
+  -->
+  <BootOverlay v-if="bootVisible && lib.booting" />
 </template>

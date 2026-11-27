@@ -505,7 +505,9 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
             position: getComputedStyle(t).position,
             toastCenterX: Math.round(tr.left + tr.width / 2),
             headCenterX: Math.round(hr.left + hr.width / 2),
-            chipsShown, chipsHidden
+            chipsShown, chipsHidden,
+            // 批量条的半透明度：color-mix 的结果在 Chromium 里带 alpha，测一下才敢说「真的透了」
+            batchBg: getComputedStyle(b).backgroundColor
           })
         })()`)) as string | null) ?? '{}'
       )
@@ -589,6 +591,7 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
       toast: { l: number; t: number; r: number; b: number; w: number; h: number }
       head: { l: number; t: number; r: number; b: number; w: number; h: number }
       batch: { l: number; t: number; r: number; b: number; w: number; h: number }
+      batchBg: string
       text: string
       position: string
       toastCenterX: number
@@ -645,6 +648,8 @@ export async function runSmokeM4(win: BrowserWindow): Promise<void> {
           h13.batch.t < h13.toast.b
         ),
       // ② 落点在工具栏标题行内（上下各留 6px 容差：提示条比行本身高一点是正常的）
+      // 批量条的底色必须是半透明（color-mix 算出来的 alpha 0.78），否则等于没改
+      batchbarTranslucent: /0\.78/.test(h13?.batchBg ?? ''),
       noticeSitsInToolbarRow:
         h13?.position === 'absolute' &&
         h13.toast.t >= h13.head.t - 6 &&

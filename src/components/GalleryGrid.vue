@@ -1422,6 +1422,42 @@ async function menuCopy(): Promise<void> {
   await assets.copySelection(ids)
 }
 
+/**
+ * 导出选中的素材**副本**到用户选的目录。框选 / Ctrl 多选后右键即可批量导出。
+ *
+ * 目录对话框由主进程弹（渲染层拿不到系统对话框）；用户取消时 `data === null`，
+ * 这里**不提示** —— 主动取消不该被通知一次“导出 0 个”。
+ *
+ * 进度走 `export:progress` 事件（App 的浮层读 `assets.exporting`）。
+ * 无论成败都要在 finally 里把它清掉，否则浮层会一直挂在那儿。
+ */
+async function menuExport(): Promise<void> {
+  const ids = assets.selectedIds.slice()
+  closeMenu()
+  if (!ids.length) return
+
+  assets.exporting = { done: 0, total: ids.length }
+  try {
+    const r = await window.stash.asset.exportTo(ids)
+    if (!r.ok) {
+      assets.notify('error', `导出失败：${r.error ?? '未知错误'}`)
+      return
+    }
+    const d = r.data
+    if (!d) return // 用户取消了目录选择
+
+    const renamed = d.renamed ? `，${d.renamed} 个因重名已改名` : ''
+    const failed = d.failed.length ? `，${d.failed.length} 个失败` : ''
+    if (d.exported === 0 && d.failed.length > 0) {
+      assets.notify('error', `导出失败：${d.failed.length} 个文件都没能复制`)
+      return
+    }
+    assets.notify('info', `已导出 ${d.exported} 个文件${renamed}${failed}`)
+  } finally {
+    assets.exporting = null
+  }
+}
+
 async function menuPaste(): Promise<void> {
   const target = assets.query.folderId
   closeMenu()
@@ -2436,6 +2472,14 @@ function uninstallVsDebug(): void {
             <path d="M1.6 4.2V2.6h3.1l1.1 1.6" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round" />
           </svg>
           移动到…
+        </button>
+
+        <button class="ctx-item" data-ctx="export" @click="menuExport">
+          <svg viewBox="0 0 13 13" fill="none">
+            <path d="M6.5 1.8v6.4M4.1 5.9l2.4 2.4 2.4-2.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M2.2 9.4v1.2a1.2 1.2 0 0 0 1.2 1.2h6.2a1.2 1.2 0 0 0 1.2-1.2V9.4" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          导出到…
         </button>
 
         <template v-if="!menuConfirm">
