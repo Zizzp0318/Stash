@@ -93,11 +93,11 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const aOpenMs = Date.now() - aT0
     const aState = await js<Record<string, unknown>>('window.__assetsState ? window.__assetsState() : null')
     result.fast = { openMs: aOpenMs, result: aRes, state: aState }
-    // 轮询 1.6s：骨架应当出现，并且在 窗口(700) + 淡出(420) 之后才消失
+    // 轮询 3s：骨架要等「窗口(700) + 探针(3 次 × 250ms) + 淡出(420)」，1.6s 不够
     let fastSawSkeleton = false
     let fastGoneAt = -1
     const trace: Array<Record<string, unknown>> = []
-    for (let i = 0; i < 64; i++) {
+    for (let i = 0; i < 120; i++) {
       const snap = await js<{ layer: boolean; boot: unknown; assets: unknown }>(
         "({ layer: !!document.querySelector('[data-boot-layer]'), boot: window.__bootState ? window.__bootState() : null, assets: window.__assetsState ? window.__assetsState() : null })"
       )
@@ -275,6 +275,47 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
       typeof cardCount === 'number' && cardCount > 0 && cardCount <= 120,
       String(cardCount)
     )
+
+    // ==================== E. 主进程繁忙 → 骨架必须继续盖着 ====================
+    /*
+     * 探针的语义：骨架的退出条件是「能操作」，不是「数据到了」。
+     * 这里给 sys:ping 注入 250ms 延迟（> 60ms 阈值）模拟「主进程正忙」：
+     * 窗口设成 300ms —— 只看窗口的话 1 秒内就该撤，骨架必须仍然在。
+     * 然后恢复延迟，确认它能正常撤掉（否则「不撤」只是卡死，不是探针生效）。
+     */
+    // 先等上一轮骨架彻底收完：否则上一轮的排期 timer 会在这段里到点，把新骨架一起带走
+    const idleBeforeBusy = await waitTrue("!!(window.__bootState && window.__bootState().booting === false)", 8000, 50)
+    result.idleBeforeBusy = idleBeforeBusy
+    await js('window.__testBootMin(300)')
+    // 探针在冒烟里默认关闭（否则每个套件都被 750ms 拖慢），这里显式打开来验证它
+    await js('window.__testProbeEnabled(true)')
+    await js('window.stash.sys.testPingDelay(250)')
+    // 诊断：延迟到底生效没有（RTT 应该 > 200ms，这正是探针要拦住的状态）
+    const busyRtt = await js<number>(
+      `(async () => { const t0 = performance.now(); await window.stash.sys.ping(); return Math.round(performance.now() - t0) })()`
+    )
+    result.busyRtt = busyRtt
+    await js(`(() => {
+      window.__busyOpenRes = 'pending'
+      window.__stashSwitchLibrary(${JSON.stringify(fastLib.path)}).then(
+        () => { window.__busyOpenRes = 'ok' },
+        (e) => { window.__busyOpenRes = 'ERR ' + String(e && e.message || e) }
+      )
+      return 'started'
+    })()`)
+    await sleep(1600)
+    const heldWhileBusy = await js<boolean>("!!document.querySelector('[data-boot-layer]')")
+    result.busyHeld = heldWhileBusy
+    check(
+      'E 主进程繁忙时骨架不撤（RTT 探针生效；窗口只有 300ms）',
+      heldWhileBusy === true,
+      String(heldWhileBusy)
+    )
+
+    await js('window.stash.sys.testPingDelay(0)')
+    const goneAfterRecover = await waitTrue("!document.querySelector('[data-boot-layer]')", 8000, 50)
+    result.busyGoneAfter = goneAfterRecover
+    check('E 主进程恢复后骨架正常撤掉（不是卡死）', goneAfterRecover >= 0, `goneAfter=${goneAfterRecover}ms`)
 
     result.checks = checks
     result.failed = checks.filter((c) => !c.pass)

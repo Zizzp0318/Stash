@@ -26,7 +26,7 @@ const lib = useLibraryStore()
 const emit = defineEmits<{ (e: 'skip'): void }>()
 
 /** 固定窗口时长（App 传 lib.bootMinMs）。0/未传时按 9 秒算 */
-const props = defineProps<{ minMs?: number }>()
+const props = defineProps<{ minMs?: number; pending?: number }>()
 
 /** 主标题固定：换库/开库对用户是同一件事 */
 const TITLE = '正在打开素材库'
@@ -49,6 +49,19 @@ const elapsed = ref(0)
 
 /** 超过 `bootStuckAfterMs` 才说「慢」——测试缝会把它调小，生产恒 8s */
 const slow = computed(() => elapsed.value * 1000 >= lib.bootStuckAfterMs)
+
+/**
+ * 副标题：前 5 秒走阶段文案（连接索引 → 读取索引），之后若还有缩略图欠账，
+ * 就换成「还剩 N 张」—— 让「为什么还没好」变得可解释，而不是一直转圈。
+ *
+ * ⚠️ 必须定义在 `caption` / `elapsed` 之后：setup 是顺序执行，提前引用会踩 TDZ。
+ */
+const subText = computed(() => {
+  if (elapsed.value >= 5 && props.pending && props.pending > 0) {
+    return `正在整理缩略图（还剩 ${props.pending.toLocaleString()} 张）`
+  }
+  return caption.value
+})
 
 let raf = 0
 let t0 = 0
@@ -106,7 +119,7 @@ onBeforeUnmount(() => {
         <div class="boot-orb" aria-hidden="true"></div>
         <div class="boot-titles">
           <div class="boot-title" data-boot-label>{{ TITLE }}</div>
-          <div class="boot-sub">{{ caption }}</div>
+          <div class="boot-sub">{{ subText }}</div>
         </div>
       </div>
 

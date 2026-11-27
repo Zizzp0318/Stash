@@ -81,7 +81,17 @@ contextBridge.exposeInMainWorld('stash', {
     ensureBatch: (ids: number[], size: 'grid' | 'detail') => ipcRenderer.invoke('thumb:ensure-batch', { ids, size }),
     backfill: (size: 'grid' | 'detail') => ipcRenderer.invoke('thumb:backfill', { size }),
     onProgress: (cb: (d: unknown) => void) => subscribe('thumb:progress', cb),
-    onDone: (cb: (d: unknown) => void) => subscribe('thumb:done', cb)
+    onDone: (cb: (d: unknown) => void) => subscribe('thumb:done', cb),
+    /** 队列水位（骨架副标题用）：还剩多少张在排队 */
+    pumpState: () => ipcRenderer.invoke('thumb:pump')
+  },
+  /**
+   * 系统探针：`ping` 是空操作往返，骨架用它的延迟判断「主进程现在卡不卡」。
+   * `testPingDelay` 只在冒烟模式有效（主进程仅在 --smoke-* 时注册该 channel）。
+   */
+  sys: {
+    ping: () => ipcRenderer.invoke('sys:ping'),
+    testPingDelay: (ms: number) => ipcRenderer.invoke('sys:__test-ping-delay', ms)
   },
   asset: {
     list: (q?: unknown) => ipcRenderer.invoke('asset:list', q),

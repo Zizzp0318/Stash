@@ -65,9 +65,24 @@ const busyTitle = computed(() => (assets.exporting ? '正在导出素材…' : '
 // 触发范围：**有库才播**。欢迎页 / 从没打开过库时 `booting` 根本不会置位，天然不触发。
 /** 离场淡出时长，必须与 BootOverlay 的 `.boot-overlay` transition 保持一致 */
 const BOOT_FADE_MS = 420
+/**
+ * 「能操作了吗」的判定参数。
+ *
+ * 为什么不能只看数据到没到：开库返回 ≠ 库就绪。之后还有 watcher 遍历全库建监听、
+ * 索引字段补全、全表计数，这些都在主进程里跑同步 IO。数据到了但主进程还在排队时，
+ * 用户点一下就是「没反应」—— 骨架必须等到这里也过了才能撤。
+ */
+const BOOT_RTT_OK_MS = 60
+const BOOT_RTT_STREAK = 3
+const BOOT_FRAME_P95_MS = 40
+const BOOT_PROBE_INTERVAL_MS = 250
+/** 硬上限：回填可能要几分钟，不能为了等「完全不卡」把人锁死在骨架上 */
+const BOOT_MAX_VISIBLE_MS = 30000
 
 const bootVisible = ref(false)
 const bootFading = ref(false)
+/** 缩略图队列水位（骨架副标题用，不参与收尾判定） */
+const thumbPending = ref(0)
 let bootFinishTimer: ReturnType<typeof setTimeout> | null = null
 /** 骨架**真正可见**的时刻（9 秒窗口从这里算，不是从「开始开库」算） */
 let bootShownAt = 0
@@ -98,6 +113,117 @@ function skipBoot(): void {
   beginBootFade()
 }
 
+// ==================== 探针：现在点得动吗 ====================
+
+/*
+ * 帧间隔探针：只在前台有效。
+ * 窗口最小化/后台时 Chromium 会冻结 rAF，gap 会异常大 —— 那不是「卡」，必须排除，
+ * 否则用户切走再切回来会永远等不到判定通过。
+ */
+const frameGaps: number[] = []
+let frameProbeRaf = 0
+let frameProbeOn = false
+let lastFrameAt = 0
+let lastGapAt = 0
+
+function startFrameProbe(): void {
+  if (frameProbeOn) return
+  frameProbeOn = true
+  frameGaps.length = 0
+  lastFrameAt = performance.now()
+  lastGapAt = performance.now()
+  const tick = (now: number): void => {
+    if (!frameProbeOn) return
+    const gap = now - lastFrameAt
+    lastFrameAt = now
+    if (gap > 0 && gap < 500) {
+      frameGaps.push(gap)
+      if (frameGaps.length > 30) frameGaps.shift()
+      lastGapAt = now
+    }
+    frameProbeRaf = requestAnimationFrame(tick)
+  }
+  frameProbeRaf = requestAnimationFrame(tick)
+}
+
+function stopFrameProbe(): void {
+  frameProbeOn = false
+  if (frameProbeRaf) cancelAnimationFrame(frameProbeRaf)
+  frameProbeRaf = 0
+  frameGaps.length = 0
+}
+
+function frameGapsOk(): boolean {
+  // 1 秒内没有新帧 = 窗口在后台，rAF 被冻结 → 这一项没有判断力，直接放行
+  if (performance.now() - lastGapAt > 1000) return true
+  if (frameGaps.length < 10) return true
+  const sorted = [...frameGaps].sort((a, b) => a - b)
+  return (sorted[Math.floor(sorted.length * 0.95)] ?? 0) <= BOOT_FRAME_P95_MS
+}
+
+/**
+ * 探针开关：**冒烟默认关闭**。
+ *
+ * 探针一轮要 3 次 IPC（约 750ms），套件里每次开库都多等这么久，
+ * 后面的操作会全撞在骨架上（实测 edit 从 130 掉到 109）。
+ * smoke-boot 的 E 段用 `__testProbeEnabled(true)` 显式打开，专门验证探针本身。
+ */
+let probeEnabled = !window.stash.isSmoke
+;(window as unknown as Record<string, unknown>).__testProbeEnabled = (on: boolean): boolean => {
+  probeEnabled = on !== false
+  return probeEnabled
+}
+
+/**
+ * 等到「主进程和界面都不卡」为止。
+ *
+ * 主判据是**空操作 IPC 的往返延迟**：它同时覆盖了两种卡 ——
+ * 主进程排队（回填/扫描/全表计数）会让 RTT 飙升，渲染层主线程被占住时
+ * await 的回调同样排不上，RTT 一样高。帧间隔只是补充（识别「主进程空闲但界面掉帧」）。
+ */
+async function waitMainResponsive(deadline: number): Promise<void> {
+  if (!probeEnabled) return
+  let streak = 0
+  while (performance.now() < deadline) {
+    const t0 = performance.now()
+    let rtt = Number.POSITIVE_INFINITY
+    try {
+      await window.stash.sys.ping()
+      rtt = performance.now() - t0
+    } catch {
+      rtt = Number.POSITIVE_INFINITY
+    }
+    streak = rtt <= BOOT_RTT_OK_MS ? streak + 1 : 0
+    if (streak >= BOOT_RTT_STREAK && frameGapsOk()) return
+    await new Promise<void>((r) => setTimeout(r, BOOT_PROBE_INTERVAL_MS))
+  }
+}
+
+// 队列水位轮询（只为文案）：1 秒一次，骨架不在时不起
+let thumbPollTimer: ReturnType<typeof setInterval> | null = null
+function startThumbPoll(): void {
+  if (thumbPollTimer) return
+  const poll = (): void => {
+    void window.stash.thumb
+      .pumpState()
+      .then((r) => {
+        if (r?.data) thumbPending.value = r.data.queued
+      })
+      .catch(() => {
+        /* 没库 / 通道异常：文案退回阶段文案即可 */
+      })
+  }
+  poll()
+  thumbPollTimer = setInterval(poll, 1000)
+}
+function stopThumbPoll(): void {
+  if (thumbPollTimer) {
+    clearInterval(thumbPollTimer)
+    thumbPollTimer = null
+  }
+  thumbPending.value = 0
+}
+
 watch(
   () => lib.booting,
   (on) => {
@@ -105,6 +231,8 @@ watch(
     if (!on) {
       bootVisible.value = false
       bootFading.value = false
+      stopFrameProbe()
+      stopThumbPoll()
       return
     }
     bootFading.value = false
@@ -120,19 +248,27 @@ watch(
      */
     bootVisible.value = true
     bootShownAt = performance.now()
+    startFrameProbe()
+    startThumbPoll()
   }
 )
 
-/** 首屏画完 → 等满固定窗口 → 淡出 */
+/**
+ * 首屏数据到了 ≠ 能操作了。
+ *
+ * 收尾要过三道关：
+ *   ① 首屏可见图 decode 完（揭开时不是一排空占位）
+ *   ② 主进程 / 界面不再排队（`waitMainResponsive`，最多到 30 秒）
+ *   ③ 已展示满固定窗口（生产 9 秒）
+ * 三条都满足才淡出。慢库会因此多停几秒，但那几秒是在真的整理，
+ * 而不是「骨架撤了、界面点不动」。
+ */
 function markBootPainted(): void {
-  /*
-   * ⚠️ 这里**不能**因为「骨架还没亮」就 endBoot。
-   * 切库有 200ms 阈值，而数据常常 30ms 就绪 —— 以前那个分支会在这里直接收尾，
-   * 结果是「固定窗口还没开始就已经结束」，骨架一次都看不到。
-   * 固定窗口的语义是「到点才走」，所以这里只负责排期，不再管可见性。
-   */
-  void waitFirstThumbs(6, 1200).then(() => {
-    // 数据再快也展示满窗口；慢库则 remain<=0，立刻淡出
+  void (async () => {
+    await waitFirstThumbs(6, 1200)
+    if (!lib.booting || bootFading.value) return
+    await waitMainResponsive(bootShownAt + BOOT_MAX_VISIBLE_MS)
+    if (!lib.booting || bootFading.value) return
     const remain = lib.bootMinMs - (performance.now() - bootShownAt)
     if (remain > 0) {
       bootFinishTimer = setTimeout(() => {
@@ -142,7 +278,7 @@ function markBootPainted(): void {
     } else {
       beginBootFade()
     }
-  })
+  })()
 }
 
 /** 首屏卡片里的图至少 ready `min` 张，或超过 `maxMs` 就返回 */
@@ -402,6 +538,7 @@ onBeforeUnmount(() => {
     v-if="bootVisible && lib.booting"
     :class="{ 'is-leaving': bootFading }"
     :min-ms="lib.bootMinMs"
+    :pending="thumbPending"
     @skip="skipBoot"
   />
 </template>

@@ -35,7 +35,7 @@ import { runSmokeWatch } from './services/smoke-watch'
 import { runSmokeVScroll } from './services/smoke-vscroll'
 import { runSmokeUsage } from './services/smoke-usage'
 import { runSmokeBoot } from './services/smoke-boot'
-import { ensureThumb, ensureBatch, retestLegacyDims, migratePlaceholderThumbs, pausePumpAsync, resumePump, invalidateGridPresence, SIZES, type ThumbSize } from './services/thumbs'
+import { ensureThumb, ensureBatch, retestLegacyDims, migratePlaceholderThumbs, pausePumpAsync, resumePump, invalidateGridPresence, pumpState as thumbPumpState, SIZES, type ThumbSize } from './services/thumbs'
 import { pauseMetaPumpAsync, resumeMetaPump } from './services/genmeta'
 import { registerMediaHandleGuard, registerRenameIsolationGuard } from './services/handles'
 import { isThumbHash } from './services/paths'
@@ -244,6 +244,12 @@ const GPU_FALLBACK_FLAG = '--gpu-fallback'
 
 /** 冒烟/自动化跑在受限环境里，而且本来就不需要渲染 —— 直接预先降级，省掉一次自救重启 */
 const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke-'))
+
+/**
+ * 冒烟注入：给 `sys:ping` 人为加延迟，用来验证「主进程忙时骨架不撤」。
+ * 生产恒 0，且设置入口只在冒烟模式下注册。
+ */
+let smokePingDelayMs = 0
 if (isSmokeRun) app.commandLine.appendSwitch('disable-gpu-sandbox')
 
 // ── 数据目录：默认 `%APPDATA%\Stash`，**便携模式**下改到「程序目录旁的 data\」 ──
@@ -457,9 +463,7 @@ function bootstrap(): void {
          * 否则每跑一次套件都要真等 9 秒 × 每次开库（folder/ edit 会慢到没法用）。
          * 生产启动没有 --smoke-* 参数 → 不传，行为与用户手动启动一致。
          */
-        additionalArguments: process.argv.some((a) => a.startsWith('--smoke'))
-          ? ['--stash-smoke']
-          : []
+        additionalArguments: isSmokeRun ? ['--stash-smoke'] : []
       }
     })
 
@@ -476,7 +480,6 @@ function bootstrap(): void {
      * ⚠️ 冒烟必须走老路径（ready-to-show 立即 show）：隐藏窗口会让 Chromium 节流渲染，
      * 冒烟里的滚动/截图会等不到（实测 scrollPos 直接超时 8s、capturePage 报 UnknownVizError）。
      */
-    const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke'))
     if (isSmokeRun) {
       w.once('ready-to-show', () => w.show())
     } else {
@@ -664,6 +667,27 @@ function bootstrap(): void {
         return runBackfill(size in SIZES ? (size as ThumbSize) : 'grid', limit)
       })
     )
+
+    /**
+     * 主进程响应探针：骨架用它判断「现在点了有没有反应」。
+     *
+     * 刻意什么都不做（不碰 DB、不碰 FS）—— 它测的不是某个任务快不快，
+     * 而是**事件循环有没有被排队**。回填、watcher 扫描、全表计数都跑在主进程，
+     * 这些活一多，ping 的往返延迟就会从个位数飙到几百毫秒，正好等于用户点击的体感。
+     */
+    ipcMain.handle('sys:ping', async () => {
+      if (smokePingDelayMs > 0) await new Promise((r) => setTimeout(r, smokePingDelayMs))
+      return Date.now()
+    })
+    // 冒烟专用：注入 ping 延迟（生产不注册，渲染层也没有对应入口）
+    if (isSmokeRun) {
+      ipcMain.handle('sys:__test-ping-delay', (_e, ms: number) => {
+        smokePingDelayMs = Math.max(0, Number(ms) || 0)
+        return smokePingDelayMs
+      })
+    }
+    /** 缩略图队列水位：骨架副标题用它说「还剩 N 张」，让等待有解释 */
+    ipcMain.handle('thumb:pump', () => wrap(() => thumbPumpState()))
 
     // 素材与标签
     ipcMain.handle('asset:list', (_e, q) => wrap(() => assetsSvc.listAssets(q ?? {})))

@@ -117,6 +117,31 @@ export interface StashThumbApi {
   backfill: (size: 'grid' | 'detail') => Promise<{ ok: boolean; data?: { queued: number }; error?: string }>
   onProgress: (cb: (d: { done: number; total: number }) => void) => Unsub
   onDone: (cb: (d: { done: number; total: number }) => void) => Unsub
+  /**
+   * 队列水位：`queued` = 还在排队等生成的张数。
+   * 骨架副标题用它说「还剩 N 张」，让等待有解释（不参与收尾判定 —— 全量回填可能几分钟）。
+   */
+  pumpState: () => Promise<{ ok: boolean; data?: ThumbPumpState; error?: string }>
+}
+
+export interface ThumbPumpState {
+  paused: boolean
+  running: number
+  queued: number
+}
+
+/**
+ * 系统级探针。
+ *
+ * `ping` 是**空操作**的往返：不碰 DB / 不碰 FS，测的是主进程事件循环排不排队。
+ * 骨架用它的往返延迟判断「现在点一下有没有反应」——
+ * 回填、watcher 扫描、全表计数都跑在主进程，这些活一多，
+ * RTT 就从个位数飙到几百毫秒，正好等于用户点击的体感。
+ */
+export interface StashSysApi {
+  ping: () => Promise<number>
+  /** 冒烟专用：注入 ping 延迟。生产主进程不注册该 channel，调用会 reject */
+  testPingDelay: (ms: number) => Promise<number>
 }
 
 export interface StashAssetRow {
@@ -608,6 +633,7 @@ export interface StashApi {
   folder: StashFolderApi
   import: StashImportApi
   thumb: StashThumbApi
+  sys: StashSysApi
   asset: StashAssetApi
   preview: StashPreviewApi
   shell: StashShellApi
