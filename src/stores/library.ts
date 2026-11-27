@@ -302,9 +302,17 @@ export const useLibraryStore = defineStore('library', () => {
 
   async function bootstrap(): Promise<void> {
     bootError.value = ''
+    /*
+     * ⚠️ 先起骨架，再去问主进程「当前有没有库」。
+     *
+     * 冷启动时 `getInfo()` 要等主进程把库真正打开（8000 张 + 冷盘，实测数秒），
+     * 这期间 Vue 已经挂载、界面只是一个空壳 —— 用户看到的就是「只有黑色框框，
+     * 等很久才出现骨架」。先把骨架顶上去，主进程再慢也有一层可见的反馈。
+     */
+    bootKind.value = 'startup'
+    beginBoot()
     const r = await window.stash.library.getInfo()
     if (r.data) {
-      beginBoot()
       try {
         info.value = r.data
         await bootStep('index')
@@ -313,14 +321,15 @@ export const useLibraryStore = defineStore('library', () => {
         await bootStep('grid')
       } finally {
         await loadRecent()
-        // 这里**不** endBoot：首屏数据还没到，收尾由 App 在「首屏到位 + 一帧绘制」后做
+        // 这里**不** endBoot：首屏数据还没到，收尾由 App 在「固定窗口结束」后做
       }
       return
     }
-    // 启动时未开库：自动恢复最近一次打开的库；从未打开过则留在欢迎页
+    // ---------- 主进程没有当前库（从没开过，或启动时没恢复）----------
     await loadRecent()
     const last = recent.value[0]
     if (last) {
+      // 有最近库：直接开。openLibrary 内部会再 beginBoot 一层，收尾同样交给 App 统一做
       const e = await openLibrary(last.path, 'startup')
       if (e) {
         // 库目录可能已被移动/删除，或该库由更新版本的 Stash 升级过（ERR_LIBRARY_TOO_NEW）。
@@ -329,8 +338,13 @@ export const useLibraryStore = defineStore('library', () => {
         recent.value = recent.value.filter((x) => x.path !== last.path)
         bootError.value = e
         console.warn(`[stash] 自动打开最近的库失败，已退回欢迎页：${last.path} —— ${e}`)
+        // openLibrary 失败时自己已经 endBoot 了一层，这里把 bootstrap 这层也收掉
+        endBoot()
       }
+      return
     }
+    // 从没打开过任何库 → 收掉骨架，留在欢迎页
+    endBoot()
   }
 
   async function createLibrary(name: string, parentDir: string): Promise<string | null> {

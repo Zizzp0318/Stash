@@ -463,7 +463,34 @@ function bootstrap(): void {
       }
     })
 
-    w.on('ready-to-show', () => w.show())
+    /*
+     * 窗口显示时机：等**首帧画好**再出现，而不是 ready-to-show 一到就 show。
+     *
+     * 冷启动（Windows 刚开机、GPU 还没热）时 ready-to-show 可能只画出了底色，
+     * 窗口一出现就是一块深色空框，几十~几百毫秒后 index.html 的骨架才画上来 ——
+     * 用户看到的是「点了图标，先弹个黑框，过一会儿才有加载动画」。
+     *
+     * did-finish-load 时 index.html 的静态骨架（logo + 进度条）已经解析并上屏，
+     * 这时候再 show，窗口一出现就是「正在加载」，没有黑框期。
+     *
+     * ⚠️ 冒烟必须走老路径（ready-to-show 立即 show）：隐藏窗口会让 Chromium 节流渲染，
+     * 冒烟里的滚动/截图会等不到（实测 scrollPos 直接超时 8s、capturePage 报 UnknownVizError）。
+     */
+    const isSmokeRun = process.argv.some((a) => a.startsWith('--smoke'))
+    if (isSmokeRun) {
+      w.once('ready-to-show', () => w.show())
+    } else {
+      let winShown = false
+      const showOnce = (): void => {
+        if (winShown || w.isDestroyed()) return
+        winShown = true
+        w.show()
+      }
+      w.webContents.once('did-finish-load', showOnce)
+      // 兜底两条：ready-to-show 之后再等 150ms（防 did-finish-load 迟迟不触发）、2.5s 硬超时
+      w.once('ready-to-show', () => setTimeout(showOnce, 150))
+      setTimeout(showOnce, 2500)
+    }
 
     // 把文件拖进窗口时，Chromium 默认会「导航到该文件」——整个应用会被替换成一张图片。
     // 渲染层已经 preventDefault 了 drop，这里再兜一层：任何非本应用页面的跳转直接拦掉。
