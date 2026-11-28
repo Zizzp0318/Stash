@@ -22,10 +22,7 @@ import { useLibraryStore } from '../stores/library'
 
 const lib = useLibraryStore()
 
-/** 跳过这几秒的开场 → App 立即进入淡出（不等到最小展示时间） */
-const emit = defineEmits<{ (e: 'skip'): void }>()
-
-/** 固定窗口时长（App 传 lib.bootMinMs）。0/未传时按 9 秒算 */
+/** 最小展示窗口（App 传 lib.bootMinMs）。0/未传时按 1.2 秒算 */
 const props = defineProps<{ minMs?: number; pending?: number }>()
 
 /** 主标题固定：换库/开库对用户是同一件事 */
@@ -72,16 +69,14 @@ function tick(now: number): void {
   elapsed.value = s
 
   /*
-   * 渐近曲线：1.2s 线性冲到 34%（让人觉得「确实在动」），
-   * 之后 34 + 58·(1-e^(-t/4.5)) 逼近 92%。
+   * 进度曲线：跟着**最小窗口**走，之后缓慢爬。
    *
-   * 但固定窗口是 9 秒，光靠渐近曲线到点只有 80% 出头 —— 会在「没满」的状态下淡出。
-   * 所以再叠一条「窗口进度」：按 dur 线性走到 92%，两者取大。
-   * 前段仍是 34% 的冲刺（窗口进度那时才 14%），中段由窗口进度接管，到点时正好 92%。
+   * 前段按窗口线性到 80%（0.5 秒窗口正好到 80%，撤的时候看着是"满"的），之后渐近逼近 92%。
+   * 慢库由探针决定何时结束，进度条停在高位慢慢爬，而不是"窗口一到就死等"。
    */
-  const dur = props.minMs && props.minMs > 0 ? props.minMs : 9000
-  const base = s < 1.2 ? (s / 1.2) * 34 : 34 + 58 * (1 - Math.exp(-(s - 1.2) / 4.5))
-  const byWindow = dur > 0 ? (s * 1000) / dur * 92 : 92
+  const dur = props.minMs && props.minMs > 0 ? props.minMs : 500
+  const byWindow = Math.min(80, ((s * 1000) / dur) * 80)
+  const base = s < 0.25 ? (s / 0.25) * 34 : 34 + 58 * (1 - Math.exp(-(s - 0.25) / 3.5))
   // 起点给 8%：第一帧就有可见的一小截，否则 0% 时像“还没开始”
   pct.value = Math.min(Math.max(Math.max(base, byWindow), 8), 92)
 
@@ -112,9 +107,6 @@ onBeforeUnmount(() => {
     <div class="boot-vignette" aria-hidden="true"></div>
 
     <div class="boot-card" data-boot-pill>
-      <!-- 固定 9 秒窗口 + 可跳过：不是「防闪白」，而是把这段时间当成开场。
-           没有出口的 9 秒会让人觉得软件卡死，所以入口必须一直在。 -->
-      <button class="boot-skip" type="button" data-boot-skip @click="emit('skip')">跳过</button>
       <div class="boot-head">
         <div class="boot-orb" aria-hidden="true"></div>
         <div class="boot-titles">
@@ -128,7 +120,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="boot-foot">
-        <span class="boot-note">约 9 秒后自动进入，可随时跳过</span>
+        <span class="boot-note">准备就绪后自动进入</span>
         <span v-if="slow" class="boot-hint" data-boot-hint>首次打开或刚开机会慢一些</span>
       </div>
     </div>
@@ -168,27 +160,6 @@ onBeforeUnmount(() => {
    * 表现为「骨架刚淡出，界面却点不动」。
    */
   pointer-events: none;
-}
-
-/* 跳过：右上角常驻。固定 9 秒窗口如果没有出口，观感就是「卡死了」 */
-.boot-skip {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  height: 24px;
-  padding: 0 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border-soft);
-  background: transparent;
-  color: var(--text-3);
-  font-size: 11px;
-  font-family: var(--font);
-  cursor: pointer;
-  -webkit-app-region: no-drag;
-}
-.boot-skip:hover {
-  color: var(--text-1);
-  background: var(--bg-hover);
 }
 
 /* 浅色：从「压暗」改成「提亮」。米白界面被压暗会变成水泥灰 */

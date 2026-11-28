@@ -141,5 +141,27 @@
       </div>
     </div>
     <script type="module" src="/main.ts"></script>
+    <script>
+      /*
+       * 骨架已经画到屏幕上了 → 通知主进程「可以显示窗口了」。
+       *
+       * 为什么不用 did-finish-load：那只表示资源加载完，不代表第一帧已经提交给合成器。
+       * 窗口 show 早了，用户看到的是窗口底色（浅米/深黑）——就是「黑框」。
+       *
+       * 为什么标题而不是 IPC：这个脚本在主进程的页面里跑，拿不到 preload 的能力；
+       * `page-title-updated` 是主进程能直接听到的最轻的信号。
+       *
+       * 两条都挂：隐藏窗口（show:false）时 rAF 可能被节流，定时器兜一条。
+       */
+      (function () {
+        var markReady = function () {
+          if (document.title !== 'stash-ready') document.title = 'stash-ready'
+        }
+        requestAnimationFrame(function () {
+          requestAnimationFrame(markReady)
+        })
+        setTimeout(markReady, 80)
+      })()
+    </script>
   </body>
 </html>

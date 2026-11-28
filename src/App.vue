@@ -53,14 +53,15 @@ const thumbProgress = ref<{ done: number; total: number } | null>(null)
 const busyProgress = computed(() => assets.exporting ?? assets.importing)
 const busyTitle = computed(() => (assets.exporting ? '正在导出素材…' : '正在导入素材…'))
 
-// ==================== 开库全屏加载层（2026-11 第四版：固定开场窗口）====================
+// ==================== 开库全屏加载层（2026-11 第五版：自适应）====================
 //
 // 数据源是 `lib.booting`；这里只负责**时序**。
 //
-// 这一版语义变了：从「数据到就撤」改成**固定 9 秒的开场窗口** ——
-// 数据再快也要把这段播完，用户可点「跳过」提前结束。
-// 借鉴 SuYan 的思路（把不确定的等待变成可预期的开场），但不搬它的 9 图轮播，
-// 沿用现有的半透明读条。
+// 语义演进：
+//   第三版「数据到就撤」     → 大库揭开后还会卡几秒；
+//   第四版「固定 9 秒开场」   → 掩盖了卡顿，但小库也被迫干等 9 秒；
+//   第五版「自适应」         → 只留 0.5 秒防闪，之后**由探针决定**：
+//                             快库 ~0.5 秒撤，慢库停到真的能操作为止（上限 30 秒）。
 //
 // 触发范围：**有库才播**。欢迎页 / 从没打开过库时 `booting` 根本不会置位，天然不触发。
 /** 离场淡出时长，必须与 BootOverlay 的 `.boot-overlay` transition 保持一致 */
@@ -73,9 +74,9 @@ const BOOT_FADE_MS = 420
  * 用户点一下就是「没反应」—— 骨架必须等到这里也过了才能撤。
  */
 const BOOT_RTT_OK_MS = 60
-const BOOT_RTT_STREAK = 3
+const BOOT_RTT_STREAK = 2
 const BOOT_FRAME_P95_MS = 40
-const BOOT_PROBE_INTERVAL_MS = 250
+const BOOT_PROBE_INTERVAL_MS = 150
 /** 硬上限：回填可能要几分钟，不能为了等「完全不卡」把人锁死在骨架上 */
 const BOOT_MAX_VISIBLE_MS = 30000
 
@@ -84,7 +85,7 @@ const bootFading = ref(false)
 /** 缩略图队列水位（骨架副标题用，不参与收尾判定） */
 const thumbPending = ref(0)
 let bootFinishTimer: ReturnType<typeof setTimeout> | null = null
-/** 骨架**真正可见**的时刻（9 秒窗口从这里算，不是从「开始开库」算） */
+/** 骨架**真正可见**的时刻（最小窗口与探针都从这里算，不是从「开始开库」算） */
 let bootShownAt = 0
 
 function clearBootTimer(): void {
@@ -108,11 +109,6 @@ function beginBootFade(): void {
 }
 
 /** 用户点「跳过」：不等固定窗口结束，直接进淡出 */
-function skipBoot(): void {
-  if (!lib.booting) return
-  beginBootFade()
-}
-
 // ==================== 探针：现在点得动吗 ====================
 
 /*
@@ -239,12 +235,11 @@ watch(
     /*
      * 立即亮骨架，**不再等 200ms**。
      *
-     * 旧逻辑是「快开库别闪一下」，但固定 9 秒窗口下这个前提不成立了：反正要停留 9 秒，
-     * 延迟只剩副作用 —— 数据 30ms 就到了、素材先渲染出来，200ms 后骨架才盖上来，
+     * 旧逻辑是「快开库别闪一下」，但现在是自适应窗口，延迟只剩副作用：
+     * 数据 30ms 就到了、素材先渲染出来，200ms 后骨架才盖上来，
      * 用户看到的正是「先出现库里的素材，再弹出骨架」。
      *
-     * 计时也从这一刻算（bootShownAt），保证是「看到骨架 9 秒」，
-     * 而不是「从开始开库算 9 秒」（大库开 3 秒，骨架就只剩 6 秒）。
+     * 计时也从这一刻算（bootShownAt），保证最小窗口和探针都是从「看得见骨架」起算。
      */
     bootVisible.value = true
     bootShownAt = performance.now()
@@ -259,7 +254,7 @@ watch(
  * 收尾要过三道关：
  *   ① 首屏可见图 decode 完（揭开时不是一排空占位）
  *   ② 主进程 / 界面不再排队（`waitMainResponsive`，最多到 30 秒）
- *   ③ 已展示满固定窗口（生产 9 秒）
+ *   ③ 已展示满最小窗口（防闪，生产 0.5 秒；之后完全由探针决定）
  * 三条都满足才淡出。慢库会因此多停几秒，但那几秒是在真的整理，
  * 而不是「骨架撤了、界面点不动」。
  */
@@ -539,6 +534,5 @@ onBeforeUnmount(() => {
     :class="{ 'is-leaving': bootFading }"
     :min-ms="lib.bootMinMs"
     :pending="thumbPending"
-    @skip="skipBoot"
   />
 </template>

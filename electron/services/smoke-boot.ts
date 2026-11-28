@@ -83,7 +83,7 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
 
     // ==================== A. 快开库：固定开场窗口同样生效 ====================
     await js('window.__testSlowBoot(0, 0)')
-    // 冒烟环境下固定窗口应当是 0（否则每个套件都被 9 秒拖死）
+    // 冒烟环境下最小窗口应当是 0（否则每个套件都被它拖慢）
     result.initMinMs = await js<number>('(window.__bootState && window.__bootState() || {}).minMs')
     // 生产是 9 秒固定窗口；冒烟压到 700ms —— 验的是「到窗口才收」，不是「数据一到就收」
     await js('window.__testBootMin(700)')
@@ -247,11 +247,10 @@ export async function runSmokeBoot(win: BrowserWindow): Promise<void> {
     const hintText = await js<string>("(document.querySelector('[data-boot-hint]')?.textContent ?? '').trim()")
     check('C 提示说的是「首次打开/刚开机会慢」，不是含糊的「请稍候」', /首次打开|刚开机/.test(hintText ?? ''), hintText ?? '')
 
-    // 语义变了：以前是「早收骨架、不给出口」（怕揭开露出冻住的界面）；
-    // 现在固定 9 秒窗口，不给出口就等于把人锁 9 秒，必须有「跳过」。
+    // 语义再变：固定 9 秒取消后，骨架是「自适应 + 自动进入」，不需要手动出口
     const hasSkip = await js<boolean>("!!document.querySelector('[data-boot-skip]')")
     result.hasSkip = hasSkip
-    check('C 提供「跳过」出口（固定窗口必须能提前结束）', hasSkip === true, String(hasSkip))
+    check('C 不再提供「跳过」按钮（自适应后无需手动结束）', hasSkip === false, String(hasSkip))
 
     // ==================== D. 内容最终到位，浮层收掉且不再回来 ====================
     const contentAfter = await waitTrue("document.querySelectorAll('.masonry-card, .list-row').length > 0", 8000, 50)

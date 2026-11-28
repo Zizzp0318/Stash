@@ -453,6 +453,11 @@ function bootstrap(): void {
       // ⚠️ 之前这里写死 #0D0D0E，浅色主题下拉伸窗口会露出一道深色边。
       backgroundColor: windowBgColor(),
       show: false,
+      /*
+       * 起始透明：配合下面的「淡入」，窗口出现时是浮现而不是突然一块。
+       * 冒烟必须不透明 —— 隐藏/透明窗口截图是黑的（capturePage 拿不到内容）。
+       */
+      opacity: isSmokeRun ? 1 : 0,
       webPreferences: {
         preload: join(__dirname, '../preload/preload.js'),
         contextIsolation: true,
@@ -488,11 +493,43 @@ function bootstrap(): void {
         if (winShown || w.isDestroyed()) return
         winShown = true
         w.show()
+        // 淡入：8 步 × 22ms ≈ 180ms。setOpacity 在个别环境（远程桌面/无合成器）无效，
+        // 所以还有一条 300ms 的兜底直接置 1 —— 最坏情况是「直接出现」，不会永久透明。
+        let step = 0
+        const timer = setInterval(() => {
+          if (w.isDestroyed()) {
+            clearInterval(timer)
+            return
+          }
+          step++
+          try {
+            w.setOpacity(Math.min(1, step / 8))
+          } catch {
+            /* 不支持透明度：靠下面的兜底 */
+          }
+          if (step >= 8) clearInterval(timer)
+        }, 22)
+        setTimeout(() => {
+          clearInterval(timer)
+          if (!w.isDestroyed()) {
+            try {
+              w.setOpacity(1)
+            } catch {
+              /* 同上 */
+            }
+          }
+        }, 300)
       }
-      w.webContents.once('did-finish-load', showOnce)
-      // 兜底两条：ready-to-show 之后再等 150ms（防 did-finish-load 迟迟不触发）、2.5s 硬超时
-      w.once('ready-to-show', () => setTimeout(showOnce, 150))
-      setTimeout(showOnce, 2500)
+      /*
+       * 主路径：渲染层在骨架真正绘制完成后把标题改成 `stash-ready`（见 src/index.html）。
+       * 这样窗口出现的那一刻屏幕上已经有内容 —— 不是「先空一会儿再画」。
+       */
+      w.webContents.on('page-title-updated', (_e, title) => {
+        if (title === 'stash-ready') showOnce()
+      })
+      // 兜底：ready-to-show 之后再等 600ms（标题信号没到也要出窗口）、3s 硬超时
+      w.once('ready-to-show', () => setTimeout(showOnce, 600))
+      setTimeout(showOnce, 3000)
     }
 
     // 把文件拖进窗口时，Chromium 默认会「导航到该文件」——整个应用会被替换成一张图片。

@@ -71,13 +71,19 @@ export const useLibraryStore = defineStore('library', () => {
   /** 慢到什么程度才提示「可以先浏览」（可被测试缝改小，便于冒烟覆盖） */
   const bootStuckAfterMs = ref(8000)
   /**
-   * 固定开场窗口（毫秒）。数据再快也要展示这么久 —— 这不是「防闪白的最小值」，
-   * 而是刻意保留的一段开场；用户可点「跳过」提前结束。
+   * 骨架的**最小展示窗口**（毫秒）。不是「必须等满」的固定开场 —— 它只做一件事：
+   * 防闪（数据几十毫秒就绪时，不至于亮一下就消失）。
    *
-   * 冒烟环境直接置 0：否则每次开库真等 9 秒，folder/edit 套件会被拖到没法跑
-   * （只有 smoke-boot 用 __testBootMin 显式设成几百毫秒去验窗口语义）。
+   * 之后完全由探针决定：快库约 0.5 秒就撤，慢库停在真的能操作为止（上限 30 秒）。
+   * 冒烟环境置 0（否则每个套件都被这几百毫秒拖慢）。
    */
-  const bootMinMs = ref(window.stash.isSmoke ? 0 : 9000)
+  const bootMinMs = ref(window.stash.isSmoke ? 0 : 500)
+
+  /**
+   * 开库流程的兜底闸门：必须大于 App 侧探针上限（30 秒）+ 淡出，
+   * 否则慢库的骨架会被它提前掐掉。见 openLibrary / createLibrary 的 finally。
+   */
+  const BOOT_GUARD_MS = 35000
   let bootDepth = 0
 
   /**
@@ -93,8 +99,8 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   /**
-   * 测试缝：改固定开场窗口时长（生产 9000）。
-   * 冒烟不可能真等 9 秒 × N 次开库，压到几百毫秒才能验证「到点才收、且确实等满了」。
+   * 测试缝：改最小展示窗口（生产 500）。
+   * 冒烟用它压到几百毫秒，验证「窗口内不撤、之后由探针决定」。
    */
   function __testBootMin(ms: number): number {
     const prev = bootMinMs.value
@@ -370,16 +376,16 @@ export const useLibraryStore = defineStore('library', () => {
       /*
        * 兜底：防止流程异常把人永远按在引导态。
        *
-       * ⚠️ 必须**长于固定开场窗口**。这里原来是写死的 3000ms，固定 9 秒之后它反而成了 bug：
-       * 开库 0.1s 就绪 → 3 秒后这个定时器把 booting 一关，骨架在 3~4 秒就被掐掉，
-       * 用户看到的是「进度条走到一半就没了」。
+       * ⚠️ 必须长于**探针上限**（App 的 BOOT_MAX_VISIBLE_MS = 30 秒），不是「最小窗口 + 5 秒」——
+       * 最小窗口只有 0.5 秒，加 5 秒就成了 5.5 秒的硬闸，慢库的骨架会在探针还在等的时候被掐掉
+       * （用户看到的就是「骨架没了但界面还卡」）。
        */
       setTimeout(() => {
         if (booting.value) {
           bootDepth = 0
           booting.value = false
         }
-      }, bootMinMs.value + 5000)
+      }, BOOT_GUARD_MS)
     }
   }
 
@@ -415,7 +421,7 @@ export const useLibraryStore = defineStore('library', () => {
           bootDepth = 0
           booting.value = false
         }
-      }, bootMinMs.value + 5000)
+      }, BOOT_GUARD_MS)
     }
   }
 
